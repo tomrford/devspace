@@ -1,36 +1,32 @@
-//! Best-effort `.git` index shim for local checkout consumers that look for
-//! Git metadata without treating Git as Devspace's local VCS surface.
+//! Best-effort, read-only Git administrative view for local checkout readers.
 
-use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 
 use blake2::{Blake2b512, Digest as _};
+use futures::StreamExt as _;
+use gix::bstr::{BStr, BString};
 use jj_lib::backend::TreeValue;
-use jj_lib::gitignore::GitIgnoreFile;
+use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
-use jj_lib::repo::StoreFactories;
-use jj_lib::repo_path::{RepoPath, RepoPathBuf};
+use jj_lib::repo::{ReadonlyRepo, Repo as _, StoreFactories};
+use jj_lib::repo_path::RepoPath;
 use jj_lib::settings::UserSettings;
 use jj_lib::workspace::Workspace;
 
-const PRIVATE_EXCLUDES_BEGIN: &str = "# devspace private paths";
-const PRIVATE_EXCLUDES_END: &str = "# /devspace private paths";
-const MAX_PATHS_PER_GIT_COMMAND: usize = 128;
-const MAX_PATH_BYTES_PER_GIT_COMMAND: usize = 32 * 1024;
-const AFTER_EXCLUSION_FAILPOINT: &str = "git_shim_after_exclusion";
+const AFTER_HEAD_FAILPOINT: &str = "git_shim_after_head";
+const DUMMY_CONFLICT_FILE: &str = ".jj-do-not-resolve-this-conflict";
 const LOCK_FILE: &str = "devspace-git-shim.lock";
 const STATE_FILE: &str = "devspace-git-shim.state";
-const TREE_IDENTITY_DOMAIN: &[u8] = b"devspace-git-shim-tree-v1";
-const POLICY_IDENTITY_DOMAIN: &[u8] = b"devspace-hidden-set-v1";
+const STATE_VERSION: &str = "git-shim-v2";
+const UNBORN_ROOT_REF: &str = "refs/jj/root";
 
 pub fn ensure(checkout_root: &Path, settings: &UserSettings) {
-    if let Err(err) = ensure_inner(checkout_root, settings) {
+    if let Err(error) = ensure_inner(checkout_root, settings) {
         tracing::warn!(
             checkout = %checkout_root.display(),
-            "git index shim refresh failed: {err}"
+            "git shim refresh failed: {error}"
         );
     }
 }
@@ -45,10 +41,10 @@ pub fn remove_guard(checkout_root: &Path) -> RemovalGuard {
         Ok(lock)
     }) {
         Ok(lock) => RemovalGuard { _lock: Some(lock) },
-        Err(err) => {
+        Err(error) => {
             tracing::warn!(
                 checkout = %checkout_root.display(),
-                "git index shim unlock failed: {err}"
+                "git shim unlock failed: {error}"
             );
             RemovalGuard { _lock: None }
         }
@@ -64,179 +60,75 @@ fn ensure_inner(checkout_root: &Path, settings: &UserSettings) -> Result<(), Str
             git_dir.display()
         ));
     }
+
     // An interrupted process can leave the guard relaxed. Repair it before
-    // resolving any refresh inputs so errors cannot extend that window.
+    // resolving refresh inputs so errors cannot extend that window.
     make_git_dirs_read_only(checkout_root)?;
 
-    // Resolve everything that does not need a writable .git first. In
-    // particular, an unrelated invalid filesystem path must not leave the
-    // guard relaxed or partially rewrite the index.
-    let base_ignores = crate::working_copy::base_ignores(checkout_root, settings)?;
-    let canonical_objects = canonical_objects_dir(checkout_root, settings)?;
-    let discovered = crate::working_copy::discover_shim_paths(checkout_root, &base_ignores)
-        .map_err(|error| error.to_string())?;
-    let canonical = canonical_paths(checkout_root, settings)?;
-    let refresh_state = canonical.refresh_state(&discovered);
-    if git_dir.is_dir()
-        && (git_dir.join("index").is_file() || !canonical.has_public_paths())
-        && read_refresh_state(checkout_root).as_deref() == Some(refresh_state.as_str())
-    {
-        return if canonical.policy_errors.is_empty() {
-            Ok(())
-        } else {
-            Err(canonical.policy_errors.join("; "))
-        };
+    let view = futures::executor::block_on(load_view(checkout_root, settings))?;
+    let refresh_state = view.refresh_state();
+    let previous_state = read_refresh_state(checkout_root);
+    if shim_files_exist(&git_dir) && previous_state.as_deref() == Some(refresh_state.as_str()) {
+        return Ok(());
     }
-    let excluded_paths = discovered
-        .hidden_paths
-        .iter()
-        .chain(&discovered.base_ignored_paths)
-        .chain(&canonical.hidden_paths)
-        .chain(&canonical.fail_closed_roots)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-
-    // info/exclude is line-based with no escape for newlines, so such a path
-    // cannot be kept out of `git add -A`; a carriage return survives only
-    // until Git strips it at a line ending. Fail closed before touching .git
-    // rather than let the path into the index.
-    if let Some(path) = excluded_paths
-        .iter()
-        .find(|path| path.as_internal_file_string().contains(['\n', '\r']))
-    {
-        return Err(format!(
-            "cannot exclude {:?}: Git exclude patterns cannot represent newlines",
-            path.as_internal_file_string()
-        ));
-    }
-
-    // A base ignore only excludes untracked paths from jj's snapshot. Restore
-    // canonical public files after clearing an ignored root, including on the
-    // first shim build and when repairing an incomplete index.
-    // An invalid policy excludes its complete subtree instead: no materialized
-    // conflict or symlink target is allowed to invent projection policy.
-    let canonical_public = canonical
-        .tracked_paths
-        .iter()
-        .filter(|path| {
-            discovered
-                .base_ignored_paths
-                .iter()
-                .any(|ignored| at_or_below(path, ignored))
-                && !canonical.hidden_paths.contains(*path)
-                && !canonical
-                    .fail_closed_roots
-                    .iter()
-                    .any(|root| at_or_below(path, root))
-        })
-        .collect::<Vec<_>>();
 
     let guard = GitDirGuard::acquire(checkout_root)?;
     let refresh = (|| {
-        if !git_dir.exists() {
-            require_success(git(checkout_root).args(["init", "-q"]), "git init")?;
+        invalidate_refresh_state(checkout_root)?;
+        if !previous_state.is_some_and(|state| state.starts_with(STATE_VERSION)) && git_dir.exists()
+        {
+            fs::remove_dir_all(&git_dir)
+                .map_err(|error| format!("replace obsolete {}: {error}", git_dir.display()))?;
         }
-        fs::write(
-            git_dir.join("objects/info/alternates"),
-            format!("{}\n", canonical_objects.display()),
-        )
-        .map_err(|error| format!("configure canonical Git object database: {error}"))?;
+        initialize_minimal_git(checkout_root, &view.canonical_objects)?;
         remove_stale_index_lock(&git_dir)?;
-        ensure_info_exclude(&git_dir, excluded_paths.iter().map(|path| path.as_ref()))?;
-
-        // Remove exclusions before adding anything. Once removed, info/exclude
-        // prevents `add -A` from reacquiring them, so a later error can omit
-        // public files but cannot leak hidden files.
-        remove_from_index(checkout_root, &excluded_paths)?;
-        if crate::git::failpoint_enabled(AFTER_EXCLUSION_FAILPOINT) {
-            return Err(format!("injected failure at {AFTER_EXCLUSION_FAILPOINT}"));
+        write_head(&git_dir, view.head_oid.as_deref())?;
+        if crate::git::failpoint_enabled(AFTER_HEAD_FAILPOINT) {
+            return Err(format!("injected failure at {AFTER_HEAD_FAILPOINT}"));
         }
-        require_success(git(checkout_root).args(["add", "-A"]), "git add -A")?;
-        add_to_index(checkout_root, canonical_public)?;
-        write_refresh_state(checkout_root, &refresh_state)?;
 
-        if canonical.policy_errors.is_empty() {
-            Ok(())
-        } else {
-            Err(canonical.policy_errors.join("; "))
-        }
+        let git_repo =
+            gix::open(checkout_root).map_err(|error| format!("open Git shim: {error}"))?;
+        let mut index = futures::executor::block_on(build_index(
+            view.repo.as_ref(),
+            &git_repo,
+            &view.parent_tree,
+            &view.working_copy_tree,
+        ))?;
+        preserve_stat_data(&git_repo, &mut index)?;
+        index
+            .write(gix::index::write::Options::default())
+            .map_err(|error| format!("write Git shim index: {error}"))?;
+        write_refresh_state(checkout_root, &refresh_state)
     })();
     finish_guard(refresh, guard)
 }
 
-fn canonical_objects_dir(
-    checkout_root: &Path,
-    settings: &UserSettings,
-) -> Result<std::path::PathBuf, String> {
-    let workspace = Workspace::load(
-        settings,
-        checkout_root,
-        &StoreFactories::default(),
-        &crate::working_copy::devspace_working_copy_factories(),
-    )
-    .map_err(|error| error.to_string())?;
-    let backend = jj_lib::git::get_git_backend(workspace.repo_loader().store())
-        .map_err(|error| error.to_string())?;
-    Ok(backend.git_repo_path().join("objects"))
+struct ShimView {
+    canonical_objects: PathBuf,
+    repo: std::sync::Arc<ReadonlyRepo>,
+    head_oid: Option<String>,
+    parent_tree: MergedTree,
+    working_copy_tree: MergedTree,
 }
 
-fn finish_guard(result: Result<(), String>, guard: GitDirGuard<'_>) -> Result<(), String> {
-    match (result, guard.finish()) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(error), Err(lock_error)) => Err(format!(
-            "{error}; also failed to restore Git guard: {lock_error}"
-        )),
-    }
-}
-
-struct CanonicalPaths {
-    tree_identity: String,
-    policy_identity: String,
-    tracked_paths: BTreeSet<RepoPathBuf>,
-    hidden_paths: BTreeSet<RepoPathBuf>,
-    fail_closed_roots: BTreeSet<RepoPathBuf>,
-    policy_errors: Vec<String>,
-}
-
-impl CanonicalPaths {
-    fn refresh_state(&self, discovered: &crate::working_copy::ShimDiscovery) -> String {
+impl ShimView {
+    fn refresh_state(&self) -> String {
         let mut hasher = Blake2b512::new();
-        hasher.update(self.tree_identity.as_bytes());
-        for (kind, paths) in [
-            (b'h', &discovered.hidden_paths),
-            (b'i', &discovered.base_ignored_paths),
-        ] {
-            for path in paths {
-                let path = path.as_internal_file_string();
-                hasher.update([kind]);
-                hasher.update((path.len() as u64).to_le_bytes());
-                hasher.update(path.as_bytes());
+        if let Some(head_oid) = &self.head_oid {
+            hasher.update(head_oid.as_bytes());
+        }
+        for tree in [&self.parent_tree, &self.working_copy_tree] {
+            for id in tree.tree_ids().iter() {
+                hasher.update((id.as_bytes().len() as u64).to_le_bytes());
+                hasher.update(id.as_bytes());
             }
         }
-        format!(
-            "{}\n{}\n",
-            hex_bytes(&hasher.finalize()),
-            self.policy_identity
-        )
-    }
-
-    fn has_public_paths(&self) -> bool {
-        self.tracked_paths.iter().any(|path| {
-            !self.hidden_paths.contains(path)
-                && !self
-                    .fail_closed_roots
-                    .iter()
-                    .any(|root| at_or_below(path, root))
-        })
+        format!("{STATE_VERSION}\n{}\n", hex_bytes(&hasher.finalize()))
     }
 }
 
-fn canonical_paths(
-    checkout_root: &Path,
-    settings: &UserSettings,
-) -> Result<CanonicalPaths, String> {
+async fn load_view(checkout_root: &Path, settings: &UserSettings) -> Result<ShimView, String> {
     let workspace = Workspace::load(
         settings,
         checkout_root,
@@ -244,143 +136,289 @@ fn canonical_paths(
         &crate::working_copy::devspace_working_copy_factories(),
     )
     .map_err(|error| format!("load checkout metadata: {error}"))?;
-    let tree = workspace
-        .working_copy()
-        .tree()
-        .map_err(|error| format!("load working-copy tree: {error}"))?
-        .clone();
-    futures::executor::block_on(resolve_canonical_paths(tree))
-}
+    let backend = jj_lib::git::get_git_backend(workspace.repo_loader().store())
+        .map_err(|error| format!("load canonical Git backend: {error}"))?;
+    let canonical_objects = backend.git_repo_path().join("objects");
 
-async fn resolve_canonical_paths(tree: MergedTree) -> Result<CanonicalPaths, String> {
-    let tree_identity = tree_identity(&tree);
-    let store = tree.store();
-    let mut policy_paths = BTreeSet::new();
-    for tree_id in tree.tree_ids().iter() {
-        let mut pending = vec![(RepoPathBuf::root(), tree_id.clone())];
-        while let Some((dir, tree_id)) = pending.pop() {
-            let backend_tree = store
-                .get_tree(dir.clone(), &tree_id)
-                .await
-                .map_err(|error| format!("read canonical tree: {error}"))?;
-            for entry in backend_tree.entries_non_recursive() {
-                let path = dir.join(entry.name());
-                if is_dsprivate(&path) {
-                    policy_paths.insert(path);
-                } else if let TreeValue::Tree(child_id) = entry.value() {
-                    pending.push((path, child_id.clone()));
-                }
-            }
-        }
-    }
+    let operation = workspace
+        .repo_loader()
+        .load_operation(workspace.working_copy().operation_id())
+        .await
+        .map_err(|error| format!("load checkout operation: {error}"))?;
+    let repo = workspace
+        .repo_loader()
+        .load_at(&operation)
+        .await
+        .map_err(|error| format!("load checkout repository: {error}"))?;
+    let working_copy_id = repo
+        .view()
+        .get_wc_commit_id(workspace.workspace_name())
+        .ok_or_else(|| "checkout has no working-copy commit".to_owned())?;
+    let working_copy = repo
+        .store()
+        .get_commit_async(working_copy_id)
+        .await
+        .map_err(|error| format!("load working-copy commit: {error}"))?;
+    let first_parent = &working_copy.parent_ids()[0];
+    let head_oid = (first_parent != repo.store().root_commit_id()).then(|| first_parent.hex());
+    let parent_tree = working_copy
+        .parent_tree(repo.as_ref())
+        .await
+        .map_err(|error| format!("merge working-copy parent trees: {error}"))?;
+    let working_copy_tree = working_copy.tree();
 
-    let mut matcher = GitIgnoreFile::empty();
-    let mut policy_files = Vec::new();
-    let mut fail_closed_roots = BTreeSet::new();
-    let mut policy_errors = Vec::new();
-    for path in &policy_paths {
-        let value = tree.path_value(path).await.map_err(|error| {
-            format!("read canonical {}: {error}", path.as_internal_file_string())
-        })?;
-        let id = match value.into_resolved() {
-            Ok(Some(TreeValue::File { id, .. })) => id,
-            Ok(_) => {
-                fail_closed_policy(
-                    path,
-                    "is not a regular file",
-                    &mut fail_closed_roots,
-                    &mut policy_errors,
-                );
-                continue;
-            }
-            Err(_) => {
-                fail_closed_policy(
-                    path,
-                    "is conflicted",
-                    &mut fail_closed_roots,
-                    &mut policy_errors,
-                );
-                continue;
-            }
-        };
-        policy_files.push((path.clone(), id.clone()));
-        let contents = store.read_file(path, &id).await.map_err(|error| {
-            format!("read canonical {}: {error}", path.as_internal_file_string())
-        })?;
-        let mut bytes = Vec::new();
-        jj_lib::file_util::copy_async_to_sync(contents, &mut bytes)
-            .await
-            .map_err(|error| {
-                format!("read canonical {}: {error}", path.as_internal_file_string())
-            })?;
-        matcher = matcher
-            .chain(
-                path.parent().expect(".dsprivate has a parent directory"),
-                Path::new(".dsprivate"),
-                &bytes,
-            )
-            .map_err(|error| error.to_string())?;
-    }
-
-    let tracked_paths = tree
-        .entries()
-        .map(|(path, value)| {
-            value
-                .map(|_| path)
-                .map_err(|error| format!("read working-copy tree: {error}"))
-        })
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    let mut hidden_paths = tracked_paths
-        .iter()
-        .filter(|path| {
-            policy_paths.contains(*path)
-                || matcher.matches_file(path)
-                || path
-                    .ancestors()
-                    .skip(1)
-                    .any(|ancestor| matcher.matches_dir(ancestor))
-        })
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    hidden_paths.extend(policy_paths);
-
-    Ok(CanonicalPaths {
-        tree_identity,
-        policy_identity: policy_identity(&policy_files),
-        tracked_paths,
-        hidden_paths,
-        fail_closed_roots,
-        policy_errors,
+    Ok(ShimView {
+        canonical_objects,
+        repo,
+        head_oid,
+        parent_tree,
+        working_copy_tree,
     })
 }
 
-fn tree_identity(tree: &MergedTree) -> String {
-    let mut hasher = Blake2b512::new();
-    hasher.update(TREE_IDENTITY_DOMAIN);
-    for id in tree.tree_ids().iter() {
-        hasher.update((id.as_bytes().len() as u64).to_le_bytes());
-        hasher.update(id.as_bytes());
+fn initialize_minimal_git(checkout_root: &Path, canonical_objects: &Path) -> Result<(), String> {
+    let git_dir = checkout_root.join(".git");
+    if !git_dir.exists() {
+        gix::init(checkout_root).map_err(|error| format!("initialize Git shim: {error}"))?;
+        for path in [
+            git_dir.join("hooks"),
+            git_dir.join("info"),
+            git_dir.join("description"),
+        ] {
+            remove_generated_path(&path)?;
+        }
     }
-    for label in tree.labels().as_slice() {
-        hasher.update((label.len() as u64).to_le_bytes());
-        hasher.update(label.as_bytes());
-    }
-    hex_bytes(&hasher.finalize())
+
+    let alternates_dir = git_dir.join("objects").join("info");
+    fs::create_dir_all(&alternates_dir)
+        .map_err(|error| format!("create {}: {error}", alternates_dir.display()))?;
+    fs::write(
+        alternates_dir.join("alternates"),
+        format!("{}\n", canonical_objects.display()),
+    )
+    .map_err(|error| format!("configure canonical Git object lookup: {error}"))
 }
 
-fn policy_identity(files: &[(RepoPathBuf, jj_lib::backend::FileId)]) -> String {
-    if files.is_empty() {
-        return "none".to_owned();
+fn remove_generated_path(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)
+            .map_err(|error| format!("remove generated {}: {error}", path.display())),
+        Ok(_) => fs::remove_file(path)
+            .map_err(|error| format!("remove generated {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspect generated {}: {error}", path.display())),
     }
-    let mut hasher = Blake2b512::new();
-    hasher.update(POLICY_IDENTITY_DOMAIN);
-    for (path, id) in files {
-        let path = path.as_internal_file_string();
-        hasher.update((path.len() as u64).to_le_bytes());
-        hasher.update(path.as_bytes());
-        hasher.update(id.as_bytes());
+}
+
+fn write_head(git_dir: &Path, oid: Option<&str>) -> Result<(), String> {
+    let value = match oid {
+        Some(oid) => format!("{oid}\n"),
+        None => format!("ref: {UNBORN_ROOT_REF}\n"),
+    };
+    fs::write(git_dir.join("HEAD"), value).map_err(|error| format!("write Git shim HEAD: {error}"))
+}
+
+async fn build_index(
+    repo: &ReadonlyRepo,
+    git_repo: &gix::Repository,
+    parent_tree: &MergedTree,
+    working_copy_tree: &MergedTree,
+) -> Result<gix::index::File, String> {
+    // Mirrors jj-lib 0.42's reset_index(), build_index_from_merged_tree(),
+    // and update_intent_to_add_impl() without mutating jj's repository view.
+    let mut index = if let Some(tree_id) = parent_tree.tree_ids().as_resolved() {
+        if tree_id == repo.store().empty_tree_id() {
+            empty_index(git_repo)
+        } else {
+            git_repo
+                .index_from_tree(&gix::ObjectId::from_bytes_or_panic(tree_id.as_bytes()))
+                .map_err(|error| format!("build Git index from parent tree: {error}"))?
+        }
+    } else {
+        build_index_from_merged_tree(git_repo, parent_tree)?
+    };
+    update_intent_to_add(git_repo, &mut index, parent_tree, working_copy_tree).await?;
+    Ok(index)
+}
+
+fn empty_index(git_repo: &gix::Repository) -> gix::index::File {
+    gix::index::File::from_state(
+        gix::index::State::new(git_repo.object_hash()),
+        git_repo.index_path(),
+    )
+}
+
+fn build_index_from_merged_tree(
+    git_repo: &gix::Repository,
+    merged_tree: &MergedTree,
+) -> Result<gix::index::File, String> {
+    let mut index = empty_index(git_repo);
+    let mut push = |path: &RepoPath, value: &Option<TreeValue>, stage: gix::index::entry::Stage| {
+        let Some(value) = value else {
+            return;
+        };
+        let (id, mode) = match value {
+            TreeValue::File { id, executable, .. } => (
+                id.as_bytes(),
+                if *executable {
+                    gix::index::entry::Mode::FILE_EXECUTABLE
+                } else {
+                    gix::index::entry::Mode::FILE
+                },
+            ),
+            TreeValue::Symlink(id) => (id.as_bytes(), gix::index::entry::Mode::SYMLINK),
+            TreeValue::Tree(_) => return,
+            TreeValue::GitSubmodule(id) => (id.as_bytes(), gix::index::entry::Mode::COMMIT),
+        };
+        index.dangerously_push_entry(
+            gix::index::entry::Stat::default(),
+            gix::ObjectId::from_bytes_or_panic(id),
+            gix::index::entry::Flags::from_stage(stage),
+            mode,
+            BStr::new(path.as_internal_file_string()),
+        );
+    };
+
+    let mut has_many_sided_conflict = false;
+    for (path, value) in merged_tree.entries() {
+        let value = value.map_err(|error| format!("read merged parent tree: {error}"))?;
+        if let Some(resolved) = value.as_resolved() {
+            push(&path, resolved, gix::index::entry::Stage::Unconflicted);
+            continue;
+        }
+
+        let conflict = value.simplify();
+        if let [left, base, right] = conflict.as_slice() {
+            push(&path, left, gix::index::entry::Stage::Ours);
+            push(&path, base, gix::index::entry::Stage::Base);
+            push(&path, right, gix::index::entry::Stage::Theirs);
+        } else {
+            has_many_sided_conflict = true;
+            push(
+                &path,
+                conflict.first(),
+                gix::index::entry::Stage::Unconflicted,
+            );
+        }
     }
-    hex_bytes(&hasher.finalize())
+    index.sort_entries();
+
+    if has_many_sided_conflict
+        && index
+            .entry_index_by_path(DUMMY_CONFLICT_FILE.into())
+            .is_err()
+    {
+        let blob = git_repo
+            .write_blob(
+                b"The working copy commit contains conflicts which cannot be resolved using Git.\n",
+            )
+            .map_err(|error| format!("write Git shim conflict guard: {error}"))?;
+        index.dangerously_push_entry(
+            gix::index::entry::Stat::default(),
+            blob.detach(),
+            gix::index::entry::Flags::from_stage(gix::index::entry::Stage::Ours),
+            gix::index::entry::Mode::FILE,
+            DUMMY_CONFLICT_FILE.into(),
+        );
+        index.sort_entries();
+    }
+    Ok(index)
+}
+
+async fn update_intent_to_add(
+    git_repo: &gix::Repository,
+    index: &mut gix::index::File,
+    parent_tree: &MergedTree,
+    working_copy_tree: &MergedTree,
+) -> Result<(), String> {
+    let mut diff = parent_tree.diff_stream(working_copy_tree, &EverythingMatcher);
+    let mut added = Vec::new();
+    while let Some(entry) = diff.next().await {
+        let values = entry
+            .values
+            .map_err(|error| format!("diff working-copy tree: {error}"))?;
+        if !values.before.is_absent() {
+            continue;
+        }
+        let executable = match values.after.as_normal() {
+            Some(TreeValue::File { executable, .. }) => *executable,
+            Some(TreeValue::Symlink(_)) => false,
+            _ => continue,
+        };
+        if index
+            .entry_index_by_path(BStr::new(entry.path.as_internal_file_string()))
+            .is_err()
+        {
+            added.push((BString::from(entry.path.into_internal_string()), executable));
+        }
+    }
+
+    if added.is_empty() {
+        return Ok(());
+    }
+    let empty_blob = git_repo
+        .write_blob(b"")
+        .map_err(|error| format!("write Git shim intent-to-add blob: {error}"))?
+        .detach();
+    for (path, executable) in added {
+        index.dangerously_push_entry(
+            gix::index::entry::Stat::default(),
+            empty_blob,
+            gix::index::entry::Flags::INTENT_TO_ADD | gix::index::entry::Flags::EXTENDED,
+            if executable {
+                gix::index::entry::Mode::FILE_EXECUTABLE
+            } else {
+                gix::index::entry::Mode::FILE
+            },
+            path.as_ref(),
+        );
+    }
+    index.sort_entries();
+    Ok(())
+}
+
+fn preserve_stat_data(
+    git_repo: &gix::Repository,
+    index: &mut gix::index::File,
+) -> Result<(), String> {
+    let old_index = match git_repo.open_index() {
+        Ok(index) => index,
+        Err(gix::worktree::open_index::Error::IndexFile(gix::index::file::init::Error::Io(
+            error,
+        ))) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read previous Git shim index: {error}")),
+    };
+    for (entry, path) in index.entries_mut_with_paths() {
+        let Some(old_entry) = old_index.entry_by_path_and_stage(path, entry.stage()) else {
+            continue;
+        };
+        if entry.id == old_entry.id && entry.mode == old_entry.mode {
+            entry.stat = old_entry.stat;
+        }
+    }
+    Ok(())
+}
+
+fn shim_files_exist(git_dir: &Path) -> bool {
+    [
+        git_dir.join("HEAD"),
+        git_dir.join("config"),
+        git_dir.join("index"),
+        git_dir.join("objects/info/alternates"),
+    ]
+    .iter()
+    .all(|path| path.is_file())
+}
+
+fn finish_guard(result: Result<(), String>, guard: GitDirGuard<'_>) -> Result<(), String> {
+    match (result, guard.finish()) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(guard_error)) => Err(format!(
+            "{error}; also failed to restore Git guard: {guard_error}"
+        )),
+    }
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -396,177 +434,21 @@ fn write_refresh_state(checkout_root: &Path, state: &str) -> Result<(), String> 
     fs::write(&path, state).map_err(|error| format!("write {}: {error}", path.display()))
 }
 
+fn invalidate_refresh_state(checkout_root: &Path) -> Result<(), String> {
+    let path = checkout_root.join(".jj").join(STATE_FILE);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove {}: {error}", path.display())),
+    }
+}
+
 fn remove_stale_index_lock(git_dir: &Path) -> Result<(), String> {
     let path = git_dir.join("index.lock");
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("remove stale {}: {error}", path.display())),
-    }
-}
-
-fn fail_closed_policy(
-    path: &RepoPath,
-    reason: &str,
-    roots: &mut BTreeSet<RepoPathBuf>,
-    errors: &mut Vec<String>,
-) {
-    roots.insert(
-        path.parent()
-            .expect(".dsprivate has a parent directory")
-            .to_owned(),
-    );
-    errors.push(format!(
-        "canonical policy {} {reason}",
-        path.as_internal_file_string()
-    ));
-}
-
-fn at_or_below(path: &RepoPath, root: &RepoPath) -> bool {
-    path == root || path.starts_with(root)
-}
-
-fn is_dsprivate(path: &RepoPath) -> bool {
-    path.as_internal_file_string()
-        .rsplit('/')
-        .next()
-        .is_some_and(|name| name == ".dsprivate")
-}
-
-fn remove_from_index(checkout_root: &Path, paths: &BTreeSet<RepoPathBuf>) -> Result<(), String> {
-    for_path_batches(paths.iter(), |batch| {
-        let mut command = git(checkout_root);
-        command.args(["rm", "-r", "--cached", "-q", "--ignore-unmatch", "--"]);
-        command.args(batch.iter().map(|path| git_pathspec(path)));
-        require_success(&mut command, "git rm --cached")
-    })
-}
-
-fn add_to_index<'a>(
-    checkout_root: &Path,
-    paths: impl IntoIterator<Item = &'a RepoPathBuf>,
-) -> Result<(), String> {
-    for_path_batches(paths, |batch| {
-        let mut command = git(checkout_root);
-        command.args(["add", "-f", "--"]);
-        command.args(batch.iter().map(|path| git_pathspec(path)));
-        require_success(&mut command, "git add -f")
-    })
-}
-
-fn for_path_batches<'a>(
-    paths: impl IntoIterator<Item = &'a RepoPathBuf>,
-    mut run: impl FnMut(&[&'a RepoPathBuf]) -> Result<(), String>,
-) -> Result<(), String> {
-    let paths = paths.into_iter().collect::<Vec<_>>();
-    if let Some(path) = paths
-        .iter()
-        .find(|path| path.as_internal_file_string().len() + 1 > MAX_PATH_BYTES_PER_GIT_COMMAND)
-    {
-        return Err(format!(
-            "Git pathspec is too long: {}",
-            path.as_internal_file_string()
-        ));
-    }
-
-    let mut batch = Vec::new();
-    let mut bytes = 0;
-    for path in paths {
-        let path_bytes = path.as_internal_file_string().len() + 1;
-        if !batch.is_empty()
-            && (batch.len() >= MAX_PATHS_PER_GIT_COMMAND
-                || bytes + path_bytes > MAX_PATH_BYTES_PER_GIT_COMMAND)
-        {
-            run(&batch)?;
-            batch.clear();
-            bytes = 0;
-        }
-        batch.push(path);
-        bytes += path_bytes;
-    }
-    if !batch.is_empty() {
-        run(&batch)?;
-    }
-    Ok(())
-}
-
-fn git_pathspec(path: &RepoPath) -> &str {
-    if path.is_root() {
-        "."
-    } else {
-        path.as_internal_file_string()
-    }
-}
-
-fn ensure_info_exclude<'a>(
-    git_dir: &Path,
-    hidden_paths: impl IntoIterator<Item = &'a RepoPath>,
-) -> Result<(), String> {
-    let exclude_path = git_dir.join("info/exclude");
-    let text = fs::read_to_string(&exclude_path).unwrap_or_default();
-    let mut lines = Vec::new();
-    let mut in_private_section = false;
-    for line in text.lines() {
-        if line == PRIVATE_EXCLUDES_BEGIN {
-            in_private_section = true;
-        } else if line == PRIVATE_EXCLUDES_END {
-            in_private_section = false;
-        } else if !in_private_section {
-            lines.push(line.to_owned());
-        }
-    }
-    if !lines.iter().any(|line| line.trim() == ".jj/") {
-        lines.push(".jj/".to_owned());
-    }
-    let hidden_paths = hidden_paths.into_iter().collect::<Vec<_>>();
-    if !hidden_paths.is_empty() {
-        lines.push(PRIVATE_EXCLUDES_BEGIN.to_owned());
-        lines.extend(hidden_paths.into_iter().map(exclude_pattern));
-        lines.push(PRIVATE_EXCLUDES_END.to_owned());
-    }
-    fs::write(&exclude_path, format!("{}\n", lines.join("\n")))
-        .map_err(|error| format!("write {}: {error}", exclude_path.display()))
-}
-
-fn exclude_pattern(path: &RepoPath) -> String {
-    if path.is_root() {
-        return "/*".to_owned();
-    }
-    let mut pattern = String::from("/");
-    for character in path.as_internal_file_string().chars() {
-        if matches!(character, '\\' | '*' | '?' | '[' | ' ') {
-            pattern.push('\\');
-        }
-        pattern.push(character);
-    }
-    pattern
-}
-
-fn git(cwd: &Path) -> Command {
-    let mut command = Command::new("git");
-    command
-        .current_dir(cwd)
-        // Index paths are exact repo paths, never patterns. Literal pathspecs
-        // keep names starting with `:` or containing glob characters from
-        // being parsed as pathspec magic.
-        .env("GIT_LITERAL_PATHSPECS", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_COUNT", "0")
-        .arg("-c")
-        .arg("core.hooksPath=/dev/null");
-    command
-}
-
-fn require_success(command: &mut Command, description: &str) -> Result<(), String> {
-    let status = command
-        .status()
-        .map_err(|error| format!("run {description}: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{description} failed"))
     }
 }
 
@@ -619,15 +501,11 @@ struct GitDirGuard<'a> {
 }
 
 impl<'a> GitDirGuard<'a> {
-    fn new(checkout_root: &'a Path) -> Self {
-        Self {
+    fn acquire(checkout_root: &'a Path) -> Result<Self, String> {
+        let guard = Self {
             checkout_root,
             active: true,
-        }
-    }
-
-    fn acquire(checkout_root: &'a Path) -> Result<Self, String> {
-        let guard = Self::new(checkout_root);
+        };
         make_git_dirs_writable(checkout_root)?;
         Ok(guard)
     }
@@ -646,77 +524,8 @@ impl Drop for GitDirGuard<'_> {
         {
             tracing::warn!(
                 checkout = %self.checkout_root.display(),
-                "failed to restore Git index shim guard: {error}"
+                "failed to restore Git shim guard: {error}"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn path_batches_respect_count_limit() {
-        let paths = (0..1_000)
-            .map(|index| {
-                RepoPathBuf::from_internal_string(format!("ignored/{index:04}-{}", "x".repeat(200)))
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let mut batch_sizes = Vec::new();
-        for_path_batches(paths.iter(), |batch| {
-            batch_sizes.push(batch.len());
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(batch_sizes.iter().sum::<usize>(), paths.len());
-        assert_eq!(batch_sizes[0], MAX_PATHS_PER_GIT_COMMAND);
-        assert!(
-            batch_sizes
-                .iter()
-                .all(|size| *size <= MAX_PATHS_PER_GIT_COMMAND)
-        );
-    }
-
-    #[test]
-    fn path_batches_split_at_byte_limit_before_count_limit() {
-        let paths = (0..300)
-            .map(|index| {
-                RepoPathBuf::from_internal_string(format!(
-                    "ignored/{}/{index:04}-{}",
-                    "x".repeat(200),
-                    "y".repeat(200)
-                ))
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let mut batches = Vec::new();
-        for_path_batches(paths.iter(), |batch| {
-            batches.push((
-                batch.len(),
-                batch
-                    .iter()
-                    .map(|path| path.as_internal_file_string().len() + 1)
-                    .sum::<usize>(),
-            ));
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(
-            batches.iter().map(|(count, _)| count).sum::<usize>(),
-            paths.len()
-        );
-        assert!(batches.len() > 1);
-        assert!(
-            batches
-                .iter()
-                .all(|(count, bytes)| *count < MAX_PATHS_PER_GIT_COMMAND
-                    && *bytes <= MAX_PATH_BYTES_PER_GIT_COMMAND)
-        );
-        let next_path_bytes = paths[batches[0].0].as_internal_file_string().len() + 1;
-        assert!(batches[0].1 + next_path_bytes > MAX_PATH_BYTES_PER_GIT_COMMAND);
     }
 }

@@ -114,6 +114,24 @@ repository.
 `ds repo remove` is the destructive repository boundary. It retires the cloud
 incarnation before deleting the machine catalog entry and local store.
 
+### Experimental Git compatibility
+
+The optional `git-shim` setting creates a checkout-local, read-only `.git`
+administrative view for tools such as Nix. It is off by default:
+
+```sh
+ds config set git-shim true
+```
+
+The shim reads canonical objects through a Git alternate but keeps its own
+`HEAD`, index, configuration, refs, and object write directory. Its detached
+`HEAD` and parent-based index mirror jj's basic colocated view. Canonical
+tracked files remain visible, including `.dsprivate` and paths selected by it;
+hidden-path filtering occurs only at the public Git projection boundary.
+
+Git mutation, import, and push through the shim are unsupported. The `.git`
+directory is read-only outside Devspace's guarded refresh.
+
 ## Synchronization
 
 Synchronization transfers two content-addressed graphs:

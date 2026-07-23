@@ -290,8 +290,9 @@ fn skill_prints_agent_guidance_without_a_checkout() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     let guidance = stdout(&output);
-    assert!(guidance.contains("best-effort Git index shim is off by default"));
+    assert!(guidance.contains("best-effort Git shim is off by default"));
     assert!(guidance.contains("ds config set git-shim true"));
+    assert!(guidance.contains("Canonical tracked hidden paths remain visible"));
     assert!(guidance.contains("Git writes and all `jj` commands"));
     assert!(guidance.contains("Git is a projection boundary"));
     assert!(guidance.contains("It is not an ignore file"));

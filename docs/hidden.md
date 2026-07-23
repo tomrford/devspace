@@ -1,9 +1,9 @@
 # Hidden files
 
 Devspace versions hidden content in canonical Jujutsu history while excluding
-it from every public Git projection. Hidden means hidden from Git remotes and
-plain Git consumers, not from the machine owner or the Devspace cloud
-authority.
+it from every public Git projection. Hidden means hidden from public Git
+remotes, not from the machine owner, the checkout-local Git compatibility
+view, or the Devspace cloud authority.
 
 ## Policy model
 
@@ -67,17 +67,23 @@ the next public projection.
 ## Checkout Git shim
 
 Some local tools require a `.git` directory even though Jujutsu owns the
-checkout. Devspace maintains a guarded Git index shim whose object alternate
-points at the canonical bare Git object database.
+checkout. When enabled, Devspace maintains a minimal checkout-local `.git`
+administrative repository. Its object alternate reads from the canonical bare
+Git object database, while its private object directory, `HEAD`, configuration,
+refs, and index remain separate from canonical storage.
 
-The shim excludes `.dsprivate`, private paths, base-ignored paths, and
-fail-closed policy roots before it runs `git add -A`. It then restores
-canonical public files that a base ignore would otherwise omit. The `.git`
-directory is made read-only outside a guarded refresh.
+The shim follows jj's colocated administrative view. `HEAD` is detached at the
+working-copy commit's first parent, or unborn when that parent is the root. The
+index contains the merged parent tree, including representable conflict
+stages, and marks paths added by the working-copy tree as intent-to-add. It
+does not inspect the filesystem, apply `.dsprivate`, apply Git ignores, or
+invoke public projection. Canonical tracked hidden and ignored paths can
+therefore appear in this local view.
 
-The shim is a compatibility view, not a writable repository boundary. It does
-not define canonical history and cannot be used to bypass projected
-`ds git push`.
+The `.git` directory is read-only outside a serialized refresh. The shim is a
+one-way compatibility view for local readers such as Nix, not a Git mutation,
+import, or push surface. `ds git push` remains the explicit public projection
+boundary.
 
 ## Projection
 

@@ -41,9 +41,12 @@ use `ds` for changes.
 
 ## Experimental Git compatibility
 
-The best-effort Git index shim is off by default. Enable it for this machine
-with `ds config set git-shim true`. The shim does not make Git a supported
-write surface.
+The best-effort Git shim is off by default. Enable it for this machine with
+`ds config set git-shim true`. It creates a checkout-local, read-only `.git`
+administrative view for local readers such as Nix. The view uses canonical
+objects but has separate HEAD, index, configuration, refs, and object writes.
+Canonical tracked hidden paths remain visible. The shim is not a Git mutation,
+import, or push surface.
 
 ## Private paths
 

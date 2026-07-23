@@ -16,7 +16,6 @@ blake2.workspace = true
 clap.workspace = true
 devspace-machine = { path = "../machine" }
 dunce.workspace = true
-etcetera.workspace = true
 futures.workspace = true
 getrandom.workspace = true
 gix.workspace = true
