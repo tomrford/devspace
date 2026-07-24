@@ -6,10 +6,6 @@ Cloudflare-native devspace. The current contract is in `README.md` and
 The legacy `tomrford/devspace-legacy` repository is a historical behavioural
 reference only; nothing canonical depends on it.
 
-Detect the VCS surface before use. In a ds checkout, use `ds`, never git or jj
-directly. A plain Git checkout uses `git`; this tree becomes a ds checkout again
-after re-initialization.
-
 Gate: `nix develop -c pnpm check` and `nix develop -c pnpm test`.
 
 Latest state only, while in development: no data migrations, no backwards
