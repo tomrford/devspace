@@ -8,10 +8,10 @@ use thiserror::Error;
 use crate::{
     CommitMapping, GitHttpTransport, GitHttpTransportError, GitProcessEnvironment, LeaseUpdate,
     LiftError, LiftedCommit, MachineGitRepository, ObjectClosureError, PackBuildError,
-    PackInstallError, PackOptions, ProjectionError, ProjectionGitBatchResult,
+    PackInstallError, PackOptions, PackProducer, ProjectionError, ProjectionGitBatchResult,
     ProjectionGitFetchRef, ProjectionGitObservation, ProjectionGitSnapshot, ProjectionGitState,
     ProjectionGitUpdate, ProjectionMappings, PushError, PushErrorKind, QualifiedRef, RemoteUrl,
-    build_packs, fetch, overlay_lift, push,
+    fetch, overlay_lift, push,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -746,14 +746,16 @@ async fn upload_closure(
         return Ok(());
     }
     let closure = repository.object_closure(heads.iter().copied())?;
-    let packs = build_packs(
-        repository,
-        &closure,
-        &BTreeSet::new(),
-        PackOptions::default(),
-    )?;
-    for pack in &packs.packs {
-        transport.upload_pack(pack).await?;
+    let candidates = closure
+        .objects
+        .iter()
+        .map(|object| object.key)
+        .collect::<Vec<_>>();
+    let known_objects = transport.inventory_git_objects(&candidates).await?;
+    let mut producer =
+        PackProducer::new(repository, &closure, &known_objects, PackOptions::default())?;
+    while let Some(pack) = producer.next_pack()? {
+        transport.upload_pack(&pack).await?;
     }
     Ok(())
 }

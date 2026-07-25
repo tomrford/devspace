@@ -183,6 +183,107 @@ async fn up_to_date_push_does_not_request_the_pack_catalog_or_chunks() {
             && !request.contains("/chunks/")
     }));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn non_noop_push_omits_every_cloud_known_git_object() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = MachineGitRepository::init(temp.path().join("machine"), &settings())
+        .await
+        .unwrap();
+    let head = write_commit(
+        &repository,
+        write_tree(&repository, b"known closure"),
+        &[],
+        b"known closure\n",
+        false,
+    );
+    let remote = temp.path().join("remote.git");
+    let initialized = Command::new("git")
+        .args(["init", "--bare", remote.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(initialized.status.success());
+    let remote_url = remote.to_string_lossy().into_owned();
+    let (base_url, server) = create_server(move |_, request, stream| {
+        let request_line = request.lines().next().unwrap();
+        if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({"remotes": [{"name": "origin", "url": remote_url}]})
+                    .to_string(),
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/git/projection?") {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"activationCursor":0,"cursors":[],"mappings":[],"nextAfter":0,"through":0,"hasMore":false,"pending":[]}"#,
+            );
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/objects/inventory ")
+        {
+            let body: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({"keys": body["keys"]}).to_string(),
+            );
+        } else if request_line.contains("/packs/") {
+            panic!("cloud-known closure was retransmitted: {request_line}");
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/projection/pushes ")
+        {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"pending":true,"fence":1,"outcome":null}"#,
+            );
+        } else if request_line.starts_with("POST ") && request_line.contains("/recover ") {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"pending":false,"fence":1,"outcome":"accepted"}"#,
+            );
+            return true;
+        } else {
+            panic!("unexpected cloud-known push request: {request_line}");
+        }
+        false
+    });
+    let transport = GitHttpTransport::new(
+        &base_url,
+        "known-secret",
+        &"11".repeat(16),
+        &"ab".repeat(32),
+        &"cd".repeat(16),
+    )
+    .unwrap();
+
+    let result = push_with_journal(
+        &repository,
+        &transport,
+        "origin",
+        &[PushHead {
+            bookmark: "main".to_owned(),
+            canonical_oid: Some(head),
+        }],
+        [0x66; 16],
+        &GitProcessEnvironment::new("git", GitProcessMode::Foreground),
+        PushFailpoint::None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.outcome, "accepted");
+    let requests = server.join().unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("/git/objects/inventory "))
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn identity_cursor_stops_clean_and_hidden_children_without_identity_states() {
     let temp = tempfile::tempdir().unwrap();
@@ -240,6 +341,10 @@ async fn identity_cursor_stops_clean_and_hidden_children_without_identity_states
                 "200 OK",
                 r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
             );
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/objects/inventory ")
+        {
+            respond(stream, "200 OK", r#"{"keys":[]}"#);
         } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
             respond(stream, "200 OK", r#"{"inserted":true,"installed":false}"#);
         } else if request_line.starts_with("POST ")
@@ -401,6 +506,10 @@ async fn settled_aborted_claim_refreshes_without_requesting_replay() {
                 "200 OK",
                 r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
             );
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/objects/inventory ")
+        {
+            respond(stream, "200 OK", r#"{"keys":[]}"#);
         } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
             respond(stream, "200 OK", r#"{"inserted":true,"installed":false}"#);
         } else if request_line.starts_with("POST ")

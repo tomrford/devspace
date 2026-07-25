@@ -139,9 +139,11 @@ Synchronization transfers two content-addressed graphs:
 - Git blobs, trees, and commits, addressed by 20-byte SHA-1 object IDs;
 - Jujutsu operations and views, addressed by 64-byte Blake2b IDs.
 
-Git objects travel in deterministic `DSPK` v2 packs. Operation objects use
-their own closure and pack routes. The machine installs and validates every
-download before it changes local operation heads.
+Git objects travel in deterministic `DSPK` v2 packs. Before upload, the
+machine checks the reached object keys in bounded inventory batches and
+produces one missing-object pack at a time. Operation objects use their own
+closure and pack routes. The machine installs and validates every download
+before it changes local operation heads.
 
 A sync run:
 

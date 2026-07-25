@@ -17,6 +17,10 @@ import {
 } from "./pack_protocol";
 
 const PACK_CATALOG_PAGE = 256;
+// Durable Object SQLite permits 100 bound parameters; each key uses kind and ID.
+const GIT_INVENTORY_QUERY_KEYS = 50;
+export const MAX_GIT_INVENTORY_KEYS = 4_096;
+export const MAX_GIT_INVENTORY_REQUEST_BYTES = 256 * 1024;
 
 interface UploadRow extends Record<string, SqlStorageValue> {
   manifest_length: number;
@@ -61,6 +65,11 @@ interface MissingReferenceRow extends Record<string, SqlStorageValue> {
   object_kind: number;
   object_id: ArrayBuffer;
   referenced_id: ArrayBuffer;
+}
+
+interface InventoryObjectRow extends Record<string, SqlStorageValue> {
+  kind: number;
+  id: ArrayBuffer;
 }
 
 class GitPackValidationError extends Error {}
@@ -219,6 +228,41 @@ export class GitPackStore {
       this.resetTrappedKernel(error);
       if (error instanceof GitPackValidationError) {
         return { ok: false as const, error: error.message };
+      }
+      throw error;
+    }
+  }
+
+  inventoryObjects(value: unknown) {
+    try {
+      const keys = decodeObjectInventory(value);
+      const present: string[] = [];
+      for (let start = 0; start < keys.length; start += GIT_INVENTORY_QUERY_KEYS) {
+        const batch = keys.slice(start, start + GIT_INVENTORY_QUERY_KEYS).map(decodeInventoryKey);
+        const rows = this.sql
+          .exec<InventoryObjectRow>(
+            `WITH requested(kind, id) AS (VALUES ${batch.map(() => "(?, ?)").join(", ")})
+             SELECT requested.kind, requested.id
+             FROM requested
+             JOIN objects
+               ON objects.kind = requested.kind AND objects.id = requested.id`,
+            ...batch.flatMap(({ kind, id }) => [kind, exactGitBuffer(id)]),
+          )
+          .toArray();
+        for (const row of rows) {
+          const prefix = ["b", "t", "c"][row.kind];
+          const id = new Uint8Array(row.id);
+          if (prefix === undefined || id.byteLength !== 20) {
+            throw new Error("stored Git object key is invalid");
+          }
+          present.push(`${prefix}:${gitToHex(id)}`);
+        }
+      }
+      present.sort();
+      return { ok: true as const, keys: present };
+    } catch (error) {
+      if (error instanceof GitPackValidationError) {
+        return { ok: false as const, status: 400, error: error.message };
       }
       throw error;
     }
@@ -715,4 +759,44 @@ export class GitPackStore {
   private resetTrappedKernel(error: unknown) {
     if (error instanceof WebAssembly.RuntimeError) this.kernel.reset();
   }
+}
+
+function decodeObjectInventory(value: unknown): string[] {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 1 ||
+    !("keys" in value) ||
+    !Array.isArray(value.keys) ||
+    value.keys.length > MAX_GIT_INVENTORY_KEYS
+  ) {
+    throw new GitPackValidationError(
+      "Git object inventory request must contain only a bounded keys array",
+    );
+  }
+  const keys = value.keys;
+  for (const [index, key] of keys.entries()) {
+    if (typeof key !== "string" || !/^[btc]:[0-9a-f]{40}$/.test(key)) {
+      throw new GitPackValidationError("Git object inventory key is invalid");
+    }
+    if (index > 0 && keys[index - 1] >= key) {
+      throw new GitPackValidationError("Git object inventory keys must be strictly sorted");
+    }
+  }
+  return keys;
+}
+
+function decodeInventoryKey(key: string): { kind: number; id: Uint8Array } {
+  const [prefix, idHex] = key.split(":");
+  const kind =
+    prefix === "b"
+      ? GIT_OBJECT_KIND.blob
+      : prefix === "t"
+        ? GIT_OBJECT_KIND.tree
+        : GIT_OBJECT_KIND.commit;
+  const id = Uint8Array.from({ length: 20 }, (_, index) =>
+    Number.parseInt(idHex.slice(index * 2, index * 2 + 2), 16),
+  );
+  return { kind, id };
 }

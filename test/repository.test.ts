@@ -1,5 +1,5 @@
 import { env, exports } from "cloudflare:workers";
-import { evictDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import gitGolden from "../crates/kernel/tests/git_golden.txt?raw";
 import { Kernel, gitToHex } from "../src/kernel";
@@ -98,6 +98,19 @@ describe("Git v2 repository object store", () => {
       installed: true,
     });
 
+    const objectKeys = decodeGitManifest(fixture.manifest).objects
+      .map((object) => `${["b", "t", "c"][object.kind]}:${gitToHex(object.id)}`)
+      .sort();
+    const absent = `b:${"ff".repeat(20)}`;
+    expect(
+      await json(
+        await routeRequest("git-install", "git/objects/inventory", {
+          method: "POST",
+          body: JSON.stringify({ keys: [...objectKeys, absent].sort() }),
+        }),
+      ),
+    ).toEqual({ keys: objectKeys });
+
     expect(await json(await listPacks("git-install", 0))).toEqual({
       packs: [{ sequence: 1, id: fixture.id }],
       nextAfter: 1,
@@ -142,6 +155,77 @@ describe("Git v2 repository object store", () => {
       through: 257,
       hasMore: false,
     });
+  });
+
+  it("inventories installed typed keys across SQL parameter batches", async () => {
+    const name = "git-inventory-batches";
+    expect(
+      await json(
+        await routeRequest(name, "git/objects/inventory", {
+          method: "POST",
+          body: JSON.stringify({ keys: [] }),
+        }),
+      ),
+    ).toEqual({ keys: [] });
+    const stored = Array.from({ length: 53 }, (_, index) => {
+      const kind = index % 3;
+      const id = Uint8Array.from({ length: 20 }, (_, position) =>
+        position === 19 ? index : position,
+      );
+      return { kind, id, key: `${["b", "t", "c"][kind]}:${gitToHex(id)}` };
+    });
+    await runInDurableObject(await repositoryGitStub(name), (_instance, state) => {
+      for (const object of stored) {
+        state.storage.sql.exec(
+          "INSERT INTO objects (kind, id, bytes) VALUES (?, ?, ?)",
+          object.kind,
+          object.id,
+          new Uint8Array([object.kind]),
+        );
+      }
+    });
+    const absent = [`b:${"fd".repeat(20)}`, `t:${"fe".repeat(20)}`, `c:${"ff".repeat(20)}`];
+    const requested = [...stored.map((object) => object.key), ...absent].sort();
+
+    expect(
+      await json(
+        await routeRequest(name, "git/objects/inventory", {
+          method: "POST",
+          body: JSON.stringify({ keys: requested }),
+        }),
+      ),
+    ).toEqual({ keys: stored.map((object) => object.key).sort() });
+
+    const invalid = await routeRequest(name, "git/objects/inventory", {
+      method: "POST",
+      body: JSON.stringify({ keys: requested.slice().reverse() }),
+    });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toEqual({
+      error: "Git object inventory keys must be strictly sorted",
+    });
+  });
+
+  it("sanitizes unexpected inventory storage failures as 500 responses", async () => {
+    const name = "git-inventory-storage-failure";
+    expect(
+      await json(
+        await routeRequest(name, "git/objects/inventory", {
+          method: "POST",
+          body: JSON.stringify({ keys: [] }),
+        }),
+      ),
+    ).toEqual({ keys: [] });
+    await runInDurableObject(await repositoryGitStub(name), (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE objects");
+    });
+
+    const response = await routeRequest(name, "git/objects/inventory", {
+      method: "POST",
+      body: JSON.stringify({ keys: [`b:${"01".repeat(20)}`] }),
+    });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "Git repository storage failed" });
   });
 
   it("rejects an incomplete closure, then installs it after the dependency arrives", async () => {

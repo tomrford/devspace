@@ -71,7 +71,8 @@ pub use op_sync_state::{
 };
 pub use pack::{
     BuiltPack, BuiltPacks, Digest, MAX_CHUNK_BYTES, MAX_PACK_BYTES, MAX_PACK_OBJECTS,
-    MIN_CHUNK_BYTES, MIN_PACK_BYTES, PackBuildError, PackMetrics, PackOptions, build_packs,
+    MIN_CHUNK_BYTES, MIN_PACK_BYTES, PackBuildError, PackMetrics, PackOptions, PackProducer,
+    build_packs,
 };
 pub use pack_manifest::{ChunkEntry, ObjectEntry, PackManifest, PackManifestError};
 pub use projection::{

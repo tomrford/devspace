@@ -44,7 +44,8 @@ One push holds the repository sync lock and performs this sequence:
    seed selects public bytes that are missing locally;
 6. ensure the complete canonical and public closures are local, then scan every
    public tree against the canonical hidden policy;
-7. upload those closures;
+7. inventory those closures and upload only missing objects, one completed pack
+   at a time;
 8. begin a durable projection batch with expected old public OIDs;
 9. invoke `git push --porcelain` with an exact force-with-lease for each ref;
 10. report the observed live OIDs to the Worker;
@@ -52,10 +53,11 @@ One push holds the repository sync lock and performs this sequence:
 12. write one native Jujutsu operation that tracks the accepted remote
     bookmarks.
 
-An up-to-date push makes no pack-catalog, manifest, or chunk request. A
-non-no-op attempt also skips the catalog when all required closures are already
-local. One command retains its installed catalog high-water so later recovery
-or retry work downloads only new catalog entries.
+An up-to-date push makes no pack-catalog, inventory, manifest, or chunk request.
+A non-no-op attempt also skips the catalog when all required closures are
+already local. Its bounded inventory requests prevent retransmission of
+cloud-known objects. One command retains its installed catalog high-water so
+later recovery or retry work downloads only new catalog entries.
 
 An identity projection sends the canonical commit itself. Its cursor is a
 projection stop point, but it does not create a pair state or public mirror.

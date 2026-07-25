@@ -99,7 +99,15 @@ The manifest contains:
 - ordered chunk entries with offset, length, and 64-byte Blake2b digest.
 
 The payload concatenates exact Git object payloads in manifest order. The same
-closure and chunk size produce the same manifest, payload, and pack ID.
+missing-object set, ordered head set, and pack options produce the same sequence
+of manifests, payloads, and pack IDs; each individual pack is deterministic for
+its exact object contents and options.
+Production is incremental: the machine asks for installed object keys in
+bounded batches, omits cloud-known objects, and retains only the completed pack
+currently being uploaded. Dependency-safe pack order ensures that an earlier
+pack installs every cross-pack dependency needed by the next pack. Object
+entries remain sorted inside each manifest, so the wire format stays
+deterministic.
 
 The Worker receives a manifest and bounded chunk parts in quarantine. Install
 is one Durable Object transaction:
@@ -160,7 +168,8 @@ One run holds the repository synchronization lock and follows this order:
 6. reconcile multiple cloud heads in the native Jujutsu repository;
 7. persist the accepted heads and catalog sequence;
 8. discover the current local operation heads;
-9. upload their reachable Git closure;
+9. inventory their reachable Git closure and upload only missing objects, one
+   completed pack at a time;
 10. upload their operation closure;
 11. write a durable outbox batch for new head transactions;
 12. apply each transaction and remove each acknowledged outbox entry.

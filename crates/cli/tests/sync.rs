@@ -113,6 +113,11 @@ async fn sync_run_silences_colliding_alias_warning() {
                 r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
             );
             false
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/objects/inventory ")
+        {
+            support::fake_worker::respond(stream, "200 OK", r#"{"keys":[]}"#);
+            false
         } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
             support::fake_worker::respond(
                 stream,

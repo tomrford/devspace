@@ -73,71 +73,109 @@ pub struct BuiltPacks {
     pub metrics: PackMetrics,
 }
 
+pub struct PackProducer<'a> {
+    repository: &'a MachineGitRepository,
+    head_commits: &'a [Oid],
+    objects: Vec<&'a crate::MachineObject>,
+    next_object: usize,
+    options: PackOptions,
+    metrics: PackMetrics,
+}
+
+impl<'a> PackProducer<'a> {
+    pub fn new(
+        repository: &'a MachineGitRepository,
+        closure: &'a ObjectClosure,
+        known_objects: &BTreeSet<ObjectKey>,
+        options: PackOptions,
+    ) -> Result<Self, PackBuildError> {
+        options.validate()?;
+        let mut objects = dependency_order(&closure.objects)?;
+        let skipped_known_objects = objects
+            .iter()
+            .filter(|object| known_objects.contains(&object.key))
+            .count();
+        objects.retain(|object| !known_objects.contains(&object.key));
+        if closure.head_commits.len() > MAX_PACK_HEADS {
+            return Err(PackBuildError::TooManyHeads(closure.head_commits.len()));
+        }
+        Ok(Self {
+            repository,
+            head_commits: &closure.head_commits,
+            objects,
+            next_object: 0,
+            options,
+            metrics: PackMetrics {
+                discovered_objects: closure.objects.len(),
+                skipped_known_objects,
+                packed_objects: 0,
+                packed_bytes: 0,
+            },
+        })
+    }
+
+    pub fn next_pack(&mut self) -> Result<Option<BuiltPack>, PackBuildError> {
+        if self.next_object == self.objects.len() {
+            return Ok(None);
+        }
+        let mut builder = PackBuilder::new(self.options);
+        while let Some(object) = self.objects.get(self.next_object).copied() {
+            if object.length > self.options.pack_bytes {
+                return Err(PackBuildError::ObjectExceedsPackLimit {
+                    key: object.key,
+                    length: object.length,
+                    limit: self.options.pack_bytes,
+                });
+            }
+            if !builder.is_empty() && !builder.can_fit(object.length) {
+                break;
+            }
+            let bytes = self.repository.read_object(object.key)?;
+            if bytes.len() as u64 != object.length {
+                return Err(PackBuildError::ObjectLengthChanged {
+                    key: object.key,
+                    discovered: object.length,
+                    actual: bytes.len() as u64,
+                });
+            }
+            let validated = validate(object.key.kind, &bytes).map_err(|source| {
+                PackBuildError::ValidateObject {
+                    key: object.key,
+                    source,
+                }
+            })?;
+            if validated.id != object.key.id {
+                return Err(PackBuildError::ObjectIdMismatch {
+                    key: object.key,
+                    actual: hex(&validated.id.0),
+                });
+            }
+            self.metrics.packed_objects += 1;
+            self.metrics.packed_bytes += bytes.len() as u64;
+            builder.push(object.key, bytes);
+            self.next_object += 1;
+        }
+        Ok(Some(builder.finish(self.head_commits)?))
+    }
+
+    pub fn metrics(&self) -> &PackMetrics {
+        &self.metrics
+    }
+}
+
 pub fn build_packs(
     repository: &MachineGitRepository,
     closure: &ObjectClosure,
     known_objects: &BTreeSet<ObjectKey>,
     options: PackOptions,
 ) -> Result<BuiltPacks, PackBuildError> {
-    options.validate()?;
-    let mut source_objects = dependency_order(&closure.objects)?;
-    let skipped_known_objects = source_objects
-        .iter()
-        .filter(|object| known_objects.contains(&object.key))
-        .count();
-    source_objects.retain(|object| !known_objects.contains(&object.key));
-    if closure.head_commits.len() > MAX_PACK_HEADS {
-        return Err(PackBuildError::TooManyHeads(closure.head_commits.len()));
-    }
-
+    let mut producer = PackProducer::new(repository, closure, known_objects, options)?;
     let mut packs = Vec::new();
-    let mut builder = PackBuilder::new(options);
-    let mut packed_bytes = 0_u64;
-    for object in source_objects {
-        let bytes = repository.read_object(object.key)?;
-        if bytes.len() as u64 != object.length {
-            return Err(PackBuildError::ObjectLengthChanged {
-                key: object.key,
-                discovered: object.length,
-                actual: bytes.len() as u64,
-            });
-        }
-        let validated =
-            validate(object.key.kind, &bytes).map_err(|source| PackBuildError::ValidateObject {
-                key: object.key,
-                source,
-            })?;
-        if validated.id != object.key.id {
-            return Err(PackBuildError::ObjectIdMismatch {
-                key: object.key,
-                actual: hex(&validated.id.0),
-            });
-        }
-        let length = bytes.len() as u64;
-        if length > options.pack_bytes {
-            return Err(PackBuildError::ObjectExceedsPackLimit {
-                key: object.key,
-                length,
-                limit: options.pack_bytes,
-            });
-        }
-        if !builder.is_empty() && !builder.can_fit(length) {
-            packs.push(builder.finish(&closure.head_commits)?);
-            builder = PackBuilder::new(options);
-        }
-        packed_bytes += length;
-        builder.push(object.key, bytes);
-    }
-    if !builder.is_empty() {
-        packs.push(builder.finish(&closure.head_commits)?);
+    while let Some(pack) = producer.next_pack()? {
+        packs.push(pack);
     }
     Ok(BuiltPacks {
-        metrics: PackMetrics {
-            discovered_objects: closure.objects.len(),
-            skipped_known_objects,
-            packed_objects: closure.objects.len() - skipped_known_objects,
-            packed_bytes,
-        },
+        metrics: producer.metrics().clone(),
         packs,
     })
 }
@@ -228,38 +266,54 @@ impl PackBuilder {
 
     fn finish(mut self, head_commits: &[Oid]) -> Result<BuiltPack, PackBuildError> {
         self.objects.sort_unstable_by_key(|(key, _)| *key);
-        let mut data = Vec::with_capacity(self.length as usize);
         let mut entries = Vec::with_capacity(self.objects.len());
+        let mut chunks = Vec::new();
+        let mut pack_hash = Blake2b512::new();
+        let mut offset = 0_u64;
         for (key, bytes) in self.objects {
-            let offset = data.len() as u64;
-            data.extend_from_slice(&bytes);
             entries.push(ObjectEntry {
                 key,
                 offset,
                 length: bytes.len() as u64,
             });
+            offset += bytes.len() as u64;
+            pack_hash.update(&bytes);
+            let mut remaining = bytes.as_slice();
+            while !remaining.is_empty() {
+                if chunks
+                    .last()
+                    .is_none_or(|chunk: &Vec<u8>| chunk.len() == self.options.chunk_bytes as usize)
+                {
+                    chunks.push(Vec::with_capacity(self.options.chunk_bytes as usize));
+                }
+                let chunk = chunks
+                    .last_mut()
+                    .expect("the chunk list was initialized above");
+                let available = self.options.chunk_bytes as usize - chunk.len();
+                let count = available.min(remaining.len());
+                chunk.extend_from_slice(&remaining[..count]);
+                remaining = &remaining[count..];
+            }
         }
-        let chunks = data
-            .chunks(self.options.chunk_bytes as usize)
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        let mut offset = 0_u64;
+        debug_assert_eq!(offset, self.length);
+        let pack_hash = pack_hash.finalize().into();
+        let mut chunk_offset = 0_u64;
         let chunk_entries = chunks
             .iter()
             .map(|chunk| {
                 let entry = ChunkEntry {
-                    offset,
+                    offset: chunk_offset,
                     length: chunk.len() as u32,
                     hash: hash(chunk),
                 };
-                offset += chunk.len() as u64;
+                chunk_offset += chunk.len() as u64;
                 entry
             })
             .collect();
         let manifest = PackManifest::new(
             self.options.chunk_bytes,
-            data.len() as u64,
-            hash(&data),
+            self.length,
+            pack_hash,
             head_commits.to_vec(),
             entries,
             chunk_entries,

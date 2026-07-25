@@ -9,15 +9,16 @@ use thiserror::Error;
 
 use crate::pack_manifest::MAX_MANIFEST_BYTES;
 use crate::{
-    BuiltPack, CloudOpHeads, Digest, MAX_CHUNK_BYTES, Oid, OpId, OpObjectKey, OpObjectKind,
-    OpSyncTransport, OpTransportError, PackManifest, PackManifestError, PackOptions,
-    PendingOpHeadTransaction, build_packs, hex,
+    BuiltPack, CloudOpHeads, Digest, MAX_CHUNK_BYTES, ObjectKey, Oid, OpId, OpObjectKey,
+    OpObjectKind, OpSyncTransport, OpTransportError, PackManifest, PackManifestError, PackOptions,
+    PackProducer, PendingOpHeadTransaction, hex,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_JSON_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
+const MAX_GIT_INVENTORY_KEYS: usize = 4_096;
 const PROJECTION_PAGE_ROWS: usize = 256;
 const MAX_PROJECTION_SNAPSHOT_ROWS: usize = 65_536;
 const MAX_PROJECTION_SNAPSHOT_PAGES: usize = MAX_PROJECTION_SNAPSHOT_ROWS / PROJECTION_PAGE_ROWS;
@@ -285,6 +286,12 @@ struct OpInventoryResponse {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct GitInventoryResponse {
+    keys: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OpHeadsResponse {
     cursor: u64,
     heads: Vec<String>,
@@ -447,6 +454,42 @@ impl GitHttpTransport {
         let url = format!("{}/packs/{}/install", self.repository_url, hex(&id));
         let response = self.send(self.client.post(url)).await?;
         self.read_json(response).await
+    }
+
+    pub async fn inventory_git_objects(
+        &self,
+        candidates: &[ObjectKey],
+    ) -> Result<BTreeSet<ObjectKey>, GitHttpTransportError> {
+        let mut present = BTreeSet::new();
+        let candidates = candidates.iter().copied().collect::<BTreeSet<_>>();
+        let candidates = candidates.into_iter().collect::<Vec<_>>();
+        for page in candidates.chunks(MAX_GIT_INVENTORY_KEYS) {
+            let mut keys = page.iter().map(git_object_key).collect::<Vec<_>>();
+            keys.sort_unstable();
+            let response = self
+                .send(
+                    self.client
+                        .post(format!("{}/objects/inventory", self.repository_url))
+                        .json(&serde_json::json!({ "keys": keys })),
+                )
+                .await?;
+            let response: GitInventoryResponse = self.read_json(response).await?;
+            let page_present = response
+                .keys
+                .into_iter()
+                .map(|key| decode_git_object_key(&key))
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            if !page_present
+                .iter()
+                .all(|key| page.binary_search(key).is_ok())
+            {
+                return Err(GitHttpTransportError::Protocol(
+                    "Git object inventory returned an unrequested object".to_owned(),
+                ));
+            }
+            present.extend(page_present);
+        }
+        Ok(present)
     }
 
     async fn op_inventory(
@@ -856,15 +899,23 @@ impl OpSyncTransport for GitHttpTransport {
         if closure.objects.is_empty() {
             return Ok(());
         }
-        let packs = build_packs(
-            repository,
-            &closure,
-            &BTreeSet::new(),
-            PackOptions::default(),
-        )
-        .map_err(|error| Box::new(error) as OpTransportError)?;
-        for pack in &packs.packs {
-            self.upload_pack(pack)
+        let candidates = closure
+            .objects
+            .iter()
+            .map(|object| object.key)
+            .collect::<Vec<_>>();
+        let known_objects = self
+            .inventory_git_objects(&candidates)
+            .await
+            .map_err(|error| Box::new(error) as OpTransportError)?;
+        let mut producer =
+            PackProducer::new(repository, &closure, &known_objects, PackOptions::default())
+                .map_err(|error| Box::new(error) as OpTransportError)?;
+        while let Some(pack) = producer
+            .next_pack()
+            .map_err(|error| Box::new(error) as OpTransportError)?
+        {
+            self.upload_pack(&pack)
                 .await
                 .map_err(|error| Box::new(error) as OpTransportError)?;
         }
@@ -1070,6 +1121,35 @@ fn op_key(key: &OpObjectKey) -> String {
         OpObjectKind::Operation => "o",
     };
     format!("{prefix}:{}", hex(&key.id))
+}
+
+fn git_object_key(key: &ObjectKey) -> String {
+    let prefix = match key.kind {
+        devspace_kernel::ObjectKind::Blob => "b",
+        devspace_kernel::ObjectKind::Tree => "t",
+        devspace_kernel::ObjectKind::Commit => "c",
+    };
+    format!("{prefix}:{}", hex(&key.id.0))
+}
+
+fn decode_git_object_key(value: &str) -> Result<ObjectKey, GitHttpTransportError> {
+    let (prefix, id) = value.split_once(':').ok_or_else(|| {
+        GitHttpTransportError::Protocol("Git object inventory returned an invalid key".to_owned())
+    })?;
+    let kind = match prefix {
+        "b" => devspace_kernel::ObjectKind::Blob,
+        "t" => devspace_kernel::ObjectKind::Tree,
+        "c" => devspace_kernel::ObjectKind::Commit,
+        _ => {
+            return Err(GitHttpTransportError::Protocol(
+                "Git object inventory returned an invalid kind".to_owned(),
+            ));
+        }
+    };
+    let id = Oid::from_hex(id.as_bytes()).ok_or_else(|| {
+        GitHttpTransportError::Protocol("Git object inventory returned an invalid ID".to_owned())
+    })?;
+    Ok(ObjectKey { kind, id })
 }
 
 fn op_key_path(key: OpObjectKey) -> String {

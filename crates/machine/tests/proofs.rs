@@ -6,7 +6,7 @@ use blake2::{Blake2b512, Digest as _};
 use devspace_kernel::{ObjectKind, Oid, validate};
 use devspace_machine::{
     GitHttpTransport, GitInstallReceipt, GitUploadReceipt, MIN_PACK_BYTES, MachineGitRepository,
-    ObjectKey, PackInstallError, PackOptions, build_packs,
+    ObjectKey, PackBuildError, PackInstallError, PackOptions, PackProducer, build_packs,
 };
 use futures::executor::block_on;
 use gix::objs::{Kind as GitObjectKind, Write as _};
@@ -222,6 +222,50 @@ fn forced_split_packs_install_in_dependency_order() {
         destination.object_closure([fixture.child_commit]).unwrap(),
         closure
     );
+}
+
+#[test]
+fn pack_production_yields_completed_packs_before_reading_later_objects() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = block_on(MachineGitRepository::init(
+        temp.path().join("source"),
+        &settings(),
+    ))
+    .unwrap();
+    let fixture = write_adverse_dependency_chain(&source);
+    let mut closure = source.object_closure([fixture.child_commit]).unwrap();
+    let late = closure
+        .objects
+        .iter_mut()
+        .find(|object| object.key.id == fixture.child_commit)
+        .unwrap();
+    late.length += 1;
+
+    let mut producer = PackProducer::new(
+        &source,
+        &closure,
+        &BTreeSet::new(),
+        PackOptions {
+            pack_objects: 1,
+            ..PackOptions::default()
+        },
+    )
+    .unwrap();
+    let first = producer.next_pack().unwrap().unwrap();
+    assert_eq!(first.manifest.objects().len(), 1);
+    assert_ne!(first.manifest.objects()[0].key.id, fixture.child_commit);
+
+    let error = loop {
+        match producer.next_pack() {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("producer did not read the changed late object"),
+            Err(error) => break error,
+        }
+    };
+    assert!(matches!(
+        error,
+        PackBuildError::ObjectLengthChanged { key, .. } if key.id == fixture.child_commit
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]

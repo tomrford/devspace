@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -5,13 +6,39 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use devspace_machine::GitHttpTransport;
+use devspace_kernel::{ObjectKind, Oid, validate};
+use devspace_machine::{
+    GitHttpTransport, GitHttpTransportError, MachineGitRepository, ObjectKey, OpSyncTransport,
+};
+use gix::objs::{Kind as GitObjectKind, Write as _};
+use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::settings::UserSettings;
 
 #[path = "../../cli/tests/support/stalling_server.rs"]
 mod stalling_server;
 use stalling_server::StallingServer;
+#[allow(dead_code)]
+#[path = "../../cli/tests/support/fake_worker.rs"]
+mod fake_worker;
+use fake_worker::{create_server, respond};
 
 const CHILD_ENV: &str = "DEVSPACE_MACHINE_GIT_TIMEOUT_TEST_CHILD";
+
+fn settings() -> UserSettings {
+    let mut config = StackedConfig::with_defaults();
+    config.add_layer(
+        ConfigLayer::parse(
+            ConfigSource::User,
+            r#"
+                [user]
+                name = "HTTP Transport Test"
+                email = "transport@example.invalid"
+            "#,
+        )
+        .unwrap(),
+    );
+    UserSettings::from_config(config).unwrap()
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn http_transport_times_out_when_worker_stalls() {
@@ -122,6 +149,138 @@ async fn paged_projection_snapshot_keeps_first_page_metadata_during_concurrent_u
     server.join().unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn sync_upload_uses_inventory_to_omit_a_cloud_known_closure() {
+    let temp = tempfile::tempdir().unwrap();
+    let repository = MachineGitRepository::init(temp.path().join("repository"), &settings())
+        .await
+        .unwrap();
+    let blob = write_raw(&repository, ObjectKind::Blob, b"known sync closure\n");
+    let mut tree_bytes = b"100644 file\0".to_vec();
+    tree_bytes.extend_from_slice(&blob.0);
+    let tree = write_raw(&repository, ObjectKind::Tree, &tree_bytes);
+    let commit_bytes = format!(
+        "tree {}\nauthor Sync <sync@example.invalid> 1700000000 +0000\ncommitter Sync <sync@example.invalid> 1700000000 +0000\n\nknown\n",
+        oid_hex(tree)
+    );
+    let head = write_raw(&repository, ObjectKind::Commit, commit_bytes.as_bytes());
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let length = stream.read(&mut request).unwrap();
+        let request = String::from_utf8_lossy(&request[..length]);
+        assert!(request.starts_with("POST /repositories/"));
+        assert!(request.contains("/git/objects/inventory HTTP/1.1"));
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["keys"].as_array().unwrap().len(), 3);
+        let response = serde_json::json!({"keys": body["keys"]}).to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .unwrap();
+    });
+    let mut transport = GitHttpTransport::new(
+        &format!("http://{address}"),
+        "inventory-secret",
+        &"11".repeat(16),
+        &"ab".repeat(32),
+        &"cd".repeat(16),
+    )
+    .unwrap();
+
+    transport
+        .upload_git_objects(&repository, &BTreeSet::from([head]))
+        .await
+        .unwrap();
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn git_inventory_splits_large_candidate_sets_and_validates_every_response_key() {
+    let candidates = (0..=4_096_u32)
+        .map(|index| ObjectKey {
+            kind: ObjectKind::Blob,
+            id: indexed_oid(index),
+        })
+        .collect::<Vec<_>>();
+    let (base_url, server) = create_server(|request_index, request, stream| {
+        let request_line = request.lines().next().unwrap();
+        assert!(request_line.contains("/git/objects/inventory "));
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let keys = body["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), if request_index == 0 { 4_096 } else { 1 });
+        respond(
+            stream,
+            "200 OK",
+            &serde_json::json!({"keys": keys}).to_string(),
+        );
+        request_index == 1
+    });
+    let transport = GitHttpTransport::new(
+        &base_url,
+        "inventory-pages-secret",
+        &"11".repeat(16),
+        &"ab".repeat(32),
+        &"cd".repeat(16),
+    )
+    .unwrap();
+
+    let present = transport.inventory_git_objects(&candidates).await.unwrap();
+
+    assert_eq!(present, candidates.iter().copied().collect());
+    assert_eq!(server.join().unwrap().len(), 2);
+
+    let requested = ObjectKey {
+        kind: ObjectKind::Blob,
+        id: indexed_oid(0),
+    };
+    for (response_key, expected_message) in [
+        (
+            format!("x:{}", oid_hex(indexed_oid(0))),
+            "Git object inventory returned an invalid kind",
+        ),
+        (
+            format!("b:{}", oid_hex(indexed_oid(1))),
+            "Git object inventory returned an unrequested object",
+        ),
+    ] {
+        let (base_url, server) = create_server(move |_, _, stream| {
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({"keys": [response_key]}).to_string(),
+            );
+            true
+        });
+        let transport = GitHttpTransport::new(
+            &base_url,
+            "inventory-response-secret",
+            &"11".repeat(16),
+            &"ab".repeat(32),
+            &"cd".repeat(16),
+        )
+        .unwrap();
+
+        let error = transport
+            .inventory_git_objects(&[requested])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, GitHttpTransportError::Protocol(message) if message == expected_message),
+            "{error:?}"
+        );
+        server.join().unwrap();
+    }
+}
+
 fn projection_page_json(
     activation_cursor: u64,
     cursor_byte: &str,
@@ -155,4 +314,27 @@ fn projection_page_json(
         batch_id = mapping_byte.repeat(16),
         owner_machine = owner_byte.repeat(16),
     )
+}
+
+fn write_raw(repository: &MachineGitRepository, kind: ObjectKind, bytes: &[u8]) -> Oid {
+    let expected = validate(kind, bytes).unwrap().id;
+    let git = gix::open(repository.git_repo_path()).unwrap();
+    let git_kind = match kind {
+        ObjectKind::Blob => GitObjectKind::Blob,
+        ObjectKind::Tree => GitObjectKind::Tree,
+        ObjectKind::Commit => GitObjectKind::Commit,
+    };
+    let actual = git.objects.write_buf(git_kind, bytes).unwrap();
+    assert_eq!(actual.as_bytes(), expected.0);
+    expected
+}
+
+fn oid_hex(oid: Oid) -> String {
+    oid.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn indexed_oid(index: u32) -> Oid {
+    let mut bytes = [0; 20];
+    bytes[16..].copy_from_slice(&index.to_be_bytes());
+    Oid(bytes)
 }

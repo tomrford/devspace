@@ -111,6 +111,10 @@ export class Repository extends DurableObject<Env> {
     return this.withAuthority(authority, () => this.packs.installPack(packId));
   }
 
+  inventoryGitObjects(authority: RepositoryAuthority, value: unknown) {
+    return this.withAuthority(authority, () => this.packs.inventoryObjects(value));
+  }
+
   listInstalledPacks(authority: RepositoryAuthority, afterValue: unknown, throughValue: unknown) {
     return this.withAuthority(authority, () =>
       this.packs.listInstalledPacks(afterValue, throughValue),

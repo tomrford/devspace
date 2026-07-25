@@ -6,6 +6,9 @@ import {
   MAX_GIT_MANIFEST_BYTES,
   readBoundedGitBody,
 } from "./pack_protocol";
+import {
+  MAX_GIT_INVENTORY_REQUEST_BYTES,
+} from "./pack_store";
 import { MAX_GIT_PROJECTION_REQUEST_BYTES } from "./projection_protocol";
 import { MAX_REMOTE_REQUEST_BYTES } from "./remote_protocol";
 import {
@@ -110,6 +113,9 @@ async function routeRepository(
     url.pathname,
   );
   const packCatalogMatch = /^\/repositories\/([^/]+)\/git\/packs$/.exec(url.pathname);
+  const gitInventoryMatch = /^\/repositories\/([^/]+)\/git\/objects\/inventory$/.exec(
+    url.pathname,
+  );
   const projectionMatch = /^\/repositories\/([^/]+)\/git\/projection$/.exec(url.pathname);
   const remotesMatch = /^\/repositories\/([^/]+)\/git\/remotes$/.exec(url.pathname);
   const remoteMatch = /^\/repositories\/([^/]+)\/git\/remotes\/([^/]+)$/.exec(url.pathname);
@@ -135,6 +141,7 @@ async function routeRepository(
     chunkMatch?.[1] ??
     packMatch?.[1] ??
     packCatalogMatch?.[1] ??
+    gitInventoryMatch?.[1] ??
     projectionMatch?.[1] ??
     remotesMatch?.[1] ??
     remoteMatch?.[1] ??
@@ -213,6 +220,16 @@ async function routeRepository(
         return errorResponse(400, "invalid pack high-water");
       }
       return rpcResponse(await stub.listInstalledPacks(authority, after.data, through?.data));
+    }
+    if (gitInventoryMatch !== null && request.method === "POST") {
+      const body = await readJsonBody(
+        request,
+        MAX_GIT_INVENTORY_REQUEST_BYTES,
+        "Git object inventory request",
+        "invalid-git-inventory",
+      );
+      if (body instanceof Response) return body;
+      return rpcResponse(await stub.inventoryGitObjects(authority, body));
     }
     if (packMatch?.[3] === "manifest" && request.method === "PUT") {
       if (packId === undefined) throw new Error("pack route did not capture an ID");
