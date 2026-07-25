@@ -52,14 +52,12 @@ references Git commits through jj's commit IDs.
 module. The Worker calls it before an object can enter durable storage.
 Malformed input returns a typed error and cannot trap the Worker.
 
-The current release build is:
+`scripts/build-wasm.mjs` builds exactly this one module into `dist/kernel.wasm`
+and enforces three properties on every build:
 
-- `dist/kernel.wasm`: 193,056 bytes;
-- imports: zero;
-- Worker dry-run bundle: 904.19 KiB raw, 183.19 KiB gzip.
-
-`scripts/build-wasm.mjs` builds exactly this one module and enforces the
-200 KiB WebAssembly budget.
+- the module has zero WebAssembly imports;
+- the module exports every name that `src/kernel.ts` calls;
+- the optimized module stays under the 200 KiB budget.
 
 ## Verification
 

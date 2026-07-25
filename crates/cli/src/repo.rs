@@ -697,7 +697,7 @@ fn cleanup_local_repository(
         Err(error) => return Err(display_error(error)),
     }
     if let Some(shard) = root.parent() {
-        let _ = fs::remove_dir(shard);
+        fs::remove_dir(shard).ok();
     }
     Ok(())
 }

@@ -14,12 +14,13 @@ use jj_lib::working_copy::{WorkingCopyFreshness, create_and_check_out_recovery_c
 use jj_lib::workspace::Workspace;
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
-use crate::bare_workspace::is_stock_bare_repository;
+use crate::bare_workspace::require_local_store;
 use crate::checkout::{
     CheckoutOwner, absolute_path, canonical_destination_path, destination_hash,
     owned_directory_matches, read_checkout_owner, reject_unsupported_global_options,
     workspace_name,
 };
+use crate::failpoint::checkout_failpoint;
 use crate::tx::{RepoTransactionError, commit_repo_transaction};
 
 #[derive(clap::Args)]
@@ -86,7 +87,8 @@ pub(crate) async fn remove_checkout(
             path.display()
         )));
     }
-    require_native_repository(&target.entry)?;
+    require_local_store(&target.entry)
+        .map_err(|message| user_error(format!("{message}; nothing was touched")))?;
 
     let workspace_name = WorkspaceNameBuf::from(target.owner.workspace_name().to_owned());
     let settings = command.settings().clone();
@@ -110,7 +112,7 @@ pub(crate) async fn remove_checkout(
     };
 
     if target.path_exists {
-        failpoint("before_checkout_deletion_validation");
+        checkout_failpoint("before_checkout_deletion_validation");
         validate_checkout_at_path(command, &target.entry, &target.owner, &path)?;
     }
     let repository_for_forget = if registered {
@@ -215,7 +217,8 @@ async fn explain_mismatched_checkout(
     owner: &CheckoutOwner,
     command: &CommandHelper,
 ) -> Result<(), CommandError> {
-    require_native_repository(entry)?;
+    require_local_store(entry)
+        .map_err(|message| user_error(format!("{message}; nothing was touched")))?;
     let registered_workspace = WorkspaceName::new(owner.workspace_name());
     let workspace_store =
         SimpleWorkspaceStore::load(&entry.native_repository_path).map_err(CommandError::from)?;
@@ -359,23 +362,6 @@ fn resolve_stored_workspace_path(repository_path: &Path, stored_path: &Path) -> 
         }
     }
     resolved
-}
-
-fn require_native_repository(entry: &CatalogEntry) -> Result<(), CommandError> {
-    if !entry.native_repository_path.exists() {
-        return Err(user_error(format!(
-            "Repository `{}` has an incomplete clone; run `ds add` again to finish it; nothing was touched",
-            entry.name
-        )));
-    }
-    if is_stock_bare_repository(&entry.native_repository_path) {
-        Ok(())
-    } else {
-        Err(user_error(format!(
-            "Repository `{}` is registered locally, but its native repository is invalid; nothing was touched",
-            entry.name
-        )))
-    }
 }
 
 async fn snapshot_checkout(
@@ -574,7 +560,7 @@ async fn forget_workspace(
             RepoTransactionError::Rebase(source) => CommandError::from(source),
             RepoTransactionError::Commit(source) => CommandError::from(source),
         })?;
-        failpoint("after_repository_view_forget");
+        checkout_failpoint("after_repository_view_forget");
     }
     forget_workspace_record(repository.path(), workspace_name)?;
     Ok(abandoned)
@@ -613,24 +599,4 @@ fn not_checkout(path: &Path) -> CommandError {
         "{} is not a Devspace checkout; nothing was touched",
         path.display()
     ))
-}
-
-fn failpoint(name: &str) {
-    if std::env::var_os("DEVSPACE_TEST_CHECKOUT_FAILPOINT").as_deref()
-        != Some(std::ffi::OsStr::new(name))
-    {
-        return;
-    }
-    if let Some(path) = std::env::var_os("DEVSPACE_TEST_CHECKOUT_FAILPOINT_READY") {
-        let _ = fs::write(path, name);
-    }
-    if let Some(path) = std::env::var_os("DEVSPACE_TEST_CHECKOUT_FAILPOINT_CONTINUE") {
-        while !Path::new(&path).exists() {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        return;
-    }
-    loop {
-        std::thread::park();
-    }
 }

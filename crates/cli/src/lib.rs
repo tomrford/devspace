@@ -1,3 +1,8 @@
+#![forbid(unsafe_code)]
+
+#[cfg(not(unix))]
+compile_error!("Devspace requires a unix platform");
+
 mod add;
 mod bare_workspace;
 mod boundary_sync;
@@ -6,6 +11,7 @@ mod config;
 mod context;
 mod daemon;
 mod doctor;
+mod failpoint;
 mod git;
 mod git_shim;
 mod init;
@@ -30,7 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use bare_workspace::{
     DevspaceWorkspaceLoaderFactory, MultipleOperationHeads, ParsedRepositoryArgs,
-    RepositorySelector, is_stock_bare_repository,
+    RepositorySelector, require_local_store,
 };
 use clap::Subcommand as _;
 use jj_cli::cli_util::{CliRunner, CommandHelper};
@@ -38,6 +44,9 @@ use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
 use jj_lib::config::{ConfigLayer, ConfigMigrationRule, ConfigSource};
 use jj_lib::op_heads_store::OpHeadsStoreError;
+
+/// The daemon socket derivation, exported so the test suites cannot retype it.
+pub use daemon::daemon_socket_path;
 
 static REPOSITORY_SELECTOR: OnceLock<Arc<RepositorySelector>> = OnceLock::new();
 static SHADOWED_ALIASES: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
@@ -283,18 +292,7 @@ async fn restrict_bare_repository_commands(
                 name.as_str()
             )));
         };
-        if !entry.native_repository_path.exists() {
-            return Err(user_error(format!(
-                "Repository `{}` has an incomplete clone; run `ds add` again to finish it.",
-                name.as_str()
-            )));
-        }
-        if !is_stock_bare_repository(&entry.native_repository_path) {
-            return Err(user_error(format!(
-                "Repository `{}` is registered locally, but its native repository is invalid.",
-                name.as_str()
-            )));
-        }
+        require_local_store(entry).map_err(|message| user_error(format!("{message}.")))?;
     }
     let is_bare_repository = loader.workspace_root() == loader.repo_path();
     if !is_bare_repository {

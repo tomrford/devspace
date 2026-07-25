@@ -1,4 +1,5 @@
 import kernelModule from "../dist/kernel.wasm";
+import { hexBytes } from "./validation";
 
 export const GIT_OBJECT_KIND = {
   blob: 0,
@@ -48,10 +49,6 @@ export class Kernel {
     this.exports = instantiate();
   }
 
-  reset() {
-    this.exports = instantiate();
-  }
-
   validate(kind: number, bytes: Uint8Array): KernelResult {
     return this.call(bytes, (pointer, length) =>
       this.exports.kernel_validate(kind, pointer, length),
@@ -85,29 +82,31 @@ export class Kernel {
     bytes: Uint8Array,
     validate: (pointer: number, length: number) => bigint,
   ): Uint8Array {
-    const inputPointer = this.exports.kernel_alloc(bytes.byteLength);
-    try {
-      new Uint8Array(this.exports.memory.buffer, inputPointer, bytes.byteLength).set(bytes);
-      const packed = validate(inputPointer, bytes.byteLength);
-      const outputPointer = Number(packed & 0xffff_ffffn);
-      const outputLength = Number(packed >> 32n);
+    return this.contained(() => {
+      const inputPointer = this.exports.kernel_alloc(bytes.byteLength);
       try {
-        const output = new Uint8Array(
-          this.exports.memory.buffer,
-          outputPointer,
-          outputLength,
-        ).slice();
-        return output;
+        new Uint8Array(this.exports.memory.buffer, inputPointer, bytes.byteLength).set(bytes);
+        const packed = validate(inputPointer, bytes.byteLength);
+        const outputPointer = Number(packed & 0xffff_ffffn);
+        const outputLength = Number(packed >> 32n);
+        try {
+          const output = new Uint8Array(
+            this.exports.memory.buffer,
+            outputPointer,
+            outputLength,
+          ).slice();
+          return output;
+        } finally {
+          this.exports.kernel_dealloc(outputPointer, outputLength);
+        }
       } finally {
-        this.exports.kernel_dealloc(outputPointer, outputLength);
+        this.exports.kernel_dealloc(inputPointer, bytes.byteLength);
       }
-    } finally {
-      this.exports.kernel_dealloc(inputPointer, bytes.byteLength);
-    }
+    });
   }
 
   startHash(): KernelHash {
-    return new KernelHash(this.exports);
+    return this.contained(() => new KernelHash(this, this.exports));
   }
 
   hash(parts: Iterable<Uint8Array>): Uint8Array {
@@ -119,42 +118,65 @@ export class Kernel {
       hash.dispose();
     }
   }
+
+  /**
+   * A trap leaves the instance's allocator in an unknown state, so the instance
+   * is replaced before the error reaches the caller and the next request starts
+   * from a clean module.
+   */
+  contained<T>(operation: () => T): T {
+    try {
+      return operation();
+    } catch (error) {
+      if (error instanceof WebAssembly.RuntimeError) this.exports = instantiate();
+      throw error;
+    }
+  }
 }
 
 export class KernelHash {
   private state: number | undefined;
 
-  constructor(private readonly exports: KernelExports) {
+  constructor(
+    private readonly kernel: Kernel,
+    private readonly exports: KernelExports,
+  ) {
     this.state = exports.kernel_hash_new();
   }
 
   update(bytes: Uint8Array) {
-    if (this.state === undefined) throw new Error("hash state is already finished");
-    const pointer = this.exports.kernel_alloc(bytes.byteLength);
-    try {
-      new Uint8Array(this.exports.memory.buffer, pointer, bytes.byteLength).set(bytes);
-      this.exports.kernel_hash_update(this.state, pointer, bytes.byteLength);
-    } finally {
-      this.exports.kernel_dealloc(pointer, bytes.byteLength);
-    }
+    const state = this.state;
+    if (state === undefined) throw new Error("hash state is already finished");
+    this.kernel.contained(() => {
+      const pointer = this.exports.kernel_alloc(bytes.byteLength);
+      try {
+        new Uint8Array(this.exports.memory.buffer, pointer, bytes.byteLength).set(bytes);
+        this.exports.kernel_hash_update(state, pointer, bytes.byteLength);
+      } finally {
+        this.exports.kernel_dealloc(pointer, bytes.byteLength);
+      }
+    });
   }
 
   finish(): Uint8Array {
     if (this.state === undefined) throw new Error("hash state is already finished");
     const state = this.state;
     this.state = undefined;
-    const pointer = this.exports.kernel_hash_finish(state);
-    try {
-      return new Uint8Array(this.exports.memory.buffer, pointer, 64).slice();
-    } finally {
-      this.exports.kernel_dealloc(pointer, 64);
-    }
+    return this.kernel.contained(() => {
+      const pointer = this.exports.kernel_hash_finish(state);
+      try {
+        return new Uint8Array(this.exports.memory.buffer, pointer, 64).slice();
+      } finally {
+        this.exports.kernel_dealloc(pointer, 64);
+      }
+    });
   }
 
   dispose() {
     if (this.state !== undefined) {
-      this.exports.kernel_hash_drop(this.state);
+      const state = this.state;
       this.state = undefined;
+      this.kernel.contained(() => this.exports.kernel_hash_drop(state));
     }
   }
 }
@@ -241,11 +263,5 @@ export function gitHashFromHex(value: string): Uint8Array {
   if (!/^[0-9a-f]{128}$/.test(value)) {
     throw new Error("hash must be 128 lowercase hex characters");
   }
-  return decodeHex(value, 64);
-}
-
-function decodeHex(value: string, length: number): Uint8Array {
-  return Uint8Array.from({ length }, (_, index) =>
-    Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
-  );
+  return hexBytes(value);
 }

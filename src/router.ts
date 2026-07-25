@@ -1,4 +1,3 @@
-import { z } from "zod";
 import { authenticateDevelopmentRequest, type DevelopmentSecretEnv } from "./auth";
 import type { AuthenticatedPrincipal, ControlPlane } from "./control_plane";
 import {
@@ -17,11 +16,10 @@ import {
 } from "./op_store";
 import { MAX_HEAD_REQUEST_BYTES } from "./op_protocol";
 import type { Repository } from "./repository";
-import { cursorStringSchema, lowerHexStringSchema } from "./validation";
+import { cursorStringSchema, identifierSchema, lowerHexStringSchema } from "./validation";
 
 const gitPackIdSchema = lowerHexStringSchema(64, "pack ID");
 const DIRECTORY_REQUEST_BYTES = 4 * 1024;
-const repositoryNameSchema = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,127}$/);
 const CONTROL_PLANE_NAME = "directory";
 type WorkerEnv = Env & DevelopmentSecretEnv;
 
@@ -34,7 +32,7 @@ export default {
         JSON.stringify({
           message: "Worker request failed",
           path: new URL(request.url).pathname,
-          error: error instanceof Error ? error.name : "UnknownError",
+          error: errorDetail(error),
         }),
       );
       return errorResponse(500, "request failed");
@@ -69,7 +67,7 @@ async function route(request: Request, env: WorkerEnv): Promise<Response> {
   }
   if (directoryMatch !== null) {
     const name = directoryMatch[1];
-    if (!repositoryNameSchema.safeParse(name).success) {
+    if (!identifierSchema.safeParse(name).success) {
       return errorResponse(400, "invalid repository name", "invalid-repository-name");
     }
     if (request.method === "GET") {
@@ -152,7 +150,7 @@ async function routeRepository(
     opInventoryMatch?.[1] ??
     opHeadsMatch?.[1] ??
     opHeadTransactionsMatch?.[1];
-  const packId = chunkMatch?.[2] ?? packMatch?.[2];
+  const packIdCandidate = chunkMatch?.[2] ?? packMatch?.[2];
   if (repositoryId === undefined) return undefined;
 
   const authorization = await control.authorizeRepository(
@@ -161,7 +159,7 @@ async function routeRepository(
     request.headers.get("x-devspace-incarnation"),
   );
   if (!authorization.ok) return rpcResponse(authorization);
-  if (packId !== undefined && !gitPackIdSchema.safeParse(packId).success) {
+  if (packIdCandidate !== undefined && !gitPackIdSchema.safeParse(packIdCandidate).success) {
     return errorResponse(400, "invalid pack ID");
   }
 
@@ -232,7 +230,7 @@ async function routeRepository(
       return rpcResponse(await stub.inventoryGitObjects(authority, body));
     }
     if (packMatch?.[3] === "manifest" && request.method === "PUT") {
-      if (packId === undefined) throw new Error("pack route did not capture an ID");
+      const packId = packMatch[2];
       let bytes: Uint8Array;
       try {
         bytes = await readBoundedGitBody(request, MAX_GIT_MANIFEST_BYTES, "Git manifest");
@@ -245,11 +243,11 @@ async function routeRepository(
       return rpcResponse(await stub.putPackManifest(authority, packId, bytes));
     }
     if (packMatch?.[3] === "manifest" && request.method === "GET") {
-      if (packId === undefined) throw new Error("pack route did not capture an ID");
+      const packId = packMatch[2];
       return binaryRpcResponse(await stub.getInstalledPackManifest(authority, packId));
     }
     if (chunkMatch !== null && request.method === "PUT") {
-      if (packId === undefined) throw new Error("chunk route did not capture a pack ID");
+      const packId = chunkMatch[2];
       const decodedPosition = cursorStringSchema.safeParse(chunkMatch[3]);
       if (!decodedPosition.success) return errorResponse(400, "invalid chunk position");
       let bytes: Uint8Array;
@@ -266,7 +264,7 @@ async function routeRepository(
       );
     }
     if (chunkMatch !== null && request.method === "GET") {
-      if (packId === undefined) throw new Error("chunk route did not capture a pack ID");
+      const packId = chunkMatch[2];
       const decodedPosition = cursorStringSchema.safeParse(chunkMatch[3]);
       if (!decodedPosition.success) return errorResponse(400, "invalid chunk position");
       return binaryRpcResponse(
@@ -274,7 +272,7 @@ async function routeRepository(
       );
     }
     if (packMatch?.[3] === "install" && request.method === "POST") {
-      if (packId === undefined) throw new Error("pack route did not capture an ID");
+      const packId = packMatch[2];
       return rpcResponse(await stub.installPack(authority, packId));
     }
     if (projectionMatch !== null && request.method === "GET") {
@@ -365,7 +363,7 @@ async function routeRepository(
       JSON.stringify({
         message: "Git repository Durable Object failed",
         repositoryId,
-        error: error instanceof Error ? error.name : "UnknownError",
+        error: errorDetail(error),
       }),
     );
     return errorResponse(500, "Git repository storage failed");
@@ -385,6 +383,12 @@ function binaryRpcResponse(result: {
   return new Response(result.bytes, {
     headers: { "content-type": "application/octet-stream" },
   });
+}
+
+/** Console logs stay server-side, so they carry the whole fault, not its name. */
+function errorDetail(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  return error.stack ?? `${error.name}: ${error.message}`;
 }
 
 function errorResponse(status: number, message: string, code?: string): Response {

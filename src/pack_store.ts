@@ -16,6 +16,7 @@ import {
   decodeGitManifest,
   splitGitParts,
 } from "./pack_protocol";
+import { hexBytes } from "./validation";
 
 const PACK_CATALOG_PAGE = 256;
 // Durable Object SQLite permits 100 bound parameters; each key uses kind and ID.
@@ -122,7 +123,6 @@ export class GitPackStore {
       this.storeManifest(id, bytes, manifest);
       return { ok: true as const, inserted: true, installed: false };
     } catch (error) {
-      this.resetTrappedKernel(error);
       if (error instanceof GitPackValidationError) {
         return { ok: false as const, error: error.message };
       }
@@ -190,7 +190,6 @@ export class GitPackStore {
       });
       return { ok: true as const, inserted: true, installed: false };
     } catch (error) {
-      this.resetTrappedKernel(error);
       if (error instanceof GitPackValidationError) {
         return { ok: false as const, error: error.message };
       }
@@ -226,7 +225,6 @@ export class GitPackStore {
       );
       return { ok: true as const, installed: true, insertedObjects };
     } catch (error) {
-      this.resetTrappedKernel(error);
       if (error instanceof GitPackValidationError) {
         return { ok: false as const, error: error.message };
       }
@@ -267,28 +265,6 @@ export class GitPackStore {
       }
       throw error;
     }
-  }
-
-  countObjects(): number {
-    return this.sql.exec<{ count: number }>("SELECT count(*) AS count FROM objects").one().count;
-  }
-
-  countObjectReferences(): number {
-    return this.sql
-      .exec<{ count: number }>("SELECT count(*) AS count FROM object_references")
-      .one().count;
-  }
-
-  countInstalledPacks(): number {
-    return this.sql
-      .exec<{ count: number }>("SELECT count(*) AS count FROM installed_packs")
-      .one().count;
-  }
-
-  countQuarantinedPacks(): number {
-    return this.sql
-      .exec<{ count: number }>("SELECT count(*) AS count FROM pack_uploads")
-      .one().count;
   }
 
   listInstalledPacks(afterValue: unknown, throughValue: unknown) {
@@ -758,10 +734,6 @@ export class GitPackStore {
       .toArray()
       .map((row) => new Uint8Array(row.bytes));
   }
-
-  private resetTrappedKernel(error: unknown) {
-    if (error instanceof WebAssembly.RuntimeError) this.kernel.reset();
-  }
 }
 
 function decodeObjectInventory(value: unknown): string[] {
@@ -798,8 +770,5 @@ function decodeInventoryKey(key: string): { kind: number; id: Uint8Array } {
       : prefix === "t"
         ? GIT_OBJECT_KIND.tree
         : GIT_OBJECT_KIND.commit;
-  const id = Uint8Array.from({ length: 20 }, (_, index) =>
-    Number.parseInt(idHex.slice(index * 2, index * 2 + 2), 16),
-  );
-  return { kind, id };
+  return { kind, id: hexBytes(idHex) };
 }

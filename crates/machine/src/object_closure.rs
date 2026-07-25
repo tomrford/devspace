@@ -4,7 +4,7 @@ use devspace_kernel::{ObjectKind, Oid, ReferenceKind, ValidationError, validate}
 use gix::objs::Kind as GitObjectKind;
 use thiserror::Error;
 
-use crate::{MachineGitRepository, hex};
+use crate::{MachineGitRepository, encode_lower_hex};
 
 pub const MAX_OBJECT_BYTES: u64 = 1024 * 1024;
 
@@ -58,7 +58,7 @@ impl MachineGitRepository {
             if validated.id != key.id {
                 return Err(ObjectClosureError::ObjectIdMismatch {
                     key,
-                    actual: hex(&validated.id.0),
+                    actual: encode_lower_hex(&validated.id.0),
                 });
             }
             let mut dependencies = Vec::new();
@@ -120,7 +120,7 @@ impl MachineGitRepository {
     }
 }
 
-fn reference_kind(kind: ReferenceKind) -> Option<ObjectKind> {
+pub(crate) fn reference_kind(kind: ReferenceKind) -> Option<ObjectKind> {
     match kind {
         ReferenceKind::Blob | ReferenceKind::Executable | ReferenceKind::Symlink => {
             Some(ObjectKind::Blob)

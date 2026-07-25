@@ -6,7 +6,9 @@ use std::path::Path;
 
 use clap::parser::ValueSource;
 use devspace_machine::{CatalogEntry, MachineStore, RepositorySyncGuard};
-use devspace_machine::{GitHttpTransport, MachineGitRepository, Oid, RegisteredGitRemote};
+use devspace_machine::{
+    GitHttpTransport, MachineGitRepository, Oid, RegisteredGitRemote, encode_lower_hex,
+};
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
@@ -16,7 +18,6 @@ use crate::checkout::{read_checkout_owner, reject_unsupported_global_options};
 use crate::sync::{LockedSyncRun, run_sync_entry_foreground_locked};
 
 const DEFAULT_REMOTE: &str = "origin";
-const FAILPOINT_ENV: &str = "DEVSPACE_FAILPOINT";
 const REMOTE_LIST_JSON_ARG: &str = "devspace-git-remote-list-json";
 pub(crate) const CLOUD_RUNTIME_ERROR: &str = "failed to start the cloud transport runtime";
 
@@ -419,12 +420,5 @@ pub(crate) fn display_error(error: impl std::fmt::Display) -> CommandError {
 }
 
 pub(super) fn short_oid(oid: Oid) -> String {
-    oid.0[..6]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-pub(crate) fn failpoint_enabled(name: &str) -> bool {
-    std::env::var_os(FAILPOINT_ENV).as_deref() == Some(std::ffi::OsStr::new(name))
+    encode_lower_hex(&oid.0[..6])
 }

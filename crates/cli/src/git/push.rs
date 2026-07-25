@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::io::Write as _;
 
 use devspace_machine::{
@@ -14,11 +15,9 @@ use jj_lib::op_store::{RefTarget, RemoteRef, RemoteRefState};
 use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
 
 use crate::checkout::reject_unsupported_global_options;
+use crate::failpoint::failpoint_enabled;
 
-use super::{
-    cloud_runtime, display_error, failpoint_enabled, locked_checkout_entry, open_cloud_session,
-    short_oid,
-};
+use super::{cloud_runtime, display_error, locked_checkout_entry, open_cloud_session, short_oid};
 
 const AFTER_PUSH_FAILPOINT: &str = "after_git_push_before_finalize";
 
@@ -104,8 +103,7 @@ pub(super) async fn push_bookmarks(
         });
         if remote_ref.is_present() && !remote_ref.is_tracked() {
             return Err(user_error(format!(
-                "Non-tracking remote bookmark {}@{} exists. Run `ds bookmark track {} --remote={}` to import the remote bookmark.",
-                name, remote_name, name, remote_name
+                "Non-tracking remote bookmark {name}@{remote_name} exists. Run `ds bookmark track {name} --remote={remote_name}` to import the remote bookmark."
             )));
         }
         requested.push(RequestedBookmark {
@@ -336,16 +334,8 @@ async fn update_view_after_push(
 }
 
 fn view_repair_warning(remote: &str, pushed: &[(String, Option<CommitId>)], error: &str) -> String {
-    let updated = pushed
-        .iter()
-        .filter(|(_, target)| target.is_some())
-        .map(|(bookmark, _)| format!(" -b {bookmark}"))
-        .collect::<String>();
-    let deleted = pushed
-        .iter()
-        .filter(|(_, target)| target.is_none())
-        .map(|(bookmark, _)| format!(" {bookmark}"))
-        .collect::<String>();
+    let updated = joined_bookmarks(pushed, Option::is_some, " -b ");
+    let deleted = joined_bookmarks(pushed, Option::is_none, " ");
     let mut repairs = Vec::new();
     if !updated.is_empty() {
         repairs.push(format!(
@@ -360,6 +350,21 @@ fn view_repair_warning(remote: &str, pushed: &[(String, Option<CommitId>)], erro
     format!(
         "The push updated {remote}, but recording it in the local view failed: {error}. {}",
         repairs.join(" ")
+    )
+}
+
+/// Concatenates the bookmarks whose target passes `wanted`, each behind `prefix`.
+fn joined_bookmarks(
+    pushed: &[(String, Option<CommitId>)],
+    wanted: fn(&Option<CommitId>) -> bool,
+    prefix: &str,
+) -> String {
+    pushed.iter().filter(|(_, target)| wanted(target)).fold(
+        String::new(),
+        |mut output, (bookmark, _)| {
+            write!(output, "{prefix}{bookmark}").expect("writing to a String cannot fail");
+            output
+        },
     )
 }
 

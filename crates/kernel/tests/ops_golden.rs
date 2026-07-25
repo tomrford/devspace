@@ -58,23 +58,23 @@ fn every_op_golden_mutation_returns_without_panicking() {
         };
         let bytes = decode_rle(rest.rsplit_once('|').unwrap().1);
         for length in 0..bytes.len() {
-            let _ = validate_op(kind, &bytes[..length]);
+            validate_op(kind, &bytes[..length]).ok();
         }
         for index in 0..bytes.len() {
             let mut mutated = bytes.clone();
             mutated[index] ^= 0x80;
-            let _ = validate_op(kind, &mutated);
+            validate_op(kind, &mutated).ok();
         }
     }
 
     let view = view_with_entries(&[1, 2], &[("default", 3), ("other", 4)]);
     for length in 0..view.len() {
-        let _ = validate_op(OpObjectKind::View, &view[..length]);
+        validate_op(OpObjectKind::View, &view[..length]).ok();
     }
     for index in 0..view.len() {
         let mut mutated = view.clone();
         mutated[index] ^= 0x80;
-        let _ = validate_op(OpObjectKind::View, &mutated);
+        validate_op(OpObjectKind::View, &mutated).ok();
     }
 }
 

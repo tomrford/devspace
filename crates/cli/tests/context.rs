@@ -5,31 +5,16 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use devspace_machine::MachineGitRepository as MachineRepository;
-use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
-
 mod support;
 
 use support::{
-    commit_id, configure_machine, ds, ds_command, machine_store, set_machine_git_shim, settings,
+    commit_id, configure_machine, ds, ds_command, registered_repository, set_machine_git_shim,
     stderr, stdout, write_cli_config,
 };
 
 async fn owned_checkout(root: &Path, config: &Path, name: &str, checkout: &Path) {
     configure_machine(root, "http://127.0.0.1:1");
-    let store = machine_store(root);
-    let entry = store
-        .register_repository(
-            RepositoryName::parse(name).unwrap(),
-            RepositoryIdentity::new(
-                RepositoryId::parse("ab".repeat(32)).unwrap(),
-                RepositoryIncarnation::parse("cd".repeat(16)).unwrap(),
-            ),
-        )
-        .unwrap();
-    MachineRepository::init(&entry.native_repository_path, &settings())
-        .await
-        .unwrap();
+    registered_repository(root, name).await;
     add_checkout(root, config, name, "root()", checkout);
 }
 

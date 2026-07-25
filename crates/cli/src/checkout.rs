@@ -1,8 +1,6 @@
 use std::fs;
-use std::path::{Path, PathBuf};
-
-#[cfg(unix)]
 use std::io::Read as _;
+use std::path::{Path, PathBuf};
 
 use blake2::{Blake2b512, Digest as _};
 use devspace_machine::{MachineConfig, RepositoryId, RepositoryIncarnation, encode_lower_hex};
@@ -165,7 +163,6 @@ pub(crate) fn owned_directory_matches(path: &Path, owner: &CheckoutOwner) -> Res
     Ok(read_checkout_owner_impl(path)?.is_some_and(|actual| actual == *owner))
 }
 
-#[cfg(unix)]
 fn read_checkout_owner_impl(path: &Path) -> Result<Option<CheckoutOwner>, String> {
     let parent = path
         .parent()
@@ -203,7 +200,6 @@ fn read_checkout_owner_impl(path: &Path) -> Result<Option<CheckoutOwner>, String
     Ok(serde_json::from_slice(&bytes).ok())
 }
 
-#[cfg(unix)]
 fn openat_nofollow(
     directory: impl rustix::fd::AsFd,
     name: &std::ffi::OsStr,
@@ -225,55 +221,9 @@ fn openat_nofollow(
     }
 }
 
-#[cfg(not(unix))]
-fn read_checkout_owner_impl(path: &Path) -> Result<Option<CheckoutOwner>, String> {
-    // Checkout ownership prevents accidental replacement, not attacks by another local process.
-    for component in [path.to_owned(), path.join(".jj")] {
-        let metadata = match fs::symlink_metadata(&component) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("failed to inspect checkout ownership: {error}")),
-        };
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-            return Ok(None);
-        }
-    }
-    let marker = path.join(".jj").join(CHECKOUT_OWNER_FILE);
-    let metadata = match fs::symlink_metadata(&marker) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "failed to inspect checkout ownership marker: {error}"
-            ));
-        }
-    };
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() > MAX_OWNER_MARKER_BYTES
-    {
-        return Ok(None);
-    }
-    let bytes = fs::read(&marker)
-        .map_err(|error| format!("failed to read checkout ownership marker: {error}"))?;
-    Ok(serde_json::from_slice(&bytes).ok())
-}
-
-#[cfg(unix)]
 fn encode_path(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt as _;
     format!("unix:{}", encode_lower_hex(path.as_os_str().as_bytes()))
-}
-
-#[cfg(windows)]
-fn encode_path(path: &Path) -> String {
-    use std::os::windows::ffi::OsStrExt as _;
-    let bytes = path
-        .as_os_str()
-        .encode_wide()
-        .flat_map(u16::to_le_bytes)
-        .collect::<Vec<_>>();
-    format!("windows:{}", encode_lower_hex(&bytes))
 }
 
 #[cfg(test)]
@@ -318,7 +268,6 @@ mod tests {
         assert_ne!(first_name, workspace_name(&second, path));
     }
 
-    #[cfg(unix)]
     #[test]
     fn named_workspace_hash_has_a_stable_vector() {
         let config = config("12121212121212121212121212121212", Some("macbook"));

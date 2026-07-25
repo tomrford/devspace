@@ -1,0 +1,5 @@
+[repos.jj]
+url = "https://github.com/jj-vcs/jj.git"
+mode = "ref"
+ref = "v0.42.0"
+commit = "b8f7c455170e3273897aaf94431f8ccfb1afa7ad"

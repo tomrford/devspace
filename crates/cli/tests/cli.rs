@@ -16,19 +16,17 @@ use jj_lib::simple_op_store::SimpleOpStore;
 
 mod support;
 
-use support::{ds, ds_with_env, machine_store, settings, stderr, stdout};
+use support::{
+    append_cli_config, ds, ds_with_env, machine_store, settings, stderr, stdout, write_cli_config,
+};
 
 const FIXTURE_DESCRIPTION: &str = "bare repository fixture";
 
 fn write_fixture_cli_config(root: &Path) -> PathBuf {
-    let path = root.join("jj-config.toml");
-    fs::write(
+    let path = write_cli_config(root);
+    append_cli_config(
         &path,
         r#"
-            [user]
-            name = "Devspace Test"
-            email = "devspace@example.invalid"
-
             [aliases]
             fixture = ["log", "--no-graph"]
             catalog-fixture = ["-R", "machine-repo", "log", "--no-graph"]
@@ -38,54 +36,36 @@ fn write_fixture_cli_config(root: &Path) -> PathBuf {
 
             [templates]
             log = '"configured " ++ description.first_line() ++ "\n"'
-
-            [ui]
-            color = "never"
         "#,
-    )
-    .unwrap();
+    );
     path
 }
 
 fn write_colliding_alias_config(root: &Path) -> PathBuf {
-    let path = root.join("jj-config.toml");
-    fs::write(
+    let path = write_cli_config(root);
+    append_cli_config(
         &path,
         r#"
-            [user]
-            name = "Devspace Test"
-            email = "devspace@example.invalid"
-
             [aliases]
             init = ["git", "init"]
             unrelated = ["version"]
-
-            [ui]
-            color = "never"
         "#,
-    )
-    .unwrap();
+    );
     path
 }
 
 fn write_watchman_config(root: &Path) -> PathBuf {
-    let path = root.join("watchman-config.toml");
-    fs::write(
-        &path,
+    let path = write_cli_config(root);
+    let watchman = root.join("watchman-config.toml");
+    fs::rename(&path, &watchman).unwrap();
+    append_cli_config(
+        &watchman,
         r#"
-            [user]
-            name = "Devspace Test"
-            email = "devspace@example.invalid"
-
             [fsmonitor]
             backend = "watchman"
-
-            [ui]
-            color = "never"
         "#,
-    )
-    .unwrap();
-    path
+    );
+    watchman
 }
 
 fn repository_identity(repository_name: &str) -> RepositoryIdentity {
@@ -282,20 +262,18 @@ fn root_help_is_devspace_first() {
 }
 
 #[test]
-fn skill_prints_agent_guidance_without_a_checkout() {
+fn skill_without_a_topic_renders_the_core_topic() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_fixture_cli_config(temp.path());
 
     let output = ds(temp.path(), &config, &["skill"]);
 
     assert!(output.status.success(), "{}", stderr(&output));
-    let guidance = stdout(&output);
-    assert!(guidance.contains("best-effort Git shim is off by default"));
-    assert!(guidance.contains("ds config set git-shim true"));
-    assert!(guidance.contains("Canonical tracked hidden paths remain visible"));
-    assert!(guidance.contains("Git writes and all `jj` commands"));
-    assert!(guidance.contains("Git is a projection boundary"));
-    assert!(guidance.contains("It is not an ignore file"));
+    assert!(
+        stdout(&output).starts_with("# Devspace"),
+        "{}",
+        stdout(&output)
+    );
 }
 
 #[test]

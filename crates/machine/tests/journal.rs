@@ -1,38 +1,28 @@
 use std::collections::BTreeMap;
 use std::process::Command;
 
-#[allow(dead_code)]
-#[path = "../../cli/tests/support/fake_worker.rs"]
-mod fake_worker;
-use fake_worker::{create_server, respond};
-
-use devspace_kernel::{ObjectKind, Oid, parse_commit, validate};
+use devspace_kernel::{ObjectKind, Oid, parse_commit};
 use devspace_machine::{
     GitHttpTransport, GitProcessEnvironment, GitProcessMode, JournalFlowError, LeaseUpdate,
     MachineGitRepository, PushErrorKind, PushFailpoint, PushHead, QualifiedRef, RemoteUrl,
     fetch_with_journal, push, push_with_journal,
 };
-use gix::objs::{Kind as GitObjectKind, Write as _};
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use devspace_testutils::fake_worker::{create_server, respond};
 use jj_lib::settings::UserSettings;
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Journal Test"
-                email = "journal@example.invalid"
+mod common;
 
-                [git]
-                write-change-id-header = true
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
+use common::{create_live_repository, oid_hex, read_raw, write_commit, write_raw};
+
+const COMMIT_IDENTITY: &str = "Journal <journal@example.invalid>";
+/// The fixed `gpgsig` header the signed-identity fixtures carry.
+const SIGNATURE: &[(&[u8], &[u8])] = &[(
+    b"gpgsig",
+    b"-----BEGIN PGP SIGNATURE-----\n fake\n -----END PGP SIGNATURE-----",
+)];
+
+fn settings() -> UserSettings {
+    devspace_testutils::settings("Journal Test", "journal@example.invalid", true)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -42,7 +32,14 @@ async fn real_lease_push_preserves_signed_identity_bytes_and_observes_rejection(
         .await
         .unwrap();
     let tree = write_tree(&repository, b"signed identity");
-    let signed = write_commit(&repository, tree, &[], b"signed\n", true);
+    let signed = write_commit(
+        &repository,
+        COMMIT_IDENTITY,
+        tree,
+        &[],
+        b"signed\n",
+        SIGNATURE,
+    );
     let remote = temp.path().join("remote.git");
     let initialized = Command::new("git")
         .args(["init", "--bare", remote.to_str().unwrap()])
@@ -72,9 +69,16 @@ async fn real_lease_push_preserves_signed_identity_bytes_and_observes_rejection(
         .output()
         .unwrap();
     assert!(remote_bytes.status.success());
-    assert_eq!(remote_bytes.stdout, raw_object(&repository, signed));
+    assert_eq!(remote_bytes.stdout, read_raw(&repository, signed));
 
-    let next = write_commit(&repository, tree, &[signed], b"next\n", false);
+    let next = write_commit(
+        &repository,
+        COMMIT_IDENTITY,
+        tree,
+        &[signed],
+        b"next\n",
+        &[],
+    );
     let rejected = push(
         repository.git_repo_path(),
         &remote_url,
@@ -107,10 +111,11 @@ async fn up_to_date_push_does_not_request_the_pack_catalog_or_chunks() {
         .unwrap();
     let head = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         write_tree(&repository, b"already current"),
         &[],
         b"already current\n",
-        false,
+        &[],
     );
     let head_hex = oid_hex(head);
     let (base_url, server) = create_server(move |_, request, stream| {
@@ -192,10 +197,11 @@ async fn non_noop_push_omits_every_cloud_known_git_object() {
         .unwrap();
     let head = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         write_tree(&repository, b"known closure"),
         &[],
         b"known closure\n",
-        false,
+        &[],
     );
     let remote = temp.path().join("remote.git");
     let initialized = Command::new("git")
@@ -291,8 +297,22 @@ async fn identity_cursor_stops_clean_and_hidden_children_without_identity_states
         .await
         .unwrap();
     let tree = write_tree(&repository, b"public root");
-    let identity = write_commit(&repository, tree, &[], b"identity root\n", false);
-    let clean = write_commit(&repository, tree, &[identity], b"clean child\n", false);
+    let identity = write_commit(
+        &repository,
+        COMMIT_IDENTITY,
+        tree,
+        &[],
+        b"identity root\n",
+        &[],
+    );
+    let clean = write_commit(
+        &repository,
+        COMMIT_IDENTITY,
+        tree,
+        &[identity],
+        b"clean child\n",
+        &[],
+    );
     let (hidden, _) = write_hidden_commit(&repository, Some(identity), b"hidden child");
     let remote = temp.path().join("remote.git");
     let initialized = Command::new("git")
@@ -441,7 +461,14 @@ async fn settled_aborted_claim_refreshes_without_requesting_replay() {
         .await
         .unwrap();
     let tree = write_tree(&repository, b"claim race");
-    let head = write_commit(&repository, tree, &[], b"claim race\n", false);
+    let head = write_commit(
+        &repository,
+        COMMIT_IDENTITY,
+        tree,
+        &[],
+        b"claim race\n",
+        &[],
+    );
     let remote = temp.path().join("remote.git");
     let initialized = Command::new("git")
         .args(["init", "--bare", remote.to_str().unwrap()])
@@ -574,7 +601,7 @@ async fn settled_aborted_claim_refreshes_without_requesting_replay() {
 }
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
-async fn live_v2_journal_push_recovery_and_fetch_proofs() {
+async fn live_journal_push_recovery_and_fetch_proofs() {
     let total = std::time::Instant::now();
     let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
     let shared_secret =
@@ -621,7 +648,8 @@ async fn live_v2_journal_push_recovery_and_fetch_proofs() {
         }
         panic!("crash child did not reach AFTER_PUSH: {result:?}");
     }
-    let (repository_id, incarnation) = create_live_repository(&base_url, &shared_secret).await;
+    let (repository_id, incarnation) =
+        create_live_repository(&base_url, &shared_secret, "git-journal-spike").await;
     let machine_a = "11".repeat(16);
     let machine_b = "22".repeat(16);
     let transport_a = GitHttpTransport::new(
@@ -690,8 +718,15 @@ async fn live_v2_journal_push_recovery_and_fetch_proofs() {
     // (b) An identity-projected signed commit crosses a real push byte-for-byte.
     let started = std::time::Instant::now();
     let signed_tree = write_tree(&a, b"signed live identity");
-    let signed = write_commit(&a, signed_tree, &[], b"signed live\n", true);
-    let signed_bytes = raw_object(&a, signed);
+    let signed = write_commit(
+        &a,
+        COMMIT_IDENTITY,
+        signed_tree,
+        &[],
+        b"signed live\n",
+        SIGNATURE,
+    );
+    let signed_bytes = read_raw(&a, signed);
     let signed_result = push_with_journal(
         &a,
         &transport_a,
@@ -729,7 +764,7 @@ async fn live_v2_journal_push_recovery_and_fetch_proofs() {
     let crashed = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "live_v2_journal_push_recovery_and_fetch_proofs",
+            "live_journal_push_recovery_and_fetch_proofs",
             "--ignored",
             "--nocapture",
         ])
@@ -777,11 +812,8 @@ async fn live_v2_journal_push_recovery_and_fetch_proofs() {
     .unwrap();
     assert_eq!(recovered.recovered_batches, vec![[0x33; 16]]);
     assert_eq!(recovered.outcome, "up-to-date");
-    assert_eq!(raw_object(&b, crash_head), raw_object(&a, crash_head));
-    assert_eq!(
-        raw_object(&b, pending_public),
-        raw_object(&a, pending_public)
-    );
+    assert_eq!(read_raw(&b, crash_head), read_raw(&a, crash_head));
+    assert_eq!(read_raw(&b, pending_public), read_raw(&a, pending_public));
     let recovered_snapshot = transport_b.projection_snapshot_all().await.unwrap();
     assert!(recovered_snapshot.pending.is_empty());
     assert_eq!(
@@ -798,13 +830,14 @@ async fn live_v2_journal_push_recovery_and_fetch_proofs() {
     // (d) A foreign child of rewritten public P is fetched, hidden state is
     // replayed onto it, recordFetch stores L(F)->F, and the next push reuses it.
     let started = std::time::Instant::now();
-    let public_tree = parse_commit(&raw_object(&a, public_main)).unwrap().tree;
+    let public_tree = parse_commit(&read_raw(&a, public_main)).unwrap().tree;
     let foreign = write_commit(
         &a,
+        COMMIT_IDENTITY,
         public_tree,
         &[public_main],
         b"foreign after projected history\n",
-        false,
+        &[],
     );
     let direct = push(
         a.git_repo_path(),
@@ -839,7 +872,7 @@ async fn live_v2_journal_push_recovery_and_fetch_proofs() {
     assert_eq!(fetched.mirrors[0].public_parents, vec![public_main]);
     assert_eq!(fetched.mirrors[0].canonical_parents, vec![hidden_head]);
     assert!(fetched.disclosure_warnings.is_empty());
-    let canonical_foreign_bytes = raw_object(&b, fetched.canonical_heads["main"]);
+    let canonical_foreign_bytes = read_raw(&b, fetched.canonical_heads["main"]);
     let canonical_foreign = parse_commit(&canonical_foreign_bytes).unwrap();
     assert_eq!(canonical_foreign.parents, vec![hidden_head]);
     assert!(tree_has_entry(&b, canonical_foreign.tree, b".dsprivate"));
@@ -877,7 +910,7 @@ async fn live_v2_journal_push_recovery_and_fetch_proofs() {
     .unwrap();
     let public_after_fetch = pushed_after_fetch.public_heads["main"].unwrap();
     assert_eq!(
-        parse_commit(&raw_object(&b, public_after_fetch))
+        parse_commit(&read_raw(&b, public_after_fetch))
             .unwrap()
             .parents,
         vec![foreign]
@@ -965,70 +998,22 @@ fn write_hidden_commit(
     (
         write_commit(
             repository,
+            COMMIT_IDENTITY,
             tree,
             &parent.into_iter().collect::<Vec<_>>(),
             b"hidden live\n",
-            false,
+            &[],
         ),
         secret.to_vec(),
     )
 }
 
-fn write_commit(
-    repository: &MachineGitRepository,
-    tree: Oid,
-    parents: &[Oid],
-    message: &[u8],
-    signed: bool,
-) -> Oid {
-    let mut bytes = format!("tree {}\n", oid_hex(tree)).into_bytes();
-    for parent in parents {
-        bytes.extend_from_slice(format!("parent {}\n", oid_hex(*parent)).as_bytes());
-    }
-    bytes.extend_from_slice(b"author Journal <journal@example.invalid> 1700000000 +0000\n");
-    bytes.extend_from_slice(b"committer Journal <journal@example.invalid> 1700000000 +0000\n");
-    if signed {
-        bytes.extend_from_slice(
-            b"gpgsig -----BEGIN PGP SIGNATURE-----\n fake\n -----END PGP SIGNATURE-----\n",
-        );
-    }
-    bytes.push(b'\n');
-    bytes.extend_from_slice(message);
-    write_raw(repository, ObjectKind::Commit, &bytes)
-}
-
-fn write_raw(repository: &MachineGitRepository, kind: ObjectKind, bytes: &[u8]) -> Oid {
-    let expected = validate(kind, bytes).unwrap().id;
-    let git = gix::open(repository.git_repo_path()).unwrap();
-    let git_kind = match kind {
-        ObjectKind::Blob => GitObjectKind::Blob,
-        ObjectKind::Tree => GitObjectKind::Tree,
-        ObjectKind::Commit => GitObjectKind::Commit,
-    };
-    let actual = git.objects.write_buf(git_kind, bytes).unwrap();
-    assert_eq!(actual.as_bytes(), expected.0);
-    expected
-}
-
-fn raw_object(repository: &MachineGitRepository, id: Oid) -> Vec<u8> {
-    gix::open(repository.git_repo_path())
-        .unwrap()
-        .find_object(gix::ObjectId::from_bytes_or_panic(&id.0))
-        .unwrap()
-        .data
-        .clone()
-}
-
 fn tree_has_entry(repository: &MachineGitRepository, tree: Oid, name: &[u8]) -> bool {
-    devspace_kernel::parse_tree(&raw_object(repository, tree))
+    devspace_kernel::parse_tree(&read_raw(repository, tree))
         .unwrap()
         .entries
         .iter()
         .any(|entry| entry.name == name)
-}
-
-fn oid_hex(id: Oid) -> String {
-    id.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn remote_ref(remote: &std::path::Path, bookmark: &str) -> Oid {
@@ -1081,37 +1066,4 @@ fn assert_remote_blobs_exclude(remote: &std::path::Path, sentinel: &[u8]) {
             "private sentinel reached remote blob {oid}"
         );
     }
-}
-
-async fn create_live_repository(base_url: &str, shared_secret: &str) -> (String, String) {
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct CreatedRepository {
-        repository_id: String,
-        incarnation: String,
-    }
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let response = reqwest::Client::new()
-        .post(format!("{}/repositories", base_url.trim_end_matches('/')))
-        .header("authorization", format!("Bearer {shared_secret}"))
-        .header("x-devspace-machine-id", "11".repeat(16))
-        .json(&serde_json::json!({
-            "name": format!("git-journal-spike-{suffix}"),
-            "idempotencyKey": format!("{suffix:032x}"),
-        }))
-        .send()
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = response.bytes().await.unwrap();
-    assert!(
-        status.is_success(),
-        "create failed {status}: {}",
-        String::from_utf8_lossy(&bytes)
-    );
-    let created: CreatedRepository = serde_json::from_slice(&bytes).unwrap();
-    (created.repository_id, created.incarnation)
 }

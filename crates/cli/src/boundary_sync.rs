@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -43,36 +43,25 @@ pub(crate) fn configure_checkout_hooks(settings: &UserSettings) -> Result<(), Co
         }
         Err(error) => return Err(user_error(error.to_string())),
     };
-    let mut state = state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = state();
     state.git_shim = Some((git_shim, settings.clone()));
     state.context_auto_sync = context_auto_sync;
     Ok(())
 }
 
 pub(crate) fn record_checkout(path: &Path) {
-    state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .checkouts
-        .insert(path.to_owned());
+    state().checkouts.insert(path.to_owned());
 }
 
 pub(crate) fn context_auto_sync_enabled() -> bool {
-    state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .context_auto_sync
+    state().context_auto_sync
 }
 
 pub(crate) fn record_checkout_movement(
     path: &Path,
     clear_messages: Vec<crate::context::SyncMessage>,
 ) {
-    let mut state = state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = state();
     state.checkouts.insert(path.to_owned());
     state
         .moved_checkouts
@@ -82,9 +71,7 @@ pub(crate) fn record_checkout_movement(
 }
 
 pub(crate) fn relocate_checkout(from: &Path, to: &Path) {
-    let mut state = state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = state();
     if state.checkouts.remove(from) {
         state.checkouts.insert(to.to_owned());
     }
@@ -97,9 +84,14 @@ pub(crate) fn relocate_checkout(from: &Path, to: &Path) {
     }
 }
 
-fn state() -> &'static Mutex<BoundarySyncState> {
+/// Poison is recovered: a panicked command must not disable the checkout
+/// hooks for the rest of the process.
+fn state() -> MutexGuard<'static, BoundarySyncState> {
     static STATE: OnceLock<Mutex<BoundarySyncState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(BoundarySyncState::default()))
+    STATE
+        .get_or_init(|| Mutex::new(BoundarySyncState::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub(crate) fn record(entry: &CatalogEntry) {
@@ -107,8 +99,6 @@ pub(crate) fn record(entry: &CatalogEntry) {
         return;
     };
     state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .repositories
         .insert(entry.name.clone(), repository_directory.to_owned());
 }
@@ -131,9 +121,7 @@ pub(crate) fn record_repository_path(path: &Path) {
 }
 
 pub(crate) fn suppress() {
-    let mut state = state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = state();
     state.suppressed = true;
     state.repositories.clear();
     state.checkouts.clear();
@@ -141,9 +129,7 @@ pub(crate) fn suppress() {
 }
 
 pub(crate) fn suppress_repository_sync() {
-    let mut state = state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = state();
     state.repository_sync_suppressed = true;
     state.repositories.clear();
 }
@@ -158,9 +144,7 @@ pub(crate) fn spawn_recorded(command_succeeded: bool) {
         context_auto_sync,
         git_shim,
     ) = {
-        let mut state = state()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = state();
         (
             state.suppressed,
             state.repository_sync_suppressed,
@@ -195,8 +179,7 @@ pub(crate) fn spawn_recorded(command_succeeded: bool) {
     let Ok(executable) = std::env::current_exe() else {
         return;
     };
-    let daemon_enabled =
-        crate::daemon::SUPPORTED && !std::env::var_os(DAEMON_ENV).is_some_and(|value| value == "0");
+    let daemon_enabled = !std::env::var_os(DAEMON_ENV).is_some_and(|value| value == "0");
     let store = daemon_enabled
         .then(MachineStore::platform_default)
         .and_then(Result::ok);
@@ -237,39 +220,47 @@ fn auto_sync_context(checkout_root: &Path, clear_messages: Vec<crate::context::S
         Ok(report) => {
             match crate::context::aliases_not_ignored_at(checkout_root) {
                 Ok(true) => {
-                    let _ = writeln!(
+                    writeln!(
                         stderr,
                         "Warning: {}",
                         crate::context::ALIASES_NOT_IGNORED_WARNING
-                    );
+                    )
+                    .ok();
                 }
                 Ok(false) => {}
                 Err(error) => {
                     let error = crate::context::redact_url_userinfo(&format!("{error:#}"));
-                    let _ = writeln!(
+                    writeln!(
                         stderr,
                         "Warning: could not check context ignore policy in {} after working-copy movement ({error})",
                         checkout_root.display()
-                    );
+                    ).ok();
                 }
             }
             if report.warned {
-                let _ = writeln!(
+                writeln!(
                     stderr,
                     "Warning: `ds context sync` completed with warnings in {} after working-copy movement; run it manually to retry",
                     checkout_root.display()
-                );
+                ).ok();
             }
         }
         Err(error) => {
             let error = crate::context::redact_url_userinfo(&format!("{error:#}"));
-            let _ = writeln!(
+            writeln!(
                 stderr,
                 "Warning: could not sync context in {} after working-copy movement ({error}); the context state may be inconsistent, so rewrite or rebuild it manually",
                 checkout_root.display()
-            );
+            ).ok();
         }
     }
+}
+
+/// The user-facing channel for a post-command hook that failed. jj's default
+/// tracing subscriber discards anything below ERROR, so a hook that only logs
+/// is silent.
+pub(crate) fn warn(text: &str) {
+    writeln!(io::stderr().lock(), "Warning: {text}").ok();
 }
 
 fn write_context_message(output: &mut impl Write, message: crate::context::SyncMessage) {
@@ -280,7 +271,7 @@ fn write_context_message(output: &mut impl Write, message: crate::context::SyncM
         }
     };
     let text = crate::context::redact_url_userinfo(&message.text);
-    let _ = writeln!(output, "{prefix}{text}");
+    writeln!(output, "{prefix}{text}").ok();
 }
 
 fn spawn_daemon(executable: &Path, machine_store_root: &Path) {
@@ -292,7 +283,7 @@ fn spawn_daemon(executable: &Path, machine_store_root: &Path) {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     detach(&mut command);
-    let _ = command.spawn();
+    command.spawn().ok();
 }
 
 fn spawn_one_shot(executable: &Path, name: &RepositoryName, repository_directory: &Path) {
@@ -312,22 +303,10 @@ fn spawn_one_shot(executable: &Path, name: &RepositoryName, repository_directory
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(error_log));
     detach(&mut command);
-    let _ = command.spawn();
+    command.spawn().ok();
 }
 
-#[cfg(unix)]
 fn detach(command: &mut Command) {
     use std::os::unix::process::CommandExt as _;
     command.process_group(0);
 }
-
-#[cfg(windows)]
-fn detach(command: &mut Command) {
-    use std::os::windows::process::CommandExt as _;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn detach(_command: &mut Command) {}

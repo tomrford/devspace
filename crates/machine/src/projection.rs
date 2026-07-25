@@ -1,7 +1,6 @@
 //! Hidden-path projection inside the canonical Git object database.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,7 +20,8 @@ use thiserror::Error;
 
 use crate::{MachineGitRepository, ObjectClosureError};
 
-const DSPRIVATE: &str = ".dsprivate";
+/// Name of the per-directory file that selects the paths Devspace keeps private.
+pub const DSPRIVATE: &str = ".dsprivate";
 const HIDDEN_SET_DOMAIN: &[u8] = b"devspace-hidden-set-v1";
 const HIDDEN_CHAIN_DOMAIN: &[u8] = b"devspace-hidden-chain-v1";
 
@@ -502,7 +502,7 @@ pub(crate) fn rewrite_commit(
 fn write_oid_header(output: &mut Vec<u8>, name: &[u8], id: Oid) {
     output.extend_from_slice(name);
     output.push(b' ');
-    output.extend_from_slice(oid_hex(id).as_bytes());
+    output.extend_from_slice(crate::encode_lower_hex(&id.0).as_bytes());
     output.push(b'\n');
 }
 
@@ -553,7 +553,7 @@ pub(crate) async fn resolve_hidden_set_for_tree(
     cache: &mut HiddenSetCache,
 ) -> Result<HiddenSet, ProjectionError> {
     let mut candidate_paths = BTreeSet::new();
-    for tree_id in merged_tree.tree_ids().iter() {
+    for tree_id in merged_tree.tree_ids() {
         for path in
             collect_dsprivate_paths(store, RepoPath::root(), tree_id, &mut cache.trees).await?
         {
@@ -759,10 +759,6 @@ fn write_object(
     Oid::from_bytes(id.as_bytes()).ok_or(ProjectionError::UnexpectedObjectIdLength {
         actual: id.as_bytes().len(),
     })
-}
-
-fn oid_hex(id: Oid) -> String {
-    crate::hex(&id.0)
 }
 
 #[derive(Debug, Error)]

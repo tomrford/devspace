@@ -5,7 +5,9 @@ use devspace_kernel::{ValidationError, validate};
 use thiserror::Error;
 
 use crate::pack_manifest::{ChunkEntry, ObjectEntry, PackManifest, PackManifestError};
-use crate::{MachineGitRepository, ObjectClosure, ObjectClosureError, ObjectKey, Oid, hex};
+use crate::{
+    MachineGitRepository, ObjectClosure, ObjectClosureError, ObjectKey, Oid, encode_lower_hex,
+};
 
 pub type Digest = [u8; 64];
 
@@ -52,25 +54,11 @@ impl PackOptions {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PackMetrics {
-    pub discovered_objects: usize,
-    pub skipped_known_objects: usize,
-    pub packed_objects: usize,
-    pub packed_bytes: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuiltPack {
     pub id: Digest,
     pub manifest: PackManifest,
     pub manifest_bytes: Vec<u8>,
     pub chunks: Vec<Vec<u8>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BuiltPacks {
-    pub packs: Vec<BuiltPack>,
-    pub metrics: PackMetrics,
 }
 
 pub struct PackProducer<'a> {
@@ -79,7 +67,6 @@ pub struct PackProducer<'a> {
     objects: Vec<&'a crate::MachineObject>,
     next_object: usize,
     options: PackOptions,
-    metrics: PackMetrics,
 }
 
 impl<'a> PackProducer<'a> {
@@ -91,10 +78,6 @@ impl<'a> PackProducer<'a> {
     ) -> Result<Self, PackBuildError> {
         options.validate()?;
         let mut objects = dependency_order(&closure.objects)?;
-        let skipped_known_objects = objects
-            .iter()
-            .filter(|object| known_objects.contains(&object.key))
-            .count();
         objects.retain(|object| !known_objects.contains(&object.key));
         if closure.head_commits.len() > MAX_PACK_HEADS {
             return Err(PackBuildError::TooManyHeads(closure.head_commits.len()));
@@ -105,12 +88,6 @@ impl<'a> PackProducer<'a> {
             objects,
             next_object: 0,
             options,
-            metrics: PackMetrics {
-                discovered_objects: closure.objects.len(),
-                skipped_known_objects,
-                packed_objects: 0,
-                packed_bytes: 0,
-            },
         })
     }
 
@@ -147,19 +124,13 @@ impl<'a> PackProducer<'a> {
             if validated.id != object.key.id {
                 return Err(PackBuildError::ObjectIdMismatch {
                     key: object.key,
-                    actual: hex(&validated.id.0),
+                    actual: encode_lower_hex(&validated.id.0),
                 });
             }
-            self.metrics.packed_objects += 1;
-            self.metrics.packed_bytes += bytes.len() as u64;
             builder.push(object.key, bytes);
             self.next_object += 1;
         }
         Ok(Some(builder.finish(self.head_commits)?))
-    }
-
-    pub fn metrics(&self) -> &PackMetrics {
-        &self.metrics
     }
 }
 
@@ -168,16 +139,13 @@ pub fn build_packs(
     closure: &ObjectClosure,
     known_objects: &BTreeSet<ObjectKey>,
     options: PackOptions,
-) -> Result<BuiltPacks, PackBuildError> {
+) -> Result<Vec<BuiltPack>, PackBuildError> {
     let mut producer = PackProducer::new(repository, closure, known_objects, options)?;
     let mut packs = Vec::new();
     while let Some(pack) = producer.next_pack()? {
         packs.push(pack);
     }
-    Ok(BuiltPacks {
-        metrics: producer.metrics().clone(),
-        packs,
-    })
+    Ok(packs)
 }
 
 fn dependency_order(

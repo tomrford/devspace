@@ -1,26 +1,24 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { gitToHex } from "./kernel";
-import { lowerHexStringSchema } from "./validation";
+import { identifierSchema, lowerHexStringSchema } from "./validation";
 
-const idSchema = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,127}$/);
 const machineIdSchema = lowerHexStringSchema(16, "machine ID");
-const repositoryNameSchema = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,127}$/);
 const repositoryIdSchema = lowerHexStringSchema(32, "repository ID");
 const incarnationSchema = lowerHexStringSchema(16, "incarnation");
 const creationNonceSchema = lowerHexStringSchema(16, "creation nonce");
 const idempotencyKeySchema = lowerHexStringSchema(16, "idempotencyKey");
-const identitySchema = z.strictObject({ userId: idSchema, machineId: machineIdSchema });
+const identitySchema = z.strictObject({ userId: identifierSchema, machineId: machineIdSchema });
 const repositoryAuthoritySchema = identitySchema.extend({
   repositoryId: repositoryIdSchema,
   incarnation: incarnationSchema,
   creationNonce: creationNonceSchema,
 });
 const createRepositorySchema = z.strictObject({
-  name: repositoryNameSchema,
+  name: identifierSchema,
   idempotencyKey: idempotencyKeySchema,
 });
-const renameRepositorySchema = z.strictObject({ newName: repositoryNameSchema });
+const renameRepositorySchema = z.strictObject({ newName: identifierSchema });
 const deleteRepositorySchema = z.strictObject({
   repositoryId: repositoryIdSchema,
   incarnation: incarnationSchema,
@@ -634,7 +632,7 @@ function decodeDeleteRepository(value: unknown) {
 }
 
 function requireRepositoryName(value: unknown): string {
-  return repositoryNameSchema.parse(value);
+  return identifierSchema.parse(value);
 }
 
 function requireRepositoryId(value: unknown): string {

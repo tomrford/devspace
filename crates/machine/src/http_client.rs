@@ -8,12 +8,16 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const TEST_HOOKS_ENV: &str = "DEVSPACE_HTTP_TEST_HOOKS";
 const TEST_REQUEST_TIMEOUT_MS_ENV: &str = "DEVSPACE_HTTP_TEST_REQUEST_TIMEOUT_MS";
 
+// The advertised transport capability. A jj bump that changes the canonical bytes of a
+// stored object rolls out as a new token here, so it must have exactly one definition.
+const CLIENT_CAPABILITY: &str = "git-pack/2";
+
 pub(crate) fn hardened_http_client() -> Result<reqwest::Client, reqwest::Error> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "x-devspace-client",
         reqwest::header::HeaderValue::from_str(&format!(
-            "ds/{} git-pack/2",
+            "ds/{} {CLIENT_CAPABILITY}",
             env!("CARGO_PKG_VERSION"),
         ))
         .expect("client version header is static ASCII"),

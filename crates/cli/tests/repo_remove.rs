@@ -8,7 +8,7 @@ use devspace_machine::{
 
 mod support;
 
-use support::fake_worker::{create_server, respond};
+use devspace_testutils::fake_worker::{create_server, respond};
 use support::{configure_machine, ds, machine_store, settings, stderr, stdout, write_cli_config};
 
 const REPOSITORY_NAME: &str = "removable";

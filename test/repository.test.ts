@@ -1,6 +1,6 @@
 import { env, exports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import gitGolden from "../crates/kernel/tests/git_golden.txt?raw";
 import { Kernel, gitToHex } from "../src/kernel";
 import {
@@ -9,17 +9,19 @@ import {
   decodeGitManifest,
 } from "../src/pack_protocol";
 import fixtures from "./fixtures/repository.json";
+import {
+  DEFAULT_MACHINE,
+  authorizationFor,
+  countRows,
+  decodeHex,
+  ensureRepository,
+  json,
+  repositoryGitStub,
+  routeRequest,
+} from "./support";
 
-const defaultMachine = "a6".repeat(16);
-const repositories = new Map<string, { repositoryId: string; incarnation: string }>();
-let authorization: Record<string, string>;
-
-beforeAll(() => {
-  authorization = authorizationFor(defaultMachine);
-});
-
-describe("Git v2 manifest and validation kernel", () => {
-  it("parses Rust-generated v2 manifests and rejects malformed real Git vectors", () => {
+describe("Git manifest and validation kernel", () => {
+  it("parses Rust-generated DSPK v2 manifests and rejects malformed real Git vectors", () => {
     const manifest = decodeGitManifest(decodeHex(fixtures.complete.manifest));
     expect(manifest).toMatchObject({
       chunkBytes: 64 * 1024,
@@ -53,9 +55,16 @@ describe("Git v2 manifest and validation kernel", () => {
     noncanonicalManifest[6] = 1;
     expect(() => decodeGitManifest(noncanonicalManifest)).toThrow("reserved bytes must be zero");
   });
+
+  it("refuses every manifest the Rust encoder refuses", () => {
+    expect(fixtures.rejections).toHaveLength(9);
+    for (const rejection of fixtures.rejections) {
+      expect(() => decodeGitManifest(decodeHex(rejection.manifest)), rejection.slug).toThrow();
+    }
+  });
 });
 
-describe("Git v2 repository object store", () => {
+describe("Git repository object store", () => {
   it("quarantines, retries and atomically installs a pack idempotently", async () => {
     const fixture = decodedFixture(fixtures.complete);
     expect(await json(await putManifest("git-install", fixture))).toEqual({
@@ -81,10 +90,10 @@ describe("Git v2 repository object store", () => {
     });
 
     const stub = await repositoryGitStub("git-install");
-    expect(await stub.countObjects()).toBe(3);
-    expect(await stub.countObjectReferences()).toBe(2);
-    expect(await stub.countInstalledPacks()).toBe(1);
-    expect(await stub.countQuarantinedPacks()).toBe(0);
+    expect(await countRows(stub, "objects")).toBe(3);
+    expect(await countRows(stub, "object_references")).toBe(2);
+    expect(await countRows(stub, "installed_packs")).toBe(1);
+    expect(await countRows(stub, "pack_uploads")).toBe(0);
     expect(await json(await install("git-install", fixture.id))).toEqual({
       installed: false,
       insertedObjects: 0,
@@ -250,6 +259,43 @@ describe("Git v2 repository object store", () => {
     expect(await response.json()).toEqual({ error: "request failed" });
   });
 
+  it("faults instead of reporting a stale authority when the authority store throws", async () => {
+    const name = "git-authority-fault";
+    const authority = await repositoryAuthority(name);
+    const stub = await repositoryGitStub(name);
+    expect(await stub.initializeRepository(authority)).toMatchObject({ ok: true });
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE repository_state");
+    });
+
+    expect(await failure(() => stub.initializeRepository(authority))).toMatch("repository_state");
+    expect(await failure(() => stub.retireRepository(authority))).toMatch("repository_state");
+  });
+
+  it("stays readable after a kernel trap on the installed-manifest path", async () => {
+    const name = "git-kernel-trap";
+    const fixture = decodedFixture(fixtures.complete);
+    await putManifest(name, fixture);
+    await putChunk(name, fixture, 0);
+    expect(await json(await install(name, fixture.id))).toMatchObject({ installed: true });
+    await runInDurableObject(await repositoryGitStub(name), (instance) => {
+      const repository = instance as unknown as {
+        packs: { kernel: { exports: Record<string, unknown> } };
+      };
+      repository.packs.kernel.exports = {
+        ...repository.packs.kernel.exports,
+        kernel_hash_new: () => {
+          throw new WebAssembly.RuntimeError("unreachable");
+        },
+      };
+    });
+
+    const trapped = await routeRequest(name, `git/packs/${fixture.id}/manifest`, { method: "GET" });
+    expect(trapped.status).toBe(500);
+    expect(await trapped.json()).toEqual({ error: "Git repository storage failed" });
+    expect(await downloadManifest(name, fixture.id)).toEqual(fixture.manifest);
+  });
+
   it("rejects an incomplete closure, then installs it after the dependency arrives", async () => {
     const missing = decodedFixture(fixtures.missingReference);
     await putManifest("git-closure", missing);
@@ -261,9 +307,9 @@ describe("Git v2 repository object store", () => {
     });
 
     const stub = await repositoryGitStub("git-closure");
-    expect(await stub.countObjects()).toBe(0);
-    expect(await stub.countInstalledPacks()).toBe(0);
-    expect(await stub.countQuarantinedPacks()).toBe(1);
+    expect(await countRows(stub, "objects")).toBe(0);
+    expect(await countRows(stub, "installed_packs")).toBe(0);
+    expect(await countRows(stub, "pack_uploads")).toBe(1);
 
     const dependency = decodedFixture(fixtures.dependency);
     await putManifest("git-closure", dependency);
@@ -276,9 +322,9 @@ describe("Git v2 repository object store", () => {
       installed: true,
       insertedObjects: 2,
     });
-    expect(await stub.countObjects()).toBe(3);
-    expect(await stub.countInstalledPacks()).toBe(2);
-    expect(await stub.countQuarantinedPacks()).toBe(0);
+    expect(await countRows(stub, "objects")).toBe(3);
+    expect(await countRows(stub, "installed_packs")).toBe(2);
+    expect(await countRows(stub, "pack_uploads")).toBe(0);
   });
 
   it("rolls back earlier inserts when a later golden-derived object is malformed", async () => {
@@ -290,10 +336,10 @@ describe("Git v2 repository object store", () => {
     expect(await rejected.json()).toMatchObject({ error: expect.stringContaining("object 1 is invalid") });
 
     const stub = await repositoryGitStub("git-malformed");
-    expect(await stub.countObjects()).toBe(0);
-    expect(await stub.countObjectReferences()).toBe(0);
-    expect(await stub.countInstalledPacks()).toBe(0);
-    expect(await stub.countQuarantinedPacks()).toBe(1);
+    expect(await countRows(stub, "objects")).toBe(0);
+    expect(await countRows(stub, "object_references")).toBe(0);
+    expect(await countRows(stub, "installed_packs")).toBe(0);
+    expect(await countRows(stub, "pack_uploads")).toBe(1);
   });
 
   it("sanitizes unexpected Git kernel failures instead of classifying them as validation", async () => {
@@ -346,7 +392,10 @@ describe("Git v2 repository object store", () => {
     const stale = await exports.default.fetch(
       new Request(`${base}/manifest`, {
         method: "PUT",
-        headers: { ...authorization, "x-devspace-incarnation": "00".repeat(16) },
+        headers: {
+          ...authorizationFor(DEFAULT_MACHINE),
+          "x-devspace-incarnation": "00".repeat(16),
+        },
         body: fixture.manifest,
       }),
     );
@@ -357,7 +406,10 @@ describe("Git v2 repository object store", () => {
       (
         await exports.default.fetch(
           new Request(`${base}/manifest`, {
-            headers: { ...authorization, "x-devspace-incarnation": "00".repeat(16) },
+            headers: {
+              ...authorizationFor(DEFAULT_MACHINE),
+              "x-devspace-incarnation": "00".repeat(16),
+            },
           }),
         )
       ).status,
@@ -432,8 +484,8 @@ describe("Git v2 repository object store", () => {
     await evictDurableObject(await repositoryGitStub("git-eviction"));
 
     const reloaded = await repositoryGitStub("git-eviction");
-    expect(await reloaded.countObjects()).toBe(3);
-    expect(await reloaded.countInstalledPacks()).toBe(1);
+    expect(await countRows(reloaded, "objects")).toBe(3);
+    expect(await countRows(reloaded, "installed_packs")).toBe(1);
     expect(await json(await putManifest("git-eviction", fixture))).toEqual({
       inserted: false,
       installed: true,
@@ -441,7 +493,7 @@ describe("Git v2 repository object store", () => {
   });
 });
 
-describe("Git v2 operation store and heads", () => {
+describe("Git operation store and heads", () => {
   it("rejects noncanonical objects and converges concurrent heads idempotently", async () => {
     const name = "git-ops-convergence";
     const kernel = new Kernel();
@@ -538,7 +590,7 @@ describe("Git v2 operation store and heads", () => {
       cursor: 1,
       heads: [operation],
     });
-    expect(await (await repositoryGitStub(name)).countOpObjects()).toBe(2);
+    expect(await countRows(await repositoryGitStub(name), "op_objects")).toBe(2);
   });
 
   it("keeps validation public but sanitizes unexpected operation storage failures", async () => {
@@ -585,50 +637,15 @@ function decodedFixture(fixture: EncodedFixture): DecodedFixture {
   };
 }
 
-async function ensureRepository(name: string) {
-  const existing = repositories.get(name);
-  if (existing !== undefined) return existing;
-  const response = await exports.default.fetch(
-    new Request("https://example.com/repositories", {
-      method: "POST",
-      headers: { ...authorization, "content-type": "application/json" },
-      body: JSON.stringify({ name, idempotencyKey: randomHex(16) }),
-    }),
-  );
-  if (!response.ok) throw new Error(`failed to create repository: ${await response.text()}`);
-  const repository = (await response.json()) as { repositoryId: string; incarnation: string };
-  repositories.set(name, repository);
-  return repository;
-}
-
 async function repositoryAuthority(name: string) {
   const repository = await ensureRepository(name);
   const authorized = await env.CONTROL_PLANE.getByName("directory").authorizeRepository(
-    { userId: env.DEVSPACE_DEVELOPMENT_USER_ID, machineId: defaultMachine },
+    { userId: env.DEVSPACE_DEVELOPMENT_USER_ID, machineId: DEFAULT_MACHINE },
     repository.repositoryId,
     repository.incarnation,
   );
   if (!authorized.ok) throw new Error(authorized.error);
   return authorized.authority;
-}
-
-async function repositoryGitStub(name: string) {
-  const repository = await ensureRepository(name);
-  return env.REPOSITORIES.getByName(repository.repositoryId);
-}
-
-async function routeRequest(name: string, path: string, init: RequestInit) {
-  const repository = await ensureRepository(name);
-  return exports.default.fetch(
-    new Request(`https://example.com/repositories/${repository.repositoryId}/${path}`, {
-      ...init,
-      headers: {
-        ...authorization,
-        "x-devspace-incarnation": repository.incarnation,
-        ...init.headers,
-      },
-    }),
-  );
 }
 
 function putManifest(name: string, fixture: DecodedFixture) {
@@ -780,24 +797,17 @@ function blobFixture(index: number): DecodedFixture {
   return { id: gitToHex(kernel.hash([manifest])), manifest, chunks: [bytes] };
 }
 
-function authorizationFor(machineId: string): Record<string, string> {
-  return {
-    authorization: `Bearer ${env.DEVSPACE_SHARED_SECRET}`,
-    "x-devspace-machine-id": machineId,
-  };
-}
-
-function randomHex(bytes: number): string {
-  return Array.from(crypto.getRandomValues(new Uint8Array(bytes)), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
-}
-
-function decodeHex(value: string): Uint8Array {
-  if (value.length % 2 !== 0) throw new Error("odd-length hex fixture");
-  return Uint8Array.from({ length: value.length / 2 }, (_, index) =>
-    Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
-  );
+/**
+ * Runs a Durable Object call that must fault rather than return a protocol
+ * envelope, and reports the rejection message.
+ */
+async function failure(operation: () => Promise<unknown>): Promise<string> {
+  try {
+    const returned = await operation();
+    throw new Error(`expected a rejection, got ${JSON.stringify(returned)}`);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
 }
 
 function findSequence(bytes: Uint8Array, sequence: Uint8Array): number {
@@ -805,9 +815,4 @@ function findSequence(bytes: Uint8Array, sequence: Uint8Array): number {
     if (sequence.every((byte, offset) => bytes[index + offset] === byte)) return index;
   }
   throw new Error(`sequence not found in ${gitToHex(bytes)}`);
-}
-
-async function json(response: Response): Promise<unknown> {
-  expect(response.status).toBe(200);
-  return response.json();
 }

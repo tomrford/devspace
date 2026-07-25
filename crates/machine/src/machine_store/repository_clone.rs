@@ -37,10 +37,6 @@ impl StagedRepositoryClone {
         &self.sync_path
     }
 
-    pub fn packs_path(&self) -> &Path {
-        &self.packs_path
-    }
-
     pub async fn publish(
         mut self,
         settings: &UserSettings,
@@ -66,7 +62,7 @@ impl StagedRepositoryClone {
         ] {
             fs::rename(from, &to).map_err(|source| MachineStoreError::PublishCloneComponent {
                 component,
-                from: from.to_path_buf(),
+                from: from.clone(),
                 to,
                 source,
             })?;
@@ -97,7 +93,7 @@ impl StagedRepositoryClone {
 
 impl Drop for StagedRepositoryClone {
     fn drop(&mut self) {
-        let _ = remove_disposable_path(&self.staging_directory);
+        remove_disposable_path(&self.staging_directory).ok();
     }
 }
 

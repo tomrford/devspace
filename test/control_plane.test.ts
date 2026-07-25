@@ -1,6 +1,7 @@
 import { env, exports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { countRows, workerRequest } from "./support";
 
 const packId = "00".repeat(64);
 
@@ -27,10 +28,10 @@ describe("cloud identity and repository directory", () => {
     ).toMatchObject({ ok: true, authority: { machineId: secondMachine } });
     await evictDurableObject(control);
 
-    expect(await (await apiRequest(firstMachine, "/repositories/shared-machines")).json()).toEqual(
+    expect(await (await workerRequest(firstMachine, "/repositories/shared-machines")).json()).toEqual(
       repository,
     );
-    expect(await (await apiRequest(secondMachine, "/repositories/shared-machines")).json()).toEqual(
+    expect(await (await workerRequest(secondMachine, "/repositories/shared-machines")).json()).toEqual(
       repository,
     );
   });
@@ -98,7 +99,7 @@ describe("cloud identity and repository directory", () => {
     expect(invalid.status).toBe(401);
     expect(await invalid.json()).toEqual({ error: "unauthorized", code: "unauthorized" });
 
-    const malformedMachine = await apiRequest("not-a-machine", "/repositories/test");
+    const malformedMachine = await workerRequest("not-a-machine", "/repositories/test");
     expect(malformedMachine.status).toBe(400);
     expect(await malformedMachine.json()).toEqual({
       error: "invalid machine ID",
@@ -108,7 +109,7 @@ describe("cloud identity and repository directory", () => {
 
   it("does not let request fields or headers select a user", async () => {
     const machineId = "34".repeat(16);
-    const created = await apiRequest(machineId, "/repositories", {
+    const created = await workerRequest(machineId, "/repositories", {
       method: "POST",
       headers: { "content-type": "application/json", "x-devspace-user-id": "attacker" },
       body: JSON.stringify({
@@ -136,7 +137,7 @@ describe("cloud identity and repository directory", () => {
       code: "repository-not-found",
     });
 
-    const injectedBody = await apiRequest(machineId, "/repositories", {
+    const injectedBody = await workerRequest(machineId, "/repositories", {
       method: "POST",
       headers: { "content-type": "application/json", "x-devspace-user-id": "attacker" },
       body: JSON.stringify({
@@ -152,13 +153,13 @@ describe("cloud identity and repository directory", () => {
   it("codes malformed repository names and request bodies", async () => {
     const machineId = "36".repeat(16);
 
-    const invalidName = await apiRequest(machineId, "/repositories/Invalid");
+    const invalidName = await workerRequest(machineId, "/repositories/Invalid");
     expect({ status: invalidName.status, body: await invalidName.json() }).toMatchObject({
       status: 400,
       body: { code: "invalid-repository-name" },
     });
 
-    const invalidCreation = await apiRequest(machineId, "/repositories", {
+    const invalidCreation = await workerRequest(machineId, "/repositories", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: "{",
@@ -168,7 +169,7 @@ describe("cloud identity and repository directory", () => {
       body: { code: "invalid-repository-creation-request" },
     });
 
-    const invalidRename = await apiRequest(machineId, "/repositories/rename-source", {
+    const invalidRename = await workerRequest(machineId, "/repositories/rename-source", {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: "{",
@@ -178,7 +179,7 @@ describe("cloud identity and repository directory", () => {
       body: { code: "invalid-repository-rename-request" },
     });
 
-    const invalidDeletion = await apiRequest(machineId, "/repositories/delete-source", {
+    const invalidDeletion = await workerRequest(machineId, "/repositories/delete-source", {
       method: "DELETE",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ repositoryId: "not-an-id", incarnation: "not-an-incarnation" }),
@@ -196,7 +197,7 @@ describe("cloud identity and repository directory", () => {
       state.storage.sql.exec("DROP TABLE repositories");
     });
 
-    const response = await apiRequest(machineId, "/repositories");
+    const response = await workerRequest(machineId, "/repositories");
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ error: "request failed" });
     await evictDurableObject(control);
@@ -209,7 +210,7 @@ describe("cloud identity and repository directory", () => {
     await evictDurableObject(env.CONTROL_PLANE.getByName("directory"));
     expect(await createRepository(machineId, "retry-safe", idempotencyKey)).toEqual(first);
 
-    const conflict = await apiRequest(machineId, "/repositories", {
+    const conflict = await workerRequest(machineId, "/repositories", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "different-request", idempotencyKey }),
@@ -220,7 +221,7 @@ describe("cloud identity and repository directory", () => {
       code: "idempotency-key-reused",
     });
 
-    const nameConflict = await apiRequest(machineId, "/repositories", {
+    const nameConflict = await workerRequest(machineId, "/repositories", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "retry-safe", idempotencyKey: "45".repeat(16) }),
@@ -244,7 +245,7 @@ describe("cloud identity and repository directory", () => {
       ),
     ).toEqual({ ok: true, retiring: true });
 
-    const response = await apiRequest(machineId, "/repositories");
+    const response = await workerRequest(machineId, "/repositories");
     expect(response.status).toBe(200);
     const body = (await response.json()) as { repositories: Array<{ name: string }> };
     expect(body.repositories).toEqual(expect.arrayContaining([active]));
@@ -263,7 +264,7 @@ describe("cloud identity and repository directory", () => {
     const renamed = await createRepository(machineId, "rename-source", "49".repeat(16));
     await createRepository(machineId, "rename-taken", "4a".repeat(16));
 
-    const collision = await apiRequest(machineId, "/repositories/rename-source", {
+    const collision = await workerRequest(machineId, "/repositories/rename-source", {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ newName: "rename-taken" }),
@@ -274,16 +275,16 @@ describe("cloud identity and repository directory", () => {
       code: "repository-name-taken",
     });
 
-    const response = await apiRequest(machineId, "/repositories/rename-source", {
+    const response = await workerRequest(machineId, "/repositories/rename-source", {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ newName: "rename-target" }),
     });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ...renamed, name: "rename-target" });
-    expect((await apiRequest(machineId, "/repositories/rename-source")).status).toBe(404);
+    expect((await workerRequest(machineId, "/repositories/rename-source")).status).toBe(404);
 
-    const noOp = await apiRequest(machineId, "/repositories/rename-target", {
+    const noOp = await workerRequest(machineId, "/repositories/rename-target", {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ newName: "rename-target" }),
@@ -319,7 +320,7 @@ describe("cloud identity and repository directory", () => {
     expect(replacement.repositoryId).not.toBe(repository.repositoryId);
     expect(replacement.incarnation).not.toBe(repository.incarnation);
 
-    const replay = await apiRequest(machineId, "/repositories", {
+    const replay = await workerRequest(machineId, "/repositories", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "retiring-replay", idempotencyKey }),
@@ -329,7 +330,7 @@ describe("cloud identity and repository directory", () => {
       error: "repository created by this request was retired",
       code: "creation-retired",
     });
-    expect(await (await apiRequest(machineId, "/repositories/retiring-replay")).json()).toEqual(
+    expect(await (await workerRequest(machineId, "/repositories/retiring-replay")).json()).toEqual(
       replacement,
     );
 
@@ -389,7 +390,7 @@ describe("cloud identity and repository directory", () => {
         incarnation: repository.incarnation,
       }),
     };
-    const failed = await apiRequest(
+    const failed = await workerRequest(
       machineId,
       "/repositories/retirement-lost-response",
       deletionRequest,
@@ -448,7 +449,7 @@ describe("cloud identity and repository directory", () => {
       testControl.recoverRetiringRepositories = async () => {};
     });
     try {
-      const replay = await apiRequest(identity.machineId, "/repositories", {
+      const replay = await workerRequest(identity.machineId, "/repositories", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ name: "concurrent-retiring-replay", idempotencyKey }),
@@ -490,7 +491,7 @@ describe("cloud identity and repository directory", () => {
     });
     await evictDurableObject(firstStub);
 
-    const deleted = await apiRequest(machineId, "/repositories/replaceable", {
+    const deleted = await workerRequest(machineId, "/repositories/replaceable", {
       method: "DELETE",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -501,7 +502,7 @@ describe("cloud identity and repository directory", () => {
     expect(deleted.status).toBe(200);
     expect(await deleted.json()).toEqual({ deleted: true });
     await evictDurableObject(firstStub);
-    expect(await firstStub.countObjects()).toBe(0);
+    expect(await countRows(firstStub, "objects")).toBe(0);
     await runInDurableObject(firstStub, (_instance, state) => {
       expect(
         state.storage.sql
@@ -528,7 +529,7 @@ describe("cloud identity and repository directory", () => {
     const staleHeaders = { "x-devspace-incarnation": first.incarnation };
     expect(
       (
-        await apiRequest(
+        await workerRequest(
           machineId,
           `/repositories/${first.repositoryId}/git/ops/heads`,
           { headers: staleHeaders },
@@ -537,7 +538,7 @@ describe("cloud identity and repository directory", () => {
     ).toBe(404);
     expect(
       (
-        await apiRequest(machineId, `/repositories/${first.repositoryId}/git/ops/heads/transactions`, {
+        await workerRequest(machineId, `/repositories/${first.repositoryId}/git/ops/heads/transactions`, {
           method: "POST",
           headers: { ...staleHeaders, "content-type": "application/json" },
           body: "{}",
@@ -546,7 +547,7 @@ describe("cloud identity and repository directory", () => {
     ).toBe(404);
     expect(
       (
-        await apiRequest(
+        await workerRequest(
           machineId,
           `/repositories/${second.repositoryId}/git/ops/heads`,
           { headers: staleHeaders },
@@ -554,7 +555,7 @@ describe("cloud identity and repository directory", () => {
       ).status,
     ).toBe(404);
 
-    const current = await apiRequest(
+    const current = await workerRequest(
       machineId,
       `/repositories/${second.repositoryId}/git/ops/heads`,
       { headers: { "x-devspace-incarnation": second.incarnation } },
@@ -573,7 +574,7 @@ describe("cloud identity and repository directory", () => {
       );
     });
 
-    const response = await apiRequest(machineId, "/repositories/provisional-delete", {
+    const response = await workerRequest(machineId, "/repositories/provisional-delete", {
       method: "DELETE",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -588,21 +589,8 @@ describe("cloud identity and repository directory", () => {
   });
 });
 
-async function apiRequest(machineId: string, path: string, init: RequestInit = {}) {
-  return exports.default.fetch(
-    new Request(`https://example.com${path}`, {
-      ...init,
-      headers: {
-        authorization: `Bearer ${env.DEVSPACE_SHARED_SECRET}`,
-        "x-devspace-machine-id": machineId,
-        ...init.headers,
-      },
-    }),
-  );
-}
-
 async function createRepository(machineId: string, name: string, idempotencyKey: string) {
-  const response = await apiRequest(machineId, "/repositories", {
+  const response = await workerRequest(machineId, "/repositories", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ name, idempotencyKey }),

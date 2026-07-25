@@ -65,7 +65,7 @@ pub(crate) async fn run_doctor(ui: &mut Ui, command: &CommandHelper) -> Result<(
 
     match store.as_ref() {
         Some(store) if crate::daemon::is_running(store) => {
-            writeln!(ui.stdout(), "OK daemon: running")?
+            writeln!(ui.stdout(), "OK daemon: running")?;
         }
         Some(_) => writeln!(ui.stdout(), "WARN daemon: not running")?,
         None => writeln!(ui.stdout(), "WARN daemon: machine store is unavailable")?,

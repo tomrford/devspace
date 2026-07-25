@@ -1,43 +1,32 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::process::Command;
 
 use blake2::{Blake2b512, Digest as _};
-use devspace_kernel::{ObjectKind, Oid, validate};
+use devspace_kernel::{ObjectKind, Oid};
 use devspace_machine::{
     GitHttpTransport, GitInstallReceipt, GitUploadReceipt, MIN_PACK_BYTES, MachineGitRepository,
-    ObjectKey, PackBuildError, PackInstallError, PackOptions, PackProducer, build_packs,
+    PackBuildError, PackInstallError, PackOptions, PackProducer, build_packs,
 };
 use futures::executor::block_on;
-use gix::objs::{Kind as GitObjectKind, Write as _};
-use jj_lib::backend::{ChangeId, CommitId, CopyId, TreeValue};
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::backend::{ChangeId, CommitId};
 use jj_lib::conflict_labels::ConflictLabels;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
-use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Machine Git Test"
-                email = "machine@example.invalid"
+mod common;
 
-                [git]
-                write-change-id-header = true
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
+use common::{
+    create_live_repository, oid_hex, read_raw, run_git, tree_with_file, write_commit, write_raw,
+};
+
+const COMMIT_IDENTITY: &str = "Foreign <foreign@example.invalid>";
+
+fn settings() -> UserSettings {
+    devspace_testutils::settings("Machine Git Test", "machine@example.invalid", true)
 }
 
 #[test]
@@ -126,9 +115,8 @@ fn deterministic_pack_rebuilds_exact_objects_and_semantics_without_extras() {
     let first = build_packs(&source, &closure, &BTreeSet::new(), PackOptions::default()).unwrap();
     let second = build_packs(&source, &closure, &BTreeSet::new(), PackOptions::default()).unwrap();
     assert_eq!(first, second);
-    assert_eq!(first.packs.len(), 1);
-    assert_eq!(first.metrics.packed_objects, closure.objects.len());
-    let pack = &first.packs[0];
+    assert_eq!(first.len(), 1);
+    let pack = &first[0];
     assert_eq!(pack.manifest.encode(), pack.manifest_bytes);
 
     let destination_path = temp.path().join("destination");
@@ -174,14 +162,14 @@ fn forced_split_packs_install_in_dependency_order() {
     let first = build_packs(&source, &closure, &BTreeSet::new(), options).unwrap();
     let second = build_packs(&source, &closure, &BTreeSet::new(), options).unwrap();
     assert_eq!(first, second);
-    assert_eq!(first.packs.len(), closure.objects.len());
+    assert_eq!(first.len(), closure.objects.len());
 
     let destination = block_on(MachineGitRepository::init(
         temp.path().join("destination"),
         &settings(),
     ))
     .unwrap();
-    for pack in &first.packs {
+    for pack in &first {
         let installed = destination
             .install_pack(pack.id, &pack.manifest_bytes, &pack.chunks)
             .unwrap();
@@ -200,7 +188,7 @@ fn forced_split_packs_install_in_dependency_order() {
     let first = build_packs(&source, &closure, &BTreeSet::new(), size_options).unwrap();
     let second = build_packs(&source, &closure, &BTreeSet::new(), size_options).unwrap();
     assert_eq!(first, second);
-    assert!(first.packs.len() > 1);
+    assert!(first.len() > 1);
 
     let destination = block_on(MachineGitRepository::init(
         temp.path().join("size-destination"),
@@ -208,7 +196,6 @@ fn forced_split_packs_install_in_dependency_order() {
     ))
     .unwrap();
     let inserted_objects = first
-        .packs
         .iter()
         .map(|pack| {
             destination
@@ -270,11 +257,12 @@ fn pack_production_yields_completed_packs_before_reading_later_objects() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
-async fn two_machines_round_trip_v2_git_packs_through_a_live_worker() {
+async fn two_machines_round_trip_git_packs_through_a_live_worker() {
     let base_url = std::env::var("DEVSPACE_URL").expect("set DEVSPACE_URL");
     let shared_secret =
         std::env::var("DEVSPACE_SHARED_SECRET").expect("set DEVSPACE_SHARED_SECRET");
-    let (repository_id, incarnation) = create_live_repository(&base_url, &shared_secret).await;
+    let (repository_id, incarnation) =
+        create_live_repository(&base_url, &shared_secret, "git-spike").await;
     let machine_a = "11".repeat(16);
     let machine_b = "22".repeat(16);
     let transport_a = GitHttpTransport::new(
@@ -303,8 +291,8 @@ async fn two_machines_round_trip_v2_git_packs_through_a_live_worker() {
         .object_closure([conflict_commit, foreign_commit])
         .unwrap();
     let built = build_packs(&source, &closure, &BTreeSet::new(), PackOptions::default()).unwrap();
-    assert_eq!(built.packs.len(), 1);
-    let pack = &built.packs[0];
+    assert_eq!(built.len(), 1);
+    let pack = &built[0];
 
     assert_eq!(
         transport_a.upload_pack(pack).await.unwrap(),
@@ -385,8 +373,8 @@ async fn two_machines_round_trip_v2_git_packs_through_a_live_worker() {
         PackOptions::default(),
     )
     .unwrap();
-    assert_eq!(interrupted.packs.len(), 1);
-    let interrupted = &interrupted.packs[0];
+    assert_eq!(interrupted.len(), 1);
+    let interrupted = &interrupted[0];
     assert_eq!(
         transport_a
             .upload_manifest(interrupted.id, &interrupted.manifest_bytes)
@@ -442,14 +430,14 @@ fn install_checks_references_and_refuses_a_consistently_rehashed_corrupt_pack() 
         &settings(),
     ))
     .unwrap();
-    let missing = &missing_dependency_pack.packs[0];
+    let missing = &missing_dependency_pack[0];
     assert!(matches!(
         empty.install_pack(missing.id, &missing.manifest_bytes, &missing.chunks),
         Err(PackInstallError::MissingReference { target, .. }) if target == blob.id
     ));
 
     let built = build_packs(&source, &closure, &BTreeSet::new(), PackOptions::default()).unwrap();
-    let pack = &built.packs[0];
+    let pack = &built[0];
     let destination = block_on(MachineGitRepository::init(
         temp.path().join("destination"),
         &settings(),
@@ -459,7 +447,7 @@ fn install_checks_references_and_refuses_a_consistently_rehashed_corrupt_pack() 
         .install_pack(pack.id, &pack.manifest_bytes, &pack.chunks)
         .unwrap();
     let first_key = pack.manifest.objects()[0].key;
-    let before = read_raw(&destination, first_key);
+    let before = read_raw(&destination, first_key.id);
 
     let mut corrupt_manifest = pack.manifest_bytes.clone();
     let mut corrupt_chunks = pack.chunks.clone();
@@ -477,14 +465,26 @@ fn install_checks_references_and_refuses_a_consistently_rehashed_corrupt_pack() 
         destination.install_pack(corrupt_id, &corrupt_manifest, &corrupt_chunks),
         Err(PackInstallError::ExistingObjectMismatch(key)) if key == first_key
     ));
-    assert_eq!(read_raw(&destination, first_key), before);
+    assert_eq!(read_raw(&destination, first_key.id), before);
 }
 
 fn build_semantic_fixture(repository: &MachineGitRepository) -> (Oid, Oid) {
     let store = repository.repo().store();
-    let left = block_on(tree_with_file(store, "left.txt", b"left\n"));
-    let base = block_on(tree_with_file(store, "base.txt", b"base\n"));
-    let right = block_on(tree_with_file(store, "right.txt", b"right\n"));
+    let left = block_on(tree_with_file(
+        store,
+        &RepoPathBuf::from_internal_string("left.txt").unwrap(),
+        b"left\n",
+    ));
+    let base = block_on(tree_with_file(
+        store,
+        &RepoPathBuf::from_internal_string("base.txt").unwrap(),
+        b"base\n",
+    ));
+    let right = block_on(tree_with_file(
+        store,
+        &RepoPathBuf::from_internal_string("right.txt").unwrap(),
+        b"right\n",
+    ));
     let mut transaction = repository.repo().start_transaction();
     let parent = block_on(
         transaction
@@ -528,8 +528,8 @@ async fn assert_exact_rebuild(
 ) {
     for object in &closure.objects {
         assert_eq!(
-            read_raw(source, object.key),
-            read_raw(&destination, object.key),
+            read_raw(source, object.key.id),
+            read_raw(&destination, object.key.id),
             "raw bytes differ for {:?}",
             object.key
         );
@@ -581,74 +581,19 @@ async fn assert_exact_rebuild(
     assert_eq!(foreign.change_id.as_bytes().len(), 16);
 }
 
-async fn create_live_repository(base_url: &str, shared_secret: &str) -> (String, String) {
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct CreatedRepository {
-        repository_id: String,
-        incarnation: String,
-    }
-
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let response = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .unwrap()
-        .post(format!("{}/repositories", base_url.trim_end_matches('/')))
-        .header("authorization", format!("Bearer {shared_secret}"))
-        .header("x-devspace-machine-id", "11".repeat(16))
-        .json(&serde_json::json!({
-            "name": format!("git-spike-{suffix}"),
-            "idempotencyKey": format!("{suffix:032x}"),
-        }))
-        .send()
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = response.bytes().await.unwrap();
-    assert!(
-        status.is_success(),
-        "repository creation failed with {status}: {}",
-        String::from_utf8_lossy(&bytes)
-    );
-    let created: CreatedRepository = serde_json::from_slice(&bytes).unwrap();
-    (created.repository_id, created.incarnation)
-}
-
-async fn tree_with_file(
-    store: &std::sync::Arc<jj_lib::store::Store>,
-    name: &str,
-    contents: &[u8],
-) -> MergedTree {
-    let path = RepoPathBuf::from_internal_string(name).unwrap();
-    let mut reader = contents;
-    let file_id = store.write_file(&path, &mut reader).await.unwrap();
-    let mut builder = MergedTreeBuilder::new(store.empty_merged_tree());
-    builder.set_or_remove(
-        path,
-        Merge::normal(TreeValue::File {
-            id: file_id,
-            executable: false,
-            copy_id: CopyId::placeholder(),
-        }),
-    );
-    builder.write_tree().await.unwrap()
-}
-
 fn write_foreign_commit(repository: &MachineGitRepository, contents: &[u8]) -> Oid {
     let blob = write_raw(repository, ObjectKind::Blob, contents);
     let mut tree = b"100644 foreign.txt\0".to_vec();
     tree.extend_from_slice(&blob.0);
     let tree = write_raw(repository, ObjectKind::Tree, &tree);
-    let commit = format!(
-        "tree {}\nauthor Foreign <foreign@example.invalid> 1700000000 +0000\ncommitter Foreign <foreign@example.invalid> 1700000000 +0000\n\nforeign commit\n",
-        oid_hex(tree)
-    );
-    write_raw(repository, ObjectKind::Commit, commit.as_bytes())
+    write_commit(
+        repository,
+        COMMIT_IDENTITY,
+        tree,
+        &[],
+        b"foreign commit\n",
+        &[],
+    )
 }
 
 struct AdverseDependencyChain {
@@ -674,14 +619,23 @@ fn write_adverse_dependency_chain(repository: &MachineGitRepository) -> AdverseD
         })
         .expect("a bounded nonce search should produce adverse tree OID ordering");
     let root_tree = write_tree_entry(repository, "40000", "middle", middle_tree);
-    let parent_commit = write_commit(repository, root_tree, None, "parent");
+    let parent_commit = write_commit(
+        repository,
+        COMMIT_IDENTITY,
+        root_tree,
+        &[],
+        b"parent\n",
+        &[],
+    );
     let child_commit = (0..1024)
         .find_map(|nonce| {
             let commit = write_commit(
                 repository,
+                COMMIT_IDENTITY,
                 root_tree,
-                Some(parent_commit),
-                &format!("child {nonce:04}"),
+                &[parent_commit],
+                format!("child {nonce:04}\n").as_bytes(),
+                &[],
             );
             (commit < parent_commit).then_some(commit)
         })
@@ -698,63 +652,6 @@ fn write_tree_entry(repository: &MachineGitRepository, mode: &str, name: &str, t
     let mut tree = format!("{mode} {name}\0").into_bytes();
     tree.extend_from_slice(&target.0);
     write_raw(repository, ObjectKind::Tree, &tree)
-}
-
-fn write_commit(
-    repository: &MachineGitRepository,
-    tree: Oid,
-    parent: Option<Oid>,
-    message: &str,
-) -> Oid {
-    let parent = parent
-        .map(|parent| format!("parent {}\n", oid_hex(parent)))
-        .unwrap_or_default();
-    let commit = format!(
-        "tree {}\n{parent}author Foreign <foreign@example.invalid> 1700000000 +0000\ncommitter Foreign <foreign@example.invalid> 1700000000 +0000\n\n{message}\n",
-        oid_hex(tree)
-    );
-    write_raw(repository, ObjectKind::Commit, commit.as_bytes())
-}
-
-fn write_raw(repository: &MachineGitRepository, kind: ObjectKind, bytes: &[u8]) -> Oid {
-    let validated = validate(kind, bytes).unwrap();
-    let git_repo = gix::open(repository.git_repo_path()).unwrap();
-    let kind = match kind {
-        ObjectKind::Blob => GitObjectKind::Blob,
-        ObjectKind::Tree => GitObjectKind::Tree,
-        ObjectKind::Commit => GitObjectKind::Commit,
-    };
-    let actual = git_repo.objects.write_buf(kind, bytes).unwrap();
-    assert_eq!(actual.as_bytes(), validated.id.0);
-    validated.id
-}
-
-fn read_raw(repository: &MachineGitRepository, key: ObjectKey) -> Vec<u8> {
-    let git_repo = gix::open(repository.git_repo_path()).unwrap();
-    git_repo
-        .find_object(gix::ObjectId::from_bytes_or_panic(&key.id.0))
-        .unwrap()
-        .data
-        .clone()
-}
-
-fn run_git(repository: &MachineGitRepository, args: &[&str]) -> Vec<u8> {
-    let output = Command::new("git")
-        .arg("--git-dir")
-        .arg(repository.git_repo_path())
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output.stdout
-}
-
-fn oid_hex(oid: Oid) -> String {
-    oid.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn hash64(bytes: &[u8]) -> [u8; 64] {

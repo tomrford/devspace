@@ -7,6 +7,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::decode_lower_hex;
 use crate::machine_store::MachineStore;
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -43,13 +44,7 @@ pub struct MachineId(String);
 impl MachineId {
     pub fn parse(value: impl Into<String>) -> Result<Self, MachineConfigError> {
         let value = value.into();
-        if value.len() != 32
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(MachineConfigError::InvalidMachineId);
-        }
+        decode_lower_hex::<16>(&value).map_err(|_| MachineConfigError::InvalidMachineId)?;
         Ok(Self(value))
     }
 

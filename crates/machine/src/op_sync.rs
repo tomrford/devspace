@@ -5,7 +5,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use blake2::{Blake2b512, Digest as _};
-use devspace_kernel::ops::{OpObjectKind as KernelOpObjectKind, OpReferenceKind, validate_op};
+use devspace_kernel::ops::{OpObjectKind, OpReferenceKind, validate_op};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::OperationId;
 use jj_lib::repo::Repo as _;
@@ -20,12 +20,6 @@ const MAX_INVENTORY_KEYS: usize = 4_096;
 const MAX_OBJECT_BYTES: u64 = 1024 * 1024;
 
 pub type TransportError = Box<dyn Error + Send + Sync>;
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum OpObjectKind {
-    View,
-    Operation,
-}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct OpObjectKey {
@@ -307,11 +301,7 @@ fn validate_bytes(
     key: OpObjectKey,
     bytes: &[u8],
 ) -> Result<ValidatedReferences, OpSyncEngineError> {
-    let kind = match key.kind {
-        OpObjectKind::View => KernelOpObjectKind::View,
-        OpObjectKind::Operation => KernelOpObjectKind::Operation,
-    };
-    let validated = validate_op(kind, bytes)
+    let validated = validate_op(key.kind, bytes)
         .map_err(|source| OpSyncEngineError::InvalidObject { key, source })?;
     if validated.id != key.id {
         return Err(OpSyncEngineError::ObjectIdMismatch { key });
@@ -350,14 +340,10 @@ fn validate_bytes(
 }
 
 fn object_path(repository: &MachineGitRepository, key: OpObjectKey) -> PathBuf {
-    let directory = match key.kind {
-        OpObjectKind::View => "views",
-        OpObjectKind::Operation => "operations",
-    };
     repository
         .operation_store_path()
-        .join(directory)
-        .join(crate::hex(&key.id))
+        .join(key.kind.directory())
+        .join(crate::encode_lower_hex(&key.id))
 }
 
 fn read_existing(path: &Path) -> Result<Option<Vec<u8>>, OpSyncEngineError> {

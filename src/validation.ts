@@ -1,5 +1,9 @@
 import { z } from "zod";
 
+export const IDENTIFIER_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+
+export const identifierSchema = z.string().regex(IDENTIFIER_PATTERN);
+
 export const lowerHexStringSchema = (bytes: number, label: string) =>
   z.string().regex(new RegExp(`^[0-9a-f]{${bytes * 2}}$`), {
     error: `${label} must be ${bytes * 2} lowercase hex characters`,
@@ -7,11 +11,6 @@ export const lowerHexStringSchema = (bytes: number, label: string) =>
 
 export const lowerHexBytesSchema = (bytes: number, label: string) =>
   lowerHexStringSchema(bytes, label).transform(hexBytes);
-
-export const shortHexStringSchema = lowerHexStringSchema(16, "value");
-export const shortHexBytesSchema = lowerHexBytesSchema(16, "value");
-export const objectIdStringSchema = lowerHexStringSchema(64, "object ID");
-export const objectIdBytesSchema = lowerHexBytesSchema(64, "object ID");
 
 export const nonNegativeSafeIntegerSchema = z
   .number()

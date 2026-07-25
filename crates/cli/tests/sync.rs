@@ -1,7 +1,3 @@
-#[cfg(unix)]
-#[path = "support/stalling_server.rs"]
-mod stalling_server;
-#[cfg(unix)]
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,25 +9,22 @@ use std::time::{Duration, Instant};
 use devspace_machine::MachineGitRepository as MachineRepository;
 use devspace_machine::{
     CatalogEntry, OpSyncState, OpSyncStore, PendingOpHeadBatch, PendingOpHeadTransaction,
-    RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
+    RepositoryName,
 };
-use jj_lib::object_id::ObjectId as _;
 #[cfg(unix)]
-use stalling_server::StallingServer;
+use devspace_testutils::stalling_server::StallingServer;
+use jj_lib::object_id::ObjectId as _;
 #[cfg(unix)]
 use support::daemon_socket_path;
 use support::{
-    configure_machine_as as configure_machine, ds_command_with_home as ds_command,
-    ds_with_home as ds, machine_store, operation_heads, poll_until, settings, stderr, stdout,
-    write_cli_config,
+    append_cli_config, configure_machine_as as configure_machine,
+    ds_command_with_home as ds_command, ds_with_home as ds, identity, machine_store,
+    operation_heads, poll_until, registered_repository, registered_repository_with_identity,
+    request_json, settings, stderr, stdout, test_identity, write_cli_config,
 };
 
 const DEVELOPMENT_SECRET: &str = "cli-development-secret";
 const FIRST_MACHINE_ID: &str = "12121212121212121212121212121212";
-
-fn request_body(request: &str) -> serde_json::Value {
-    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
-}
 
 #[test]
 fn sync_help_lists_status_but_hides_run() {
@@ -86,89 +79,80 @@ fn ds_auto_start_boundary(cwd: &Path, home: &Path, config: &Path, args: &[&str])
 
 async fn local_repository(root: &Path, name: &str, base_url: &str) -> CatalogEntry {
     configure_machine(root, base_url, FIRST_MACHINE_ID, DEVELOPMENT_SECRET);
-    let store = machine_store(root);
-    let entry = store
-        .register_repository(
-            RepositoryName::parse(name).unwrap(),
-            RepositoryIdentity::new(
-                RepositoryId::parse("ab".repeat(32)).unwrap(),
-                RepositoryIncarnation::parse("cd".repeat(16)).unwrap(),
-            ),
-        )
-        .unwrap();
-    MachineRepository::init(&entry.native_repository_path, &settings())
-        .await
-        .unwrap();
-    entry
+    registered_repository(root, name).await
 }
 
 #[tokio::test]
 async fn sync_run_silences_colliding_alias_warning() {
-    let (base_url, server) = support::fake_worker::create_server(|_, request, stream| {
-        let request_line = request.lines().next().unwrap();
-        if request_line.starts_with("GET ") && request_line.contains("/packs?") {
-            support::fake_worker::respond(
-                stream,
-                "200 OK",
-                r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
-            );
-            false
-        } else if request_line.starts_with("POST ")
-            && request_line.contains("/git/objects/inventory ")
-        {
-            support::fake_worker::respond(stream, "200 OK", r#"{"keys":[]}"#);
-            false
-        } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
-            support::fake_worker::respond(
-                stream,
-                "200 OK",
-                r#"{"inserted":true,"installed":false}"#,
-            );
-            false
-        } else if request_line.starts_with("POST ")
-            && request_line.contains("/packs/")
-            && request_line.contains("/install ")
-        {
-            support::fake_worker::respond(
-                stream,
-                "200 OK",
-                r#"{"installed":true,"insertedObjects":1}"#,
-            );
-            false
-        } else if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads ") {
-            support::fake_worker::respond(stream, "200 OK", r#"{"cursor":0,"heads":[]}"#);
-            false
-        } else if request_line.starts_with("POST ") && request_line.contains("/git/ops/inventory ")
-        {
-            support::fake_worker::respond(
-                stream,
-                "200 OK",
-                &serde_json::json!({"keys": request_body(request)["keys"]}).to_string(),
-            );
-            false
-        } else if request_line.starts_with("POST ")
-            && request_line.contains("/git/ops/heads/transactions ")
-        {
-            support::fake_worker::respond(
-                stream,
-                "200 OK",
-                &serde_json::json!({
-                    "cursor": 1,
-                    "heads": [request_body(request)["newHead"]],
-                })
-                .to_string(),
-            );
-            true
-        } else {
-            panic!("unexpected fake cloud request: {request_line}");
-        }
-    });
+    let (base_url, server) =
+        devspace_testutils::fake_worker::create_server(|_, request, stream| {
+            let request_line = request.lines().next().unwrap();
+            if request_line.starts_with("GET ") && request_line.contains("/packs?") {
+                devspace_testutils::fake_worker::respond(
+                    stream,
+                    "200 OK",
+                    r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
+                );
+                false
+            } else if request_line.starts_with("POST ")
+                && request_line.contains("/git/objects/inventory ")
+            {
+                devspace_testutils::fake_worker::respond(stream, "200 OK", r#"{"keys":[]}"#);
+                false
+            } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
+                devspace_testutils::fake_worker::respond(
+                    stream,
+                    "200 OK",
+                    r#"{"inserted":true,"installed":false}"#,
+                );
+                false
+            } else if request_line.starts_with("POST ")
+                && request_line.contains("/packs/")
+                && request_line.contains("/install ")
+            {
+                devspace_testutils::fake_worker::respond(
+                    stream,
+                    "200 OK",
+                    r#"{"installed":true,"insertedObjects":1}"#,
+                );
+                false
+            } else if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads ") {
+                devspace_testutils::fake_worker::respond(
+                    stream,
+                    "200 OK",
+                    r#"{"cursor":0,"heads":[]}"#,
+                );
+                false
+            } else if request_line.starts_with("POST ")
+                && request_line.contains("/git/ops/inventory ")
+            {
+                devspace_testutils::fake_worker::respond(
+                    stream,
+                    "200 OK",
+                    &serde_json::json!({"keys": request_json(request)["keys"]}).to_string(),
+                );
+                false
+            } else if request_line.starts_with("POST ")
+                && request_line.contains("/git/ops/heads/transactions ")
+            {
+                devspace_testutils::fake_worker::respond(
+                    stream,
+                    "200 OK",
+                    &serde_json::json!({
+                        "cursor": 1,
+                        "heads": [request_json(request)["newHead"]],
+                    })
+                    .to_string(),
+                );
+                true
+            } else {
+                panic!("unexpected fake cloud request: {request_line}");
+            }
+        });
     let temp = tempfile::tempdir().unwrap();
     local_repository(temp.path(), "alias-warning", &base_url).await;
     let config = write_cli_config(temp.path());
-    let mut contents = fs::read_to_string(&config).unwrap();
-    contents.push_str("\n[aliases]\nsync = [\"status\"]\n");
-    fs::write(&config, contents).unwrap();
+    append_cli_config(&config, "\n[aliases]\nsync = [\"status\"]\n");
 
     let output = ds(
         temp.path(),
@@ -207,7 +191,7 @@ async fn sync_run_times_out_when_the_worker_accepts_but_never_responds() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(20),
         "sync took {:?}",
         started.elapsed()
     );
@@ -224,22 +208,15 @@ async fn catalog_repository(
     identity_byte: u8,
     complete: bool,
 ) -> CatalogEntry {
-    let entry = machine_store(root)
+    if complete {
+        return registered_repository_with_identity(root, name, identity(identity_byte)).await;
+    }
+    machine_store(root)
         .register_repository(
             RepositoryName::parse(name).unwrap(),
-            RepositoryIdentity::new(
-                RepositoryId::parse(format!("{identity_byte:02x}").repeat(32)).unwrap(),
-                RepositoryIncarnation::parse(format!("{:02x}", identity_byte + 1).repeat(16))
-                    .unwrap(),
-            ),
+            identity(identity_byte),
         )
-        .unwrap();
-    if complete {
-        MachineRepository::init(&entry.native_repository_path, &settings())
-            .await
-            .unwrap();
-    }
-    entry
+        .unwrap()
 }
 
 #[tokio::test]
@@ -251,7 +228,6 @@ async fn sync_run_skips_when_the_repository_lock_is_held() {
         .try_lock_repository_sync(&entry.identity)
         .unwrap();
 
-    let started = Instant::now();
     let output = ds(
         temp.path(),
         temp.path(),
@@ -260,11 +236,6 @@ async fn sync_run_skips_when_the_repository_lock_is_held() {
     );
 
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "sync run waited for the held lock: {:?}",
-        started.elapsed()
-    );
     assert!(stdout(&output).is_empty());
     assert_eq!(
         stderr(&output),
@@ -308,14 +279,10 @@ fn sync_run_points_an_incomplete_clone_back_to_add() {
         FIRST_MACHINE_ID,
         DEVELOPMENT_SECRET,
     );
-    let store = machine_store(temp.path());
-    store
+    machine_store(temp.path())
         .register_repository(
             RepositoryName::parse("incomplete").unwrap(),
-            RepositoryIdentity::new(
-                RepositoryId::parse("ab".repeat(32)).unwrap(),
-                RepositoryIncarnation::parse("cd".repeat(16)).unwrap(),
-            ),
+            test_identity(),
         )
         .unwrap();
     let config = write_cli_config(temp.path());

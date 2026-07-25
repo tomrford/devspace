@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use blake2::digest::Update;
-use blake2::{Blake2b512, Digest};
+use blake2::{Blake2b512, Digest as _};
 
 pub(crate) trait ContentHash {
     fn hash(&self, state: &mut Blake2b512);
@@ -18,7 +18,7 @@ pub(crate) fn content_id(value: &impl ContentHash) -> [u8; 64] {
 
 impl ContentHash for bool {
     fn hash(&self, state: &mut Blake2b512) {
-        (*self as u8).hash(state);
+        u8::from(*self).hash(state);
     }
 }
 

@@ -19,6 +19,32 @@ pub enum OpObjectKind {
     Operation = 1,
 }
 
+impl OpObjectKind {
+    /// jj's simple operation-store directory for this kind.
+    pub const fn directory(self) -> &'static str {
+        match self {
+            Self::View => "views",
+            Self::Operation => "operations",
+        }
+    }
+
+    /// Prefix of an `<kind>:<id>` operation-inventory key on the wire.
+    pub const fn inventory_prefix(self) -> &'static str {
+        match self {
+            Self::View => "v",
+            Self::Operation => "o",
+        }
+    }
+
+    pub fn from_inventory_prefix(prefix: &str) -> Option<Self> {
+        match prefix {
+            "v" => Some(Self::View),
+            "o" => Some(Self::Operation),
+            _ => None,
+        }
+    }
+}
+
 impl TryFrom<u8> for OpObjectKind {
     type Error = ValidationError;
 

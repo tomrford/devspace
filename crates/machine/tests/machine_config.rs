@@ -154,24 +154,26 @@ fn debug_output_redacts_shared_secrets_at_the_type_boundary() {
 }
 
 #[test]
-fn decode_errors_include_the_toml_diagnostic() {
+fn decode_errors_report_the_malformed_field() {
     let temp = tempfile::tempdir().unwrap();
     let store = MachineStore::new(temp.path());
     store.write_config(&config("initial-secret")).unwrap();
-    let exposed_secret = "secret-that-must-not-appear";
     fs::write(
         store.config_path(),
         format!(
-            "base_url = \"https://worker.example.test\"\nmachine_id = \"{}\"\nshared_secret = {exposed_secret}\n",
+            "base_url = \"https://worker.example.test\"\nmachine_id = \"{}\"\nshared_secret = not-a-string\n",
             "ab".repeat(16)
         ),
     )
     .unwrap();
 
     let error = store.load_config().unwrap_err();
+    assert!(
+        matches!(error, MachineConfigError::Decode { .. }),
+        "{error:?}"
+    );
     let message = format!("{error:#}");
-    assert!(message.contains("line 3"), "{message}");
-    assert!(message.contains(exposed_secret), "{message}");
+    assert!(message.contains("shared_secret"), "{message}");
 }
 
 #[cfg(unix)]

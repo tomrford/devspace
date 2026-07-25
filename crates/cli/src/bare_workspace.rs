@@ -3,12 +3,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use devspace_machine::{CatalogEntry, MachineStore, RepositoryName};
+use devspace_machine::{CatalogEntry, MachineGitRepository, MachineStore, RepositoryName};
 use jj_lib::commit::Commit;
 use jj_lib::dag_walk_async;
-use jj_lib::default_index::DefaultIndexStore;
-use jj_lib::default_submodule_store::DefaultSubmoduleStore;
-use jj_lib::git_backend::GitBackend;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::op_heads_store::{OpHeadsStore, OpHeadsStoreError, OpHeadsStoreLock};
 use jj_lib::op_store::{OpStore, OperationId};
@@ -17,8 +14,6 @@ use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::{ReadonlyRepo, Repo as _, RepoLoader, StoreFactories};
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
-use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
-use jj_lib::simple_op_store::SimpleOpStore;
 use jj_lib::working_copy::{
     CheckoutError, CheckoutStats, LockedWorkingCopy, ResetError, SnapshotError, SnapshotOptions,
     SnapshotStats, WorkingCopy, WorkingCopyStateError,
@@ -179,7 +174,7 @@ pub(crate) fn workspace_for_repository(path: PathBuf, repo: Arc<ReadonlyRepo>) -
     )
 }
 
-pub(crate) fn is_stock_bare_repository(path: &Path) -> bool {
+fn is_stock_bare_repository(path: &Path) -> bool {
     let config_markers = [
         path.join("config.toml"),
         path.join("config-id"),
@@ -192,17 +187,24 @@ pub(crate) fn is_stock_bare_repository(path: &Path) -> bool {
     {
         return false;
     }
-    let stock_store_types = [
-        ("store", GitBackend::name()),
-        ("op_store", SimpleOpStore::name()),
-        ("op_heads", SimpleOpHeadsStore::name()),
-        ("index", DefaultIndexStore::name()),
-        ("submodule_store", DefaultSubmoduleStore::name()),
-    ];
-    stock_store_types.iter().all(|(directory, expected)| {
-        std::fs::read_to_string(path.join(directory).join("type"))
-            .is_ok_and(|actual| actual == *expected)
-    })
+    MachineGitRepository::check_stock_layout(path).is_ok()
+}
+
+/// Reject a catalog entry whose local store cannot be used. The messages carry
+/// no terminal punctuation so `ds remove` can append its own tail.
+pub(crate) fn require_local_store(entry: &CatalogEntry) -> Result<(), String> {
+    let name = &entry.name;
+    if !entry.native_repository_path.exists() {
+        return Err(format!(
+            "Repository `{name}` has an incomplete clone; run `ds add` again to finish it"
+        ));
+    }
+    if !is_stock_bare_repository(&entry.native_repository_path) {
+        return Err(format!(
+            "Repository `{name}` is registered locally, but its native repository is invalid"
+        ));
+    }
+    Ok(())
 }
 
 fn repository_name(path: &Path) -> Option<RepositoryName> {
@@ -309,7 +311,7 @@ impl OpHeadsStoreLock for ReadOnlyOpHeadsStoreLock {}
 
 #[async_trait]
 impl OpHeadsStore for ReadOnlyOpHeadsStore {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "devspace_read_only_op_heads_store"
     }
 
@@ -520,6 +522,7 @@ mod tests {
     use clap::FromArgMatches as _;
     use jj_lib::backend::CommitId;
     use jj_lib::op_store::RootOperationData;
+    use jj_lib::simple_op_store::SimpleOpStore;
 
     use super::*;
 
@@ -535,7 +538,7 @@ mod tests {
 
     #[async_trait]
     impl OpHeadsStore for ChangingOpHeadsStore {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "changing"
         }
 
@@ -558,7 +561,7 @@ mod tests {
 
     #[async_trait]
     impl OpHeadsStore for SequencedOpHeadsStore {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "sequenced"
         }
 

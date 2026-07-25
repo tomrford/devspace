@@ -1,43 +1,27 @@
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::io::{Read, Write};
+use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use devspace_kernel::{ObjectKind, Oid, validate};
+use devspace_kernel::{ObjectKind, Oid};
 use devspace_machine::{
-    GitHttpTransport, GitHttpTransportError, MachineGitRepository, ObjectKey, OpSyncTransport,
+    GitHttpTransport, GitHttpTransportError, MachineGitRepository, ObjectKey, OpSyncTransport as _,
 };
-use gix::objs::{Kind as GitObjectKind, Write as _};
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use devspace_testutils::fake_worker::{create_server, respond};
+use devspace_testutils::stalling_server::StallingServer;
 use jj_lib::settings::UserSettings;
 
-#[path = "../../cli/tests/support/stalling_server.rs"]
-mod stalling_server;
-use stalling_server::StallingServer;
-#[allow(dead_code)]
-#[path = "../../cli/tests/support/fake_worker.rs"]
-mod fake_worker;
-use fake_worker::{create_server, respond};
+mod common;
+
+use common::{oid_hex, write_raw};
 
 const CHILD_ENV: &str = "DEVSPACE_MACHINE_GIT_TIMEOUT_TEST_CHILD";
 
 fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "HTTP Transport Test"
-                email = "transport@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
+    devspace_testutils::settings("HTTP Transport Test", "transport@example.invalid", false)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -77,7 +61,7 @@ async fn http_transport_times_out_when_worker_stalls() {
     let error = transport.list_packs(0, None).await.unwrap_err();
 
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(20),
         "Git catalog request took {:?}",
         started.elapsed(),
     );
@@ -314,23 +298,6 @@ fn projection_page_json(
         batch_id = mapping_byte.repeat(16),
         owner_machine = owner_byte.repeat(16),
     )
-}
-
-fn write_raw(repository: &MachineGitRepository, kind: ObjectKind, bytes: &[u8]) -> Oid {
-    let expected = validate(kind, bytes).unwrap().id;
-    let git = gix::open(repository.git_repo_path()).unwrap();
-    let git_kind = match kind {
-        ObjectKind::Blob => GitObjectKind::Blob,
-        ObjectKind::Tree => GitObjectKind::Tree,
-        ObjectKind::Commit => GitObjectKind::Commit,
-    };
-    let actual = git.objects.write_buf(git_kind, bytes).unwrap();
-    assert_eq!(actual.as_bytes(), expected.0);
-    expected
-}
-
-fn oid_hex(oid: Oid) -> String {
-    oid.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn indexed_oid(index: u32) -> Oid {

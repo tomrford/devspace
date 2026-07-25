@@ -107,7 +107,6 @@ export function initializeGitSchema(sql: SqlStorage) {
       user_id TEXT NOT NULL,
       repository_id TEXT NOT NULL,
       creation_nonce TEXT,
-      retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
       op_cursor INTEGER NOT NULL DEFAULT 0 CHECK (op_cursor >= 0),
       op_receipt_count INTEGER NOT NULL DEFAULT 0 CHECK (op_receipt_count >= 0),
       op_receipt_head_count INTEGER NOT NULL DEFAULT 0 CHECK (op_receipt_head_count >= 0)

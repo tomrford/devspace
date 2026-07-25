@@ -391,6 +391,10 @@ export class ProjectionGitStore {
             expected: update.expectedOldOid,
           })),
         );
+        this.requireUnclaimedBookmarks(
+          request.remote,
+          request.updates.map((update) => update.bookmark),
+        );
         const fence = this.nextFence(this.meta());
         this.sql.exec(
           "INSERT INTO projection_git_batches VALUES (?, ?, ?, ?, ?, ?)",
@@ -421,30 +425,19 @@ export class ProjectionGitStore {
           }
           const proposedStateId =
             update.proposedState === null ? null : stateIds[update.proposedState];
-          try {
-            this.sql.exec(
-              `INSERT INTO projection_git_batch_refs
-               (batch_id, position, remote, bookmark, expected_old_oid,
-                proposed_state_id, identity_oid)
-               VALUES (?, ?, ?, ?, ?, ?, ?)`,
-              batchId,
-              position,
-              request.remote,
-              update.bookmark,
-              update.expectedOldOid === null ? null : exactGitBuffer(update.expectedOldOid),
-              proposedStateId,
-              update.identityOid === null ? null : exactGitBuffer(update.identityOid),
-            );
-          } catch (error) {
-            if (error instanceof Error && error.message.includes("UNIQUE constraint failed")) {
-              throw new ProjectionGitStoreError(
-                `another push already owns ${request.remote}/${update.bookmark}`,
-                409,
-                "push-in-progress",
-              );
-            }
-            throw error;
-          }
+          this.sql.exec(
+            `INSERT INTO projection_git_batch_refs
+             (batch_id, position, remote, bookmark, expected_old_oid,
+              proposed_state_id, identity_oid)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            batchId,
+            position,
+            request.remote,
+            update.bookmark,
+            update.expectedOldOid === null ? null : exactGitBuffer(update.expectedOldOid),
+            proposedStateId,
+            update.identityOid === null ? null : exactGitBuffer(update.identityOid),
+          );
         }
         return { ok: true as const, pending: true, fence };
       });
@@ -1118,6 +1111,26 @@ export class ProjectionGitStore {
     }
   }
 
+  private requireUnclaimedBookmarks(remote: string, bookmarks: string[]) {
+    for (const bookmark of bookmarks) {
+      const claimed = this.sql
+        .exec<{ claimed: number }>(
+          `SELECT 1 AS claimed FROM projection_git_batch_refs
+           WHERE remote = ? AND bookmark = ? LIMIT 1`,
+          remote,
+          bookmark,
+        )
+        .toArray()[0];
+      if (claimed !== undefined) {
+        throw new ProjectionGitStoreError(
+          `another push already owns ${remote}/${bookmark}`,
+          409,
+          "push-in-progress",
+        );
+      }
+    }
+  }
+
   private requireExpectedCursors(
     remote: string,
     expectedCursors: Array<{ bookmark: string; expected: Uint8Array | null }>,
@@ -1455,7 +1468,6 @@ export class ProjectionGitStore {
   }
 
   private handleExpected(error: unknown) {
-    if (error instanceof WebAssembly.RuntimeError) this.kernel.reset();
     if (error instanceof ProjectionGitStoreError) return failure(error, error.status);
     if (error instanceof ProjectionGitProtocolError) return failure(error, 400, error.code);
     if (error instanceof ProjectionGitValidationError) return failure(error, 400);

@@ -1,4 +1,3 @@
-#[cfg(unix)]
 mod platform {
     use std::collections::{BTreeSet, VecDeque};
     use std::env;
@@ -26,7 +25,7 @@ mod platform {
     use rustix::process::getuid;
 
     use crate::checkout::{destination_hash, reject_unsupported_global_options};
-    use crate::sync::{SyncRun, run_sync_entry};
+    use crate::sync::{LockedSyncRun, run_sync_entry_locked};
 
     const DAEMON_LOCK_FILE: &str = "daemon.lock";
     const DAEMON_LOG_FILE: &str = "daemon.log";
@@ -36,8 +35,6 @@ mod platform {
     const LOOP_INTERVAL: Duration = Duration::from_millis(25);
     const MAX_NOTIFICATION_BYTES: u64 = 512;
     const CLIENT_TIMEOUT: Duration = Duration::from_millis(25);
-
-    pub(crate) const SUPPORTED: bool = true;
 
     pub(crate) fn notify_sync(store: &MachineStore, name: &RepositoryName) -> bool {
         let Some(mut stream) = connect_to_daemon(store) else {
@@ -229,9 +226,9 @@ mod platform {
         }
 
         writeln!(log, "sync `{name}` started")?;
-        match run_sync_entry(store, &entry, command.settings()).await {
-            Ok(SyncRun::Completed) => writeln!(log, "sync `{name}` completed")?,
-            Ok(SyncRun::AlreadyLocked) => writeln!(log, "sync `{name}` skipped: lock held")?,
+        match run_sync_entry_locked(store, &entry, command.settings()).await {
+            Ok(LockedSyncRun::Completed(_)) => writeln!(log, "sync `{name}` completed")?,
+            Ok(LockedSyncRun::AlreadyLocked) => writeln!(log, "sync `{name}` skipped: lock held")?,
             Err(error) => writeln!(log, "sync `{name}` failed: {error}")?,
         }
         Ok(())
@@ -372,7 +369,7 @@ mod platform {
     }
 
     fn send(events: &Sender<SocketEvent>, event: SocketEvent) {
-        let _ = events.send(event);
+        events.send(event).ok();
     }
 
     fn enqueue_complete_catalog(
@@ -479,12 +476,12 @@ mod platform {
     }
 
     fn log_startup_error(log: &mut File, error: String) -> CommandError {
-        let _ = writeln!(log, "daemon startup failed: {error}");
-        let _ = log.flush();
+        writeln!(log, "daemon startup failed: {error}").ok();
+        log.flush().ok();
         user_error(error)
     }
 
-    fn daemon_socket_path(store_root: &Path) -> Result<PathBuf, String> {
+    pub fn daemon_socket_path(store_root: &Path) -> Result<PathBuf, String> {
         let canonical_root = dunce::canonicalize(store_root).map_err(|error| {
             format!(
                 "failed to canonicalize machine store at {} for daemon socket identity: {error}",
@@ -640,51 +637,10 @@ mod platform {
 
     impl Drop for SocketCleanup {
         fn drop(&mut self) {
-            let _ = fs::remove_file(&self.path);
+            fs::remove_file(&self.path).ok();
         }
     }
 }
 
-#[cfg(not(unix))]
-mod platform {
-    use devspace_machine::{MachineStore, RepositoryName};
-    use jj_cli::cli_util::CommandHelper;
-    use jj_cli::command_error::{CommandError, user_error};
-    use jj_cli::ui::Ui;
-
-    pub(crate) const SUPPORTED: bool = false;
-
-    pub(crate) fn notify_sync(_store: &MachineStore, _name: &RepositoryName) -> bool {
-        false
-    }
-
-    pub(crate) fn is_running(_store: &MachineStore) -> bool {
-        false
-    }
-
-    #[derive(clap::Args)]
-    pub(crate) struct DaemonArgs {
-        #[command(subcommand)]
-        command: DaemonCommand,
-    }
-
-    #[derive(clap::Subcommand)]
-    enum DaemonCommand {
-        /// Run the machine-store synchronization daemon in the foreground.
-        Run,
-    }
-
-    pub(crate) async fn run_daemon(
-        _ui: &mut Ui,
-        _command: &CommandHelper,
-        args: DaemonArgs,
-    ) -> Result<(), CommandError> {
-        match args.command {
-            DaemonCommand::Run => Err(user_error(
-                "The devspace daemon is not supported on Windows; command-boundary sync remains active.",
-            )),
-        }
-    }
-}
-
-pub(crate) use platform::{DaemonArgs, SUPPORTED, is_running, notify_sync, run_daemon};
+pub use platform::daemon_socket_path;
+pub(crate) use platform::{DaemonArgs, is_running, notify_sync, run_daemon};

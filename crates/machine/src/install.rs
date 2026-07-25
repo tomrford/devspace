@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 
 use blake2::{Blake2b512, Digest as _};
-use devspace_kernel::{ObjectKind, ReferenceKind, ValidationError, validate};
+use devspace_kernel::{ObjectKind, ValidationError, validate};
 use gix::objs::{Kind as GitObjectKind, Write as _};
 use thiserror::Error;
 
-use crate::object_closure::to_git_kind;
+use crate::object_closure::{reference_kind, to_git_kind};
 use crate::pack::{Digest, hash};
-use crate::{MachineGitRepository, ObjectKey, Oid, PackManifest, PackManifestError, hex};
+use crate::{
+    MachineGitRepository, ObjectKey, Oid, PackManifest, PackManifestError, encode_lower_hex,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstalledPack {
@@ -28,8 +30,8 @@ impl MachineGitRepository {
         let actual_id = hash(manifest_bytes);
         if actual_id != expected_id {
             return Err(PackInstallError::ManifestIdMismatch {
-                expected: hex(&expected_id),
-                actual: hex(&actual_id),
+                expected: encode_lower_hex(&expected_id),
+                actual: encode_lower_hex(&actual_id),
             });
         }
         let manifest = PackManifest::decode(manifest_bytes)?;
@@ -99,7 +101,7 @@ impl MachineGitRepository {
             if validated.id != entry.key.id {
                 return Err(PackInstallError::ObjectIdMismatch {
                     key: entry.key,
-                    actual: hex(&validated.id.0),
+                    actual: encode_lower_hex(&validated.id.0),
                 });
             }
             pack_kinds.insert(entry.key.id, entry.key.kind);
@@ -171,17 +173,6 @@ impl MachineGitRepository {
             inserted_objects,
             existing_objects,
         })
-    }
-}
-
-fn reference_kind(kind: ReferenceKind) -> Option<ObjectKind> {
-    match kind {
-        ReferenceKind::Blob | ReferenceKind::Executable | ReferenceKind::Symlink => {
-            Some(ObjectKind::Blob)
-        }
-        ReferenceKind::Tree => Some(ObjectKind::Tree),
-        ReferenceKind::Commit => Some(ObjectKind::Commit),
-        ReferenceKind::Gitlink => None,
     }
 }
 

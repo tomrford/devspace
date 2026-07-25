@@ -1,7 +1,5 @@
 #![cfg(unix)]
 
-#[path = "support/stalling_server.rs"]
-mod stalling_server;
 mod support;
 
 use std::fs;
@@ -14,15 +12,11 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use devspace_machine::MachineGitRepository as MachineRepository;
-use devspace_machine::{
-    CatalogEntry, MACHINE_STORE_OVERRIDE, RepositoryId, RepositoryIdentity, RepositoryIncarnation,
-    RepositoryName,
-};
-use stalling_server::StallingServer;
+use devspace_machine::{CatalogEntry, MACHINE_STORE_OVERRIDE};
+use devspace_testutils::stalling_server::StallingServer;
 use support::{
-    configure_machine, daemon_socket_path, machine_store, poll_until, settings, stderr,
-    write_cli_config,
+    configure_machine, daemon_socket_path, identity, machine_store, poll_until,
+    registered_repository_with_identity, stderr, write_cli_config,
 };
 
 #[tokio::test]
@@ -198,21 +192,7 @@ async fn local_repository_with_identity(
     base_url: &str,
 ) -> CatalogEntry {
     configure_machine(root, base_url);
-    let store = machine_store(root);
-    let entry = store
-        .register_repository(
-            RepositoryName::parse(name).unwrap(),
-            RepositoryIdentity::new(
-                RepositoryId::parse(format!("{identity_byte:02x}").repeat(32)).unwrap(),
-                RepositoryIncarnation::parse(format!("{:02x}", identity_byte + 1).repeat(16))
-                    .unwrap(),
-            ),
-        )
-        .unwrap();
-    MachineRepository::init(&entry.native_repository_path, &settings())
-        .await
-        .unwrap();
-    entry
+    registered_repository_with_identity(root, name, identity(identity_byte)).await
 }
 
 fn daemon_command(root: &Path, config: &Path, poll_ms: u64, idle_ms: u64) -> Command {

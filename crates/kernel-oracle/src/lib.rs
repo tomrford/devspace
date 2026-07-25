@@ -7,6 +7,7 @@
 //! so those two signature-bearing vectors change.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write as _};
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use devspace_kernel::ops::{OpObjectKind, validate_op};
 use devspace_kernel::{
     ObjectKind, Oid, ReferenceKind, TreeEntryKind, parse_commit, parse_tree, validate,
 };
-use devspace_machine::MachineGitRepository;
+use devspace_machine::{MachineGitRepository, encode_lower_hex};
 use futures::executor::block_on;
 use jj_lib::backend::{
     Backend as _, ChangeId, Commit as BackendCommit, CommitId, MillisSinceEpoch, Signature,
@@ -225,7 +226,7 @@ impl Fixture {
                 "oracle-v1",
                 "-m",
                 "oracle annotated tag",
-                &oid_hex(tag_target),
+                &encode_lower_hex(&tag_target.0),
             ],
             None,
             BASE_TIME + 12,
@@ -344,7 +345,7 @@ impl Fixture {
                 "add",
                 "--detach",
                 worktree_text,
-                &oid_hex(start),
+                &encode_lower_hex(&start.0),
             ],
             None,
             timestamp,
@@ -399,7 +400,7 @@ impl Fixture {
                 "{} {} {}\t",
                 entry.mode,
                 entry.kind,
-                oid_hex(entry.oid)
+                encode_lower_hex(&entry.oid.0)
             )?;
             input.extend_from_slice(entry.name.as_bytes());
             input.push(0);
@@ -419,10 +420,10 @@ impl Fixture {
         if signed {
             owned.push("-S".to_owned());
         }
-        owned.push(oid_hex(tree));
+        owned.push(encode_lower_hex(&tree.0));
         for parent in parents {
             owned.push("-p".to_owned());
-            owned.push(oid_hex(*parent));
+            owned.push(encode_lower_hex(&parent.0));
         }
         let args = owned.iter().map(String::as_str).collect::<Vec<_>>();
         parse_oid(&self.git(&args, Some(message), timestamp)?)
@@ -505,7 +506,11 @@ impl Fixture {
     }
 
     fn update_ref(&self, name: &str, oid: Oid) -> Result<()> {
-        self.git(&["update-ref", name, &oid_hex(oid)], None, BASE_TIME)?;
+        self.git(
+            &["update-ref", name, &encode_lower_hex(&oid.0)],
+            None,
+            BASE_TIME,
+        )?;
         Ok(())
     }
 
@@ -514,7 +519,11 @@ impl Fixture {
     }
 
     fn cat_file(&self, kind: &str, oid: Oid) -> Result<Vec<u8>> {
-        self.git(&["cat-file", kind, &oid_hex(oid)], None, BASE_TIME)
+        self.git(
+            &["cat-file", kind, &encode_lower_hex(&oid.0)],
+            None,
+            BASE_TIME,
+        )
     }
 
     fn reachable_oids(&self) -> Result<Vec<Oid>> {
@@ -542,7 +551,7 @@ impl Fixture {
         {
             let mut stdin = child.stdin.take().expect("piped stdin");
             for oid in &oids {
-                writeln!(stdin, "{}", oid_hex(*oid))?;
+                writeln!(stdin, "{}", encode_lower_hex(&oid.0))?;
             }
         }
         let output = child.wait_with_output()?;
@@ -600,7 +609,11 @@ impl Fixture {
     }
 
     fn pretty(&self, oid: Oid) -> Result<Vec<u8>> {
-        self.git(&["cat-file", "-p", &oid_hex(oid)], None, BASE_TIME)
+        self.git(
+            &["cat-file", "-p", &encode_lower_hex(&oid.0)],
+            None,
+            BASE_TIME,
+        )
     }
 }
 
@@ -692,11 +705,8 @@ fn generate_op_vectors(write_vectors: bool) -> Result<OpReport> {
     }
 
     let mut generated = Vec::new();
-    for (kind, directory) in [
-        (OpObjectKind::View, "views"),
-        (OpObjectKind::Operation, "operations"),
-    ] {
-        let mut entries = fs::read_dir(repository.operation_store_path().join(directory))?
+    for kind in [OpObjectKind::View, OpObjectKind::Operation] {
+        let mut entries = fs::read_dir(repository.operation_store_path().join(kind.directory()))?
             .collect::<io::Result<Vec<_>>>()?;
         entries.sort_unstable_by_key(|entry| entry.file_name());
         for entry in entries {
@@ -706,7 +716,7 @@ fn generate_op_vectors(write_vectors: bool) -> Result<OpReport> {
             let filename = filename
                 .to_str()
                 .ok_or_else(|| io::Error::other("non-UTF-8 operation-store ID"))?;
-            if filename != encode_hex(&validated.id) {
+            if filename != encode_lower_hex(&validated.id) {
                 return Err(io::Error::other("jj-lib operation-store filename changed").into());
             }
             generated.push((kind, validated.id, bytes));
@@ -732,7 +742,7 @@ fn generate_op_vectors(write_vectors: bool) -> Result<OpReport> {
             OpObjectKind::Operation => "operation",
         });
         output.push('|');
-        output.push_str(&encode_hex(id));
+        output.push_str(&encode_lower_hex(id));
         output.push('|');
         output.push_str(&encode_rle(bytes));
         output.push('\n');
@@ -758,13 +768,15 @@ fn validate_object(fixture: &Fixture, object: &Object) -> Result<()> {
         io::Error::other(format!(
             "kernel rejected {} {}: {error}",
             kind_name(object.kind),
-            oid_hex(object.oid)
+            encode_lower_hex(&object.oid.0)
         ))
     })?;
     if validated.id != object.oid {
-        return Err(
-            io::Error::other(format!("kernel ID mismatch for {}", oid_hex(object.oid))).into(),
-        );
+        return Err(io::Error::other(format!(
+            "kernel ID mismatch for {}",
+            encode_lower_hex(&object.oid.0)
+        ))
+        .into());
     }
     let pretty = fixture.pretty(object.oid)?;
     match object.kind {
@@ -783,7 +795,7 @@ fn validate_object(fixture: &Fixture, object: &Object) -> Result<()> {
             if actual != expected {
                 return Err(io::Error::other(format!(
                     "tree references disagree with git cat-file for {}",
-                    oid_hex(object.oid)
+                    encode_lower_hex(&object.oid.0)
                 ))
                 .into());
             }
@@ -807,7 +819,7 @@ fn validate_object(fixture: &Fixture, object: &Object) -> Result<()> {
             if actual != expected {
                 return Err(io::Error::other(format!(
                     "commit reference extraction disagrees with git cat-file for {}",
-                    oid_hex(object.oid)
+                    encode_lower_hex(&object.oid.0)
                 ))
                 .into());
             }
@@ -827,7 +839,7 @@ fn validate_commit(
     if parsed.tree != git_tree || parsed.parents != git_parents {
         return Err(io::Error::other(format!(
             "commit references disagree with git cat-file for {}",
-            oid_hex(object.oid)
+            encode_lower_hex(&object.oid.0)
         ))
         .into());
     }
@@ -841,7 +853,7 @@ fn validate_commit(
     {
         return Err(io::Error::other(format!(
             "change-id disagrees with jj-lib for {}",
-            oid_hex(object.oid)
+            encode_lower_hex(&object.oid.0)
         ))
         .into());
     }
@@ -859,7 +871,7 @@ fn validate_commit(
     if jj_trees != expected_trees {
         return Err(io::Error::other(format!(
             "jj:trees disagrees with jj-lib for {}",
-            oid_hex(object.oid)
+            encode_lower_hex(&object.oid.0)
         ))
         .into());
     }
@@ -877,7 +889,7 @@ fn validate_commit(
     if jj_labels != expected_labels {
         return Err(io::Error::other(format!(
             "conflict labels disagree with jj-lib for {}",
-            oid_hex(object.oid)
+            encode_lower_hex(&object.oid.0)
         ))
         .into());
     }
@@ -1023,9 +1035,9 @@ fn render(objects: &[&Object]) -> String {
     for object in objects {
         output.push_str(kind_name(object.kind));
         output.push('|');
-        output.push_str(&oid_hex(object.oid));
+        output.push_str(&encode_lower_hex(&object.oid.0));
         output.push('|');
-        output.push_str(&encode_hex(&object.payload));
+        output.push_str(&encode_lower_hex(&object.payload));
         output.push('\n');
     }
     output
@@ -1059,9 +1071,9 @@ fn raw_commit(
     timestamp: i64,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
-    writeln!(payload, "tree {}", oid_hex(tree)).expect("Vec write");
+    writeln!(payload, "tree {}", encode_lower_hex(&tree.0)).expect("Vec write");
     for parent in parents {
-        writeln!(payload, "parent {}", oid_hex(*parent)).expect("Vec write");
+        writeln!(payload, "parent {}", encode_lower_hex(&parent.0)).expect("Vec write");
     }
     payload.extend_from_slice(b"author ");
     payload.extend_from_slice(author_name);
@@ -1166,20 +1178,6 @@ fn parse_oid(bytes: &[u8]) -> Result<Oid> {
     Oid::from_hex(hex).ok_or_else(|| io::Error::other("git emitted an invalid SHA-1").into())
 }
 
-fn oid_hex(oid: Oid) -> String {
-    encode_hex(&oid.0)
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
 const fn kind_name(kind: ObjectKind) -> &'static str {
     match kind {
         ObjectKind::Blob => "blob",
@@ -1208,7 +1206,7 @@ fn encode_rle(bytes: &[u8]) -> String {
         if !output.is_empty() {
             output.push(',');
         }
-        output.push_str(&format!("{byte:02x}*{}", end - index));
+        write!(output, "{byte:02x}*{}", end - index).expect("writing to a String cannot fail");
         index = end;
     }
     output

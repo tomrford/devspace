@@ -61,7 +61,7 @@ pub struct RepositoryId(String);
 impl RepositoryId {
     pub fn parse(value: impl Into<String>) -> Result<Self, MachineStoreError> {
         let value = value.into();
-        validate_lower_hex(&value, 64, "repository ID")?;
+        validate_lower_hex::<32>(&value, "repository ID")?;
         Ok(Self(value))
     }
 
@@ -82,7 +82,7 @@ pub struct RepositoryIncarnation(String);
 impl RepositoryIncarnation {
     pub fn parse(value: impl Into<String>) -> Result<Self, MachineStoreError> {
         let value = value.into();
-        validate_lower_hex(&value, 32, "repository incarnation")?;
+        validate_lower_hex::<16>(&value, "repository incarnation")?;
         Ok(Self(value))
     }
 
@@ -202,12 +202,6 @@ impl MachineStore {
         &self,
         destination_hash: &str,
     ) -> Result<CheckoutDestinationGuard, MachineStoreError> {
-        debug_assert!(
-            !destination_hash.is_empty()
-                && destination_hash
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        );
         let directory = self.root.join(CHECKOUT_LOCK_DIRECTORY);
         fs::create_dir_all(&directory).map_err(|source| {
             MachineStoreError::CreateCheckoutLockDirectory {
@@ -634,23 +628,15 @@ fn validate_catalog(catalog: &PersistedCatalog) -> Result<(), MachineStoreError>
     Ok(())
 }
 
-fn validate_lower_hex(
+fn validate_lower_hex<const N: usize>(
     value: &str,
-    length: usize,
     field: &'static str,
 ) -> Result<(), MachineStoreError> {
-    let valid = match length {
-        32 => decode_lower_hex::<16>(value).is_ok(),
-        64 => decode_lower_hex::<32>(value).is_ok(),
-        _ => unreachable!("machine identities have fixed supported lengths"),
-    };
-    if !valid {
-        return Err(MachineStoreError::InvalidOpaqueIdentity {
-            field,
-            value: value.to_owned(),
-            length,
-        });
-    }
+    decode_lower_hex::<N>(value).map_err(|_| MachineStoreError::InvalidOpaqueIdentity {
+        field,
+        value: value.to_owned(),
+        length: N * 2,
+    })?;
     Ok(())
 }
 

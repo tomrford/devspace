@@ -677,6 +677,7 @@ dependencies = [
  "blake2",
  "clap",
  "devspace-machine",
+ "devspace-testutils",
  "dunce",
  "futures 0.3.32",
  "getrandom 0.4.3",
@@ -689,7 +690,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "tracing",
 ]
 
 [[package]]
@@ -726,6 +726,7 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "devspace-kernel",
+ "devspace-testutils",
  "futures 0.3.32",
  "gix",
  "jj-lib",
@@ -736,6 +737,13 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "devspace-testutils"
+version = "0.1.0"
+dependencies = [
+ "jj-lib",
 ]
 
 [[package]]

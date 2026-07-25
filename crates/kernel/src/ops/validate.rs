@@ -1,6 +1,6 @@
 //! Mirrors `jj_lib::op_store` values and `jj_lib::simple_op_store` encoding.
 
-use alloc::borrow::ToOwned;
+use alloc::borrow::ToOwned as _;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
@@ -8,11 +8,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use blake2::Blake2b512;
-use prost::Message;
+use prost::Message as _;
 
 use super::hash::{ContentHash, content_id, hash_map};
 use super::proto;
-use super::{Context, OpObjectReference, OpReferenceKind, OpValidatedObject, ValidationError};
+use super::{Context as _, OpObjectReference, OpReferenceKind, OpValidatedObject, ValidationError};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct Id<const LENGTH: usize>(Vec<u8>);

@@ -7,10 +7,10 @@ use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, 
 
 mod support;
 
-use support::fake_worker::{create_server, repository_response, respond};
+use devspace_testutils::fake_worker::{create_server, repository_response, respond};
 use support::{
-    configure_machine, daemon_socket_path, ds, ds_command, machine_store, poll_until, stderr,
-    stdout, write_cli_config,
+    configure_machine, daemon_socket_path, ds, ds_command, machine_store, poll_until, request_json,
+    stderr, stdout, write_cli_config,
 };
 
 fn create_git_remote(root: &Path, name: &str) -> std::path::PathBuf {
@@ -38,10 +38,6 @@ fn create_git_remote(root: &Path, name: &str) -> std::path::PathBuf {
     remote
 }
 
-fn request_body(request: &str) -> serde_json::Value {
-    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
-}
-
 fn create_import_server(
     expected_name: String,
     git_url: String,
@@ -61,10 +57,10 @@ fn create_import_server(
     create_server(move |_, request, stream| {
         let request_line = request.lines().next().unwrap();
         if request_line == "POST /repositories HTTP/1.1" {
-            assert_eq!(request_body(request)["name"], expected_name);
+            assert_eq!(request_json(request)["name"], expected_name);
             respond(stream, "200 OK", &response);
         } else if request_line.starts_with("PUT ") && request_line.contains("/remotes/origin ") {
-            assert_eq!(request_body(request)["url"], git_url);
+            assert_eq!(request_json(request)["url"], git_url);
             respond(
                 stream,
                 "200 OK",
@@ -106,12 +102,12 @@ fn create_import_server(
             respond(
                 stream,
                 "200 OK",
-                &serde_json::json!({"keys": request_body(request)["keys"]}).to_string(),
+                &serde_json::json!({"keys": request_json(request)["keys"]}).to_string(),
             );
         } else if request_line.starts_with("POST ")
             && request_line.contains("/git/ops/heads/transactions ")
         {
-            let body = request_body(request);
+            let body = request_json(request);
             head = Some(body["newHead"].as_str().unwrap().to_owned());
             head_cursor += 1;
             respond(
@@ -134,7 +130,7 @@ fn create_import_server(
         } else if request_line.starts_with("POST ")
             && request_line.contains("/git/projection/fetches ")
         {
-            let body = request_body(request);
+            let body = request_json(request);
             let cursors = body["refs"]
                 .as_array()
                 .unwrap()

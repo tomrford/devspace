@@ -1,28 +1,19 @@
 use std::path::{Path, PathBuf};
 
-use devspace_machine::MachineGitRepository as MachineRepository;
-use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
+use devspace_machine::RepositoryName;
 
 mod support;
 
-use support::fake_worker::{create_server, respond};
-use support::{configure_machine, ds, machine_store, settings, stderr, stdout, write_cli_config};
-
-fn identity(id_byte: u8) -> RepositoryIdentity {
-    RepositoryIdentity::new(
-        RepositoryId::parse(format!("{id_byte:02x}").repeat(32)).unwrap(),
-        RepositoryIncarnation::parse(format!("{:02x}", id_byte + 1).repeat(16)).unwrap(),
-    )
-}
+use devspace_testutils::fake_worker::{create_server, respond};
+use support::{
+    configure_machine, ds, identity, machine_store, registered_repository_with_identity, stderr,
+    stdout, write_cli_config,
+};
 
 async fn local_repository(root: &Path, name: &str, id_byte: u8) -> PathBuf {
-    let entry = machine_store(root)
-        .register_repository(RepositoryName::parse(name).unwrap(), identity(id_byte))
-        .unwrap();
-    MachineRepository::init(&entry.native_repository_path, &settings())
+    registered_repository_with_identity(root, name, identity(id_byte))
         .await
-        .unwrap();
-    entry.native_repository_path
+        .native_repository_path
 }
 
 fn add_checkout(root: &Path, config: &Path, name: &str, checkout: &Path) {

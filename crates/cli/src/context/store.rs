@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 
 use super::ensure_dir_mode;
 use super::git::Git;
-use super::lock::{FileLock, MutationLock};
+use super::lock::FileLock;
 use super::manifest::{LockEntry, Lockfile};
 use anyhow::{Context as _, Result, bail};
+use blake2::{Blake2b512, Digest as _};
+use devspace_machine::encode_lower_hex;
 
 pub struct Store {
     cache_root: PathBuf,
@@ -24,10 +26,6 @@ pub struct GcReport {
     pub removed_remotes: Vec<PathBuf>,
     pub removed_roots: Vec<PathBuf>,
     pub warnings: Vec<String>,
-}
-
-pub struct StoreMutationLock {
-    _lock: FileLock,
 }
 
 impl Store {
@@ -63,24 +61,29 @@ impl Store {
         ensure_dir_mode(&self.locks_dir(), 0o700)
     }
 
-    pub fn lock_mutation(&self) -> Result<StoreMutationLock> {
+    pub fn lock_mutation(&self) -> Result<FileLock> {
         let path = self.locks_dir().join("store.lock");
-        let lock = FileLock::try_acquire(&path)?
-            .with_context(|| format!("context store is busy: {}", self.state_root.display()))?;
-        Ok(StoreMutationLock { _lock: lock })
+        FileLock::try_acquire_or_err(&path, || {
+            format!("context store is busy: {}", self.state_root.display())
+        })
     }
 
     /// Serialize mutations of one project's `.repos/`, keyed like the gc
     /// roots. Keeping the lock file here instead of inside the project means
     /// checkouts never carry lock artifacts; the cost is that Grepo, which
     /// locks `.repos/.mutate.lock`, no longer excludes against `ds context`.
-    pub fn lock_project_mutation(&self, git: &Git, project_dir: &Path) -> Result<MutationLock> {
+    pub fn lock_project_mutation(&self, project_dir: &Path) -> Result<FileLock> {
         let canonical = project_dir
             .canonicalize()
             .with_context(|| format!("canonicalize {}", project_dir.display()))?;
-        let key = git.hash_string(&canonical.display().to_string());
+        let key = cache_key(&canonical.display().to_string());
         let path = self.locks_dir().join(format!("{key}.mutate.lock"));
-        MutationLock::acquire(&path, project_dir)
+        FileLock::try_acquire_or_err(&path, || {
+            format!(
+                "another mutation is in progress in {}",
+                project_dir.display()
+            )
+        })
     }
 
     pub fn with_remote_cache<T>(
@@ -89,22 +92,14 @@ impl Store {
         url: &str,
         f: impl FnOnce(&Path) -> Result<T>,
     ) -> Result<T> {
-        let remote_key = git.hash_string(url);
+        let remote_key = cache_key(url);
         self.with_remote_cache_for_key(git, url, &remote_key, f)
     }
 
     /// Where the snapshot for this (url, commit, subdir) lives, materialized
     /// or not.
-    pub fn snapshot_path(
-        &self,
-        git: &Git,
-        url: &str,
-        commit: &str,
-        subdir: Option<&str>,
-    ) -> Result<PathBuf> {
-        let remote_key = git.hash_string(url);
-        let snapshot_key = self.snapshot_key(git, url, commit, subdir)?;
-        Ok(self.snapshot_dir_for_keys(&remote_key, &snapshot_key))
+    pub fn snapshot_path(&self, url: &str, commit: &str, subdir: Option<&str>) -> PathBuf {
+        self.snapshot_dir_for_keys(&cache_key(url), &snapshot_key(url, commit, subdir))
     }
 
     pub fn ensure_snapshot_for_commit(
@@ -114,8 +109,8 @@ impl Store {
         commit: &str,
         subdir: Option<&str>,
     ) -> Result<PathBuf> {
-        let remote_key = git.hash_string(url);
-        let snapshot_key = self.snapshot_key(git, url, commit, subdir)?;
+        let remote_key = cache_key(url);
+        let snapshot_key = snapshot_key(url, commit, subdir);
         let snapshot_dir = self.snapshot_dir_for_keys(&remote_key, &snapshot_key);
         self.with_remote_cache_for_key(git, url, &remote_key, |remote_dir| {
             if snapshot_dir.exists() {
@@ -129,11 +124,11 @@ impl Store {
     }
 
     /// Register `lock_path` as a gc root (a symlink back to the lockfile).
-    pub fn refresh_root(&self, git: &Git, lock_path: &Path) -> Result<PathBuf> {
+    pub fn refresh_root(&self, lock_path: &Path) -> Result<PathBuf> {
         let canonical = lock_path
             .canonicalize()
             .with_context(|| format!("canonicalize {}", lock_path.display()))?;
-        let root_key = git.hash_string(&canonical.display().to_string());
+        let root_key = cache_key(&canonical.display().to_string());
         let root_link = self.roots_dir().join(format!("{root_key}.lock"));
         if root_link.exists() {
             fs::remove_file(&root_link)
@@ -152,7 +147,7 @@ impl Store {
     /// Sweep snapshots and remote caches unreachable from any rooted
     /// lockfile. Foreign entries hold nothing in this store, so they
     /// contribute no reachability.
-    pub fn gc(&self, git: &Git) -> Result<GcReport> {
+    pub fn gc(&self) -> Result<GcReport> {
         let mut report = GcReport::default();
         let mut reachable_snapshots = BTreeSet::new();
         let mut reachable_remotes = BTreeSet::new();
@@ -163,14 +158,10 @@ impl Store {
             if !metadata.file_type().is_symlink() {
                 continue;
             }
-            let lock_path = match fs::canonicalize(&entry) {
-                Ok(path) => path,
-                Err(_) => {
-                    fs::remove_file(&entry)
-                        .with_context(|| format!("remove {}", entry.display()))?;
-                    report.removed_roots.push(entry);
-                    continue;
-                }
+            let Ok(lock_path) = fs::canonicalize(&entry) else {
+                fs::remove_file(&entry).with_context(|| format!("remove {}", entry.display()))?;
+                report.removed_roots.push(entry);
+                continue;
             };
             let lockfile = match Lockfile::load(&lock_path) {
                 Ok(lockfile) => lockfile,
@@ -189,9 +180,9 @@ impl Store {
                 let Some(commit) = &git_entry.commit else {
                     continue;
                 };
-                let remote_key = git.hash_string(&git_entry.url);
+                let remote_key = cache_key(&git_entry.url);
                 let snapshot_key =
-                    self.snapshot_key(git, &git_entry.url, commit, git_entry.subdir.as_deref())?;
+                    snapshot_key(&git_entry.url, commit, git_entry.subdir.as_deref());
                 reachable_snapshots.insert(self.snapshot_dir_for_keys(&remote_key, &snapshot_key));
                 reachable_remotes.insert(self.remote_dir_for_key(&remote_key));
             }
@@ -230,17 +221,6 @@ impl Store {
         Ok(report)
     }
 
-    fn snapshot_key(
-        &self,
-        git: &Git,
-        url: &str,
-        commit: &str,
-        subdir: Option<&str>,
-    ) -> Result<String> {
-        let payload = format!("{url}\n{commit}\n{}", subdir.unwrap_or(""));
-        Ok(git.hash_string(&payload))
-    }
-
     fn remote_dir_for_key(&self, remote_key: &str) -> PathBuf {
         self.remotes_dir().join(format!("{remote_key}.git"))
     }
@@ -261,6 +241,16 @@ impl Store {
         git.ensure_remote_cache(&remote_dir, url)?;
         f(&remote_dir)
     }
+}
+
+/// Names a cache directory after its input. Changing this changes where every
+/// existing snapshot and remote cache lives.
+fn cache_key(value: &str) -> String {
+    encode_lower_hex(&Blake2b512::digest(value.as_bytes()))
+}
+
+fn snapshot_key(url: &str, commit: &str, subdir: Option<&str>) -> String {
+    cache_key(&format!("{url}\n{commit}\n{}", subdir.unwrap_or("")))
 }
 
 pub fn replace_symlink(link_path: &Path, target: &Path) -> Result<()> {

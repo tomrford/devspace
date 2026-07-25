@@ -2,7 +2,8 @@
 
 Cloudflare-native devspace. The current contract is in `README.md` and
 `docs/kernel.md`, `docs/sync.md`, `docs/hidden.md`,
-`docs/git-projection.md`, `docs/git-push.md` and `docs/git-fetch.md`.
+`docs/git-projection.md`, `docs/git-push.md`, `docs/git-fetch.md` and
+`docs/sign-rewritten.md`.
 The legacy `tomrford/devspace-legacy` repository is a historical behavioural
 reference only; nothing canonical depends on it.
 
@@ -44,12 +45,18 @@ describing the current classes.
 - Gitignore matching through jj-lib's gix-ignore wrapper is canonical private
   projection behavior. Audit it against the machine projection and working-copy
   tests on every jj bump.
-- `crates/cli/src/working_copy.rs::base_ignores` mirrors jj-cli's
-  GitBackend branch of `WorkspaceCommandHelper::base_ignores`: the backend Git
-  config's global excludes plus `.git/info/exclude`. Audit it on every bump.
+- Devspace does not compute base ignores. `crates/cli/src/working_copy.rs`
+  reads jj-cli's `SnapshotOptions.base_ignores` unchanged and unions the
+  `.dsprivate` hidden paths found by `hidden_track_matcher` into
+  `start_tracking_matcher` and `force_tracking_matcher`. Audit two things on
+  every bump: the shape of `SnapshotOptions.base_ignores`, and the precedence
+  between base ignores and forced tracking.
 - `crates/machine/src/op_sync.rs::object_path` knows the simple operation
   store's on-disk layout outside the kernel. Audit it with operation encodings
   on every bump.
+- The `[workspace.lints]` table in `Cargo.toml` is a verbatim copy of jj
+  0.42.0's. Diff it against the new jj version on every bump and adopt the
+  difference.
 
 ## jj bump rollout
 

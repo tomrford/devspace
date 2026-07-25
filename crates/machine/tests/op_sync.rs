@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use devspace_kernel::ops::{OpObjectKind as KernelOpObjectKind, OpReferenceKind, validate_op};
+use devspace_kernel::ops::{OpReferenceKind, validate_op};
 use devspace_machine::{
     CloudOpHeads, MachineGitRepository, OpId, OpObjectKey, OpObjectKind, OpSyncEngine, OpSyncStore,
     OpSyncTransport, OpTransportError, PendingOpHeadTransaction,
 };
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{Operation, RefTarget, RemoteRef, RemoteRefState, View};
 use jj_lib::ref_name::{RefName, RemoteRefSymbol};
@@ -13,19 +12,7 @@ use jj_lib::repo::Repo as _;
 use jj_lib::settings::UserSettings;
 
 fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Operation Sync Test"
-                email = "op-sync@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
+    devspace_testutils::settings("Operation Sync Test", "op-sync@example.invalid", false)
 }
 
 async fn offline_machine(path: &std::path::Path, name: &str) -> MachineGitRepository {
@@ -196,7 +183,7 @@ impl FakeCloud {
                 .objects
                 .get(&key)
                 .ok_or_else(|| std::io::Error::other("missing operation ancestry"))?;
-            let operation = validate_op(KernelOpObjectKind::Operation, bytes)?;
+            let operation = validate_op(OpObjectKind::Operation, bytes)?;
             for reference in operation
                 .references
                 .into_iter()

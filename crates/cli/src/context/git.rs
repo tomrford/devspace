@@ -7,8 +7,6 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
-use blake2::{Blake2b512, Digest as _};
-use devspace_machine::encode_lower_hex;
 
 use super::{ensure_dir_mode, run_command};
 
@@ -28,10 +26,6 @@ impl Git {
         Self {
             program: program.into(),
         }
-    }
-
-    pub fn hash_string(&self, value: &str) -> String {
-        encode_lower_hex(&Blake2b512::digest(value.as_bytes()))
     }
 
     pub fn ensure_remote_cache(&self, remote_dir: &Path, url: &str) -> Result<()> {

@@ -48,7 +48,7 @@ pub(crate) fn intercept(args: &[OsString]) -> Option<ExitCode> {
         Ok(args) => run(args),
         Err(error) => {
             let code = error.exit_code();
-            let _ = error.print();
+            error.print().ok();
             ExitCode::from(u8::try_from(code).unwrap_or(1))
         }
     })
@@ -58,7 +58,7 @@ fn run(args: ConfigArgs) -> ExitCode {
     match run_inner(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            let _ = writeln!(io::stderr().lock(), "Error: {error}");
+            writeln!(io::stderr().lock(), "Error: {error}").ok();
             ExitCode::FAILURE
         }
     }

@@ -1,5 +1,10 @@
 import { z } from "zod";
-import { canonicalHeadTransactionBytes, decodeHeadTransaction } from "./op_protocol";
+import {
+  MAX_OPERATION_HEADS,
+  canonicalHeadTransactionBytes,
+  decodeHeadTransaction,
+  opInventorySchema,
+} from "./op_protocol";
 import {
   Kernel,
   KernelValidationError,
@@ -8,18 +13,20 @@ import {
   exactGitBuffer,
   gitToHex,
 } from "./kernel";
+import { firstZodMessage, hexBytes, lowerHexBytesSchema } from "./validation";
 
 const OP_OBJECT_ID_BYTES = 64;
-const MAX_OPERATION_HEADS = 4_096;
 const RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const MAX_RECEIPTS = 65_536;
 const MAX_RECEIPT_HEADS = 1_048_576;
 const PRUNE_BATCH = 256;
 export const MAX_OP_OBJECT_BYTES = 1024 * 1024;
-export const MAX_OP_INVENTORY_KEYS = 4_096;
 export const MAX_OP_INVENTORY_REQUEST_BYTES = 640 * 1024;
 
-const OP_KIND = {
+const opObjectIdSchema = lowerHexBytesSchema(64, "operation-store object ID");
+const incarnationSchema = lowerHexBytesSchema(16, "incarnation");
+
+const OP_OBJECT_KIND = {
   view: 0,
   operation: 1,
 } as const;
@@ -67,7 +74,7 @@ export class OpGitStore {
       if (bytes.byteLength > MAX_OP_OBJECT_BYTES) {
         throw new OpStoreError(`operation-store object exceeds ${MAX_OP_OBJECT_BYTES} byte limit`);
       }
-      const id = decodeId(idValue, "operation-store object ID");
+      const id = decodeOpRequest(opObjectIdSchema, idValue);
       let validated;
       try {
         validated =
@@ -84,7 +91,7 @@ export class OpGitStore {
         throw new OpStoreError("operation-store object ID does not match canonical bytes");
       }
       const inserted = this.ctx.storage.transactionSync(() => {
-        const kind = OP_KIND[kindName];
+        const kind = OP_OBJECT_KIND[kindName];
         const existing = this.sql
           .exec<{ bytes: ArrayBuffer }>(
             "SELECT bytes FROM op_objects WHERE kind = ? AND id = ?",
@@ -125,11 +132,11 @@ export class OpGitStore {
 
   get(kindName: "view" | "operation", idValue: unknown) {
     try {
-      const id = decodeId(idValue, "operation-store object ID");
+      const id = decodeOpRequest(opObjectIdSchema, idValue);
       const row = this.sql
         .exec<{ bytes: ArrayBuffer }>(
           "SELECT bytes FROM op_objects WHERE kind = ? AND id = ?",
-          OP_KIND[kindName],
+          OP_OBJECT_KIND[kindName],
           exactGitBuffer(id),
         )
         .toArray()[0];
@@ -144,12 +151,12 @@ export class OpGitStore {
 
   inventory(value: unknown) {
     try {
-      const keys = decodeInventory(value);
+      const { keys } = decodeOpRequest(opInventorySchema, value);
       const present: string[] = [];
       for (const key of keys) {
         const [prefix, idHex] = key.split(":");
-        const kind = prefix === "v" ? OP_KIND.view : OP_KIND.operation;
-        const id = decodeId(idHex, "operation-store inventory ID");
+        const kind = prefix === "v" ? OP_OBJECT_KIND.view : OP_OBJECT_KIND.operation;
+        const id = hexBytes(idHex);
         const found = this.sql
           .exec<{ present: number }>(
             "SELECT 1 AS present FROM op_objects WHERE kind = ? AND id = ?",
@@ -283,12 +290,8 @@ export class OpGitStore {
     }
   }
 
-  countObjects() {
-    return this.sql.exec<{ count: number }>("SELECT count(*) AS count FROM op_objects").one().count;
-  }
-
   private requireState(incarnationValue: unknown): RepositoryStateRow {
-    const incarnation = decodeShortId(incarnationValue, "incarnation");
+    const incarnation = decodeOpRequest(incarnationSchema, incarnationValue);
     const state = this.sql
       .exec<RepositoryStateRow>(
         `SELECT incarnation, op_cursor, op_receipt_count, op_receipt_head_count
@@ -400,7 +403,7 @@ export class OpGitStore {
              SELECT edges.referenced_id
              FROM ancestors
              JOIN op_object_references AS edges
-               ON edges.object_kind = ${OP_KIND.operation}
+               ON edges.object_kind = ${OP_OBJECT_KIND.operation}
               AND edges.object_id = ancestors.id
               AND edges.reference_kind = ${OP_REFERENCE_KIND.operation}
            )
@@ -424,10 +427,10 @@ export class OpGitStore {
            FROM reachable
            JOIN op_object_references AS edges
              ON (reachable.kind = ${OP_REFERENCE_KIND.view}
-                 AND edges.object_kind = ${OP_KIND.view}
+                 AND edges.object_kind = ${OP_OBJECT_KIND.view}
                  AND edges.object_id = reachable.id)
               OR (reachable.kind = ${OP_REFERENCE_KIND.operation}
-                 AND edges.object_kind = ${OP_KIND.operation}
+                 AND edges.object_kind = ${OP_OBJECT_KIND.operation}
                  AND edges.object_id = reachable.id)
          )
          SELECT reachable.kind, reachable.id
@@ -438,11 +441,11 @@ export class OpGitStore {
           AND commits.id = reachable.id
          LEFT JOIN op_objects AS views
            ON reachable.kind = ${OP_REFERENCE_KIND.view}
-          AND views.kind = ${OP_KIND.view}
+          AND views.kind = ${OP_OBJECT_KIND.view}
           AND views.id = reachable.id
          LEFT JOIN op_objects AS operations
            ON reachable.kind = ${OP_REFERENCE_KIND.operation}
-          AND operations.kind = ${OP_KIND.operation}
+          AND operations.kind = ${OP_OBJECT_KIND.operation}
           AND operations.id = reachable.id
          WHERE commits.id IS NULL AND views.id IS NULL AND operations.id IS NULL
            AND NOT (
@@ -468,7 +471,6 @@ export class OpGitStore {
   }
 
   private failure(error: unknown) {
-    if (error instanceof WebAssembly.RuntimeError) this.kernel.reset();
     if (error instanceof OpStoreError) {
       return {
         ok: false as const,
@@ -489,46 +491,11 @@ export class OpGitStore {
   }
 }
 
-function decodeId(value: unknown, label: string): Uint8Array {
-  if (typeof value !== "string" || !/^[0-9a-f]{128}$/.test(value)) {
-    throw new OpStoreError(`${label} must be 128 lowercase hex characters`);
-  }
-  return decodeHex(value, OP_OBJECT_ID_BYTES);
-}
-
-function decodeShortId(value: unknown, label: string): Uint8Array {
-  if (typeof value !== "string" || !/^[0-9a-f]{32}$/.test(value)) {
-    throw new OpStoreError(`${label} must be 32 lowercase hex characters`);
-  }
-  return decodeHex(value, 16);
-}
-
-function decodeHex(value: string, length: number): Uint8Array {
-  return Uint8Array.from({ length }, (_, index) =>
-    Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
-  );
-}
-
-function decodeInventory(value: unknown): string[] {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    Array.isArray(value) ||
-    Object.keys(value).length !== 1 ||
-    !("keys" in value) ||
-    !Array.isArray(value.keys) ||
-    value.keys.length > MAX_OP_INVENTORY_KEYS
-  ) {
-    throw new OpStoreError("operation-store inventory request must contain only a bounded keys array");
-  }
-  const keys = value.keys;
-  for (const [index, key] of keys.entries()) {
-    if (typeof key !== "string" || !/^[vo]:[0-9a-f]{128}$/.test(key)) {
-      throw new OpStoreError("operation-store inventory key is invalid");
-    }
-    if (index > 0 && keys[index - 1] >= key) {
-      throw new OpStoreError("operation-store inventory keys must be strictly sorted");
-    }
-  }
-  return keys;
+function decodeOpRequest<Schema extends z.ZodType>(
+  schema: Schema,
+  value: unknown,
+): z.output<Schema> {
+  const result = schema.safeParse(value);
+  if (!result.success) throw new OpStoreError(firstZodMessage(result.error));
+  return result.data;
 }

@@ -1,45 +1,31 @@
 use std::collections::BTreeSet;
-use std::process::Command;
 
-use devspace_kernel::{ObjectKind, Oid, TreeEntryKind, parse_commit, parse_tree, validate};
+use devspace_kernel::{ObjectKind, Oid, TreeEntryKind, parse_commit, parse_tree};
 use devspace_machine::{
-    CommitMapping, MachineGitRepository, ObjectKey, PackOptions, ProjectionError,
-    ProjectionMappings, build_packs,
+    CommitMapping, MachineGitRepository, PackOptions, ProjectionError, ProjectionMappings,
+    build_packs,
 };
 use futures::executor::block_on;
-use gix::objs::{Kind as GitObjectKind, Write as _};
-use jj_lib::backend::{ChangeId, CopyId, TreeValue};
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::backend::ChangeId;
 use jj_lib::conflict_labels::ConflictLabels;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
-use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
 
+mod common;
+
+use common::{all_objects, read_raw, tree_with_file, write_commit, write_raw};
+
 const ROOT_SECRET: &[u8] = b"ROOT-PRIVATE-SENTINEL\0\xff";
 const DIRECTORY_SECRET: &[u8] = b"DIRECTORY-PRIVATE-SENTINEL\0\xfe";
 const NESTED_SECRET: &[u8] = b"NESTED-PRIVATE-SENTINEL\0\xfd";
+const COMMIT_IDENTITY: &str = "Projection <projection@example.invalid>";
 
 fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Projection Test"
-                email = "projection@example.invalid"
-
-                [git]
-                write-change-id-header = true
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
+    devspace_testutils::settings("Projection Test", "projection@example.invalid", true)
 }
 
 #[test]
@@ -48,11 +34,13 @@ fn hidden_free_history_is_an_object_free_identity_projection() {
     let repository = block_on(MachineGitRepository::init(temp.path(), &settings())).unwrap();
     let blob = write_raw(&repository, ObjectKind::Blob, b"public bytes\n");
     let tree = write_tree(&repository, &[(b"100644", b"public.txt", blob)]);
-    let base = write_commit(&repository, tree, &[], &[], b"base\n");
+    let base = write_commit(&repository, COMMIT_IDENTITY, tree, &[], b"base\n", &[]);
     let signed = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         tree,
         &[base],
+        b"signed identity\n",
         &[
             (b"encoding", b"ISO-8859-1"),
             (b"change-id", b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
@@ -66,16 +54,9 @@ fn hidden_free_history_is_an_object_free_identity_projection() {
                 b"object 0000000000000000000000000000000000000000\n type commit\n tag identity",
             ),
         ],
-        b"signed identity\n",
     );
     let before = all_objects(&repository);
-    let canonical_bytes = read_raw(
-        &repository,
-        ObjectKey {
-            kind: ObjectKind::Commit,
-            id: signed,
-        },
-    );
+    let canonical_bytes = read_raw(&repository, signed);
 
     let mut mappings = ProjectionMappings::default();
     let result = block_on(repository.project_hidden_paths(&[base, signed], &mut mappings)).unwrap();
@@ -85,13 +66,7 @@ fn hidden_free_history_is_an_object_free_identity_projection() {
     assert!(mappings.rows().next().is_none());
     assert_eq!(all_objects(&repository), before);
     assert_eq!(
-        read_raw(
-            &repository,
-            ObjectKey {
-                kind: ObjectKind::Commit,
-                id: result.public_heads[1],
-            },
-        ),
+        read_raw(&repository, result.public_heads[1]),
         canonical_bytes
     );
 }
@@ -128,7 +103,7 @@ fn hidden_projection_is_minimal_deterministic_and_cloud_durable() {
         .public_id;
     assert_eq!(public_merge.parents, vec![public_hidden, fixture.clean]);
 
-    let rewritten_hidden = read_commit_bytes(&source, public_hidden);
+    let rewritten_hidden = read_raw(&source, public_hidden);
     assert!(
         !rewritten_hidden
             .windows(b"gpgsig".len())
@@ -183,15 +158,12 @@ fn hidden_projection_is_minimal_deterministic_and_cloud_durable() {
     source.scan_hidden_paths(public_head, &hidden_set).unwrap();
     assert_no_private_sentinel(&source, public_head);
 
-    let public_bytes = read_commit_bytes(&source, public_head);
+    let public_bytes = read_raw(&source, public_head);
     let mut second_mappings = ProjectionMappings::default();
     let second =
         block_on(source.project_hidden_paths(&[fixture.merge], &mut second_mappings)).unwrap();
     assert_eq!(second.public_heads, vec![public_head]);
-    assert_eq!(
-        read_commit_bytes(&source, second.public_heads[0]),
-        public_bytes
-    );
+    assert_eq!(read_raw(&source, second.public_heads[0]), public_bytes);
     assert_eq!(second.new_mappings, projected.new_mappings);
 
     let before_seeded = all_objects(&source);
@@ -216,12 +188,12 @@ fn hidden_projection_is_minimal_deterministic_and_cloud_durable() {
         &settings(),
     ))
     .unwrap();
-    for pack in &built.packs {
+    for pack in &built {
         destination
             .install_pack(pack.id, &pack.manifest_bytes, &pack.chunks)
             .unwrap();
     }
-    assert_eq!(read_commit_bytes(&destination, public_head), public_bytes);
+    assert_eq!(read_raw(&destination, public_head), public_bytes);
     let installed_commit = block_on(
         destination
             .repo()
@@ -253,10 +225,11 @@ fn rewritten_parent_forces_a_clean_descendant_rewrite() {
     );
     let descendant = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         clean_tree,
         &[fixture.hidden],
-        &[],
         b"policy removed\n",
+        &[],
     );
 
     let mut mappings = ProjectionMappings::default();
@@ -294,15 +267,36 @@ fn rejects_conflicting_policy_non_file_policy_gitlinks_and_seed_collisions() {
 
     let empty = write_tree(&repository, &[]);
     let non_file_tree = write_tree(&repository, &[(b"40000", b".dsprivate", empty)]);
-    let non_file = write_commit(&repository, non_file_tree, &[], &[], b"invalid policy\n");
+    let non_file = write_commit(
+        &repository,
+        COMMIT_IDENTITY,
+        non_file_tree,
+        &[],
+        b"invalid policy\n",
+        &[],
+    );
     assert!(matches!(
         block_on(repository.project_hidden_paths(&[non_file], &mut ProjectionMappings::default())),
         Err(ProjectionError::InvalidDsprivateEntry { .. })
     ));
 
-    let target = write_commit(&repository, empty, &[], &[], b"gitlink target\n");
+    let target = write_commit(
+        &repository,
+        COMMIT_IDENTITY,
+        empty,
+        &[],
+        b"gitlink target\n",
+        &[],
+    );
     let gitlink_tree = write_tree(&repository, &[(b"160000", b"submodule", target)]);
-    let gitlink = write_commit(&repository, gitlink_tree, &[], &[], b"gitlink\n");
+    let gitlink = write_commit(
+        &repository,
+        COMMIT_IDENTITY,
+        gitlink_tree,
+        &[],
+        b"gitlink\n",
+        &[],
+    );
     assert!(matches!(
         block_on(repository.project_hidden_paths(
             &[gitlink],
@@ -347,7 +341,14 @@ fn build_hidden_fixture(repository: &MachineGitRepository) -> HiddenFixture {
             (b"40000", b"shared", shared_tree),
         ],
     );
-    let base = write_commit(repository, base_tree, &[], &[], b"clean base\n");
+    let base = write_commit(
+        repository,
+        COMMIT_IDENTITY,
+        base_tree,
+        &[],
+        b"clean base\n",
+        &[],
+    );
     let clean_blob = write_raw(repository, ObjectKind::Blob, b"clean branch\n");
     let clean_tree = write_tree(
         repository,
@@ -357,7 +358,14 @@ fn build_hidden_fixture(repository: &MachineGitRepository) -> HiddenFixture {
             (b"40000", b"shared", shared_tree),
         ],
     );
-    let clean = write_commit(repository, clean_tree, &[base], &[], b"clean side\n");
+    let clean = write_commit(
+        repository,
+        COMMIT_IDENTITY,
+        clean_tree,
+        &[base],
+        b"clean side\n",
+        &[],
+    );
 
     let root_policy = write_raw(
         repository,
@@ -393,8 +401,10 @@ fn build_hidden_fixture(repository: &MachineGitRepository) -> HiddenFixture {
     );
     let hidden = write_commit(
         repository,
+        COMMIT_IDENTITY,
         hidden_tree,
         &[base],
+        b"hidden side\n",
         &[
             (b"encoding", b"ISO-8859-1"),
             (b"change-id", b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
@@ -418,14 +428,14 @@ fn build_hidden_fixture(repository: &MachineGitRepository) -> HiddenFixture {
             ),
             (b"x-after", b"last opaque header"),
         ],
-        b"hidden side\n",
     );
     let merge = write_commit(
         repository,
+        COMMIT_IDENTITY,
         hidden_tree,
         &[hidden, clean],
-        &[],
         b"mixed merge\n",
+        &[],
     );
     HiddenFixture {
         base,
@@ -468,25 +478,6 @@ async fn write_conflicted_dsprivate(repository: &MachineGitRepository) -> Oid {
     Oid(commit.id().as_bytes().try_into().unwrap())
 }
 
-async fn tree_with_file(
-    store: &std::sync::Arc<jj_lib::store::Store>,
-    path: &RepoPathBuf,
-    contents: &[u8],
-) -> MergedTree {
-    let mut reader = contents;
-    let file_id = store.write_file(path, &mut reader).await.unwrap();
-    let mut builder = MergedTreeBuilder::new(store.empty_merged_tree());
-    builder.set_or_remove(
-        path.clone(),
-        Merge::normal(TreeValue::File {
-            id: file_id,
-            executable: false,
-            copy_id: CopyId::placeholder(),
-        }),
-    );
-    builder.write_tree().await.unwrap()
-}
-
 fn assert_no_private_sentinel(repository: &MachineGitRepository, head: Oid) {
     let closure = repository.object_closure([head]).unwrap();
     for object in closure
@@ -494,7 +485,7 @@ fn assert_no_private_sentinel(repository: &MachineGitRepository, head: Oid) {
         .iter()
         .filter(|object| object.key.kind == ObjectKind::Blob)
     {
-        let bytes = read_raw(repository, object.key);
+        let bytes = read_raw(repository, object.key.id);
         for sentinel in [ROOT_SECRET, DIRECTORY_SECRET, NESTED_SECRET] {
             assert!(
                 !bytes
@@ -505,48 +496,6 @@ fn assert_no_private_sentinel(repository: &MachineGitRepository, head: Oid) {
             );
         }
     }
-}
-
-fn write_commit(
-    repository: &MachineGitRepository,
-    tree: Oid,
-    parents: &[Oid],
-    extras: &[(&[u8], &[u8])],
-    message: &[u8],
-) -> Oid {
-    let mut bytes = format!(
-        "tree {}\n",
-        tree.0
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    )
-    .into_bytes();
-    for parent in parents {
-        bytes.extend_from_slice(
-            format!(
-                "parent {}\n",
-                parent
-                    .0
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            )
-            .as_bytes(),
-        );
-    }
-    bytes.extend_from_slice(b"author Projection <projection@example.invalid> 1700000000 +0000\n");
-    bytes
-        .extend_from_slice(b"committer Projection <projection@example.invalid> 1700000000 +0000\n");
-    for (name, value) in extras {
-        bytes.extend_from_slice(name);
-        bytes.push(b' ');
-        bytes.extend_from_slice(value);
-        bytes.push(b'\n');
-    }
-    bytes.push(b'\n');
-    bytes.extend_from_slice(message);
-    write_raw(repository, ObjectKind::Commit, &bytes)
 }
 
 fn write_tree(repository: &MachineGitRepository, entries: &[(&[u8], &[u8], Oid)]) -> Oid {
@@ -561,32 +510,9 @@ fn write_tree(repository: &MachineGitRepository, entries: &[(&[u8], &[u8], Oid)]
     write_raw(repository, ObjectKind::Tree, &bytes)
 }
 
-fn write_raw(repository: &MachineGitRepository, kind: ObjectKind, bytes: &[u8]) -> Oid {
-    let validated = validate(kind, bytes).unwrap();
-    let git_repo = gix::open(repository.git_repo_path()).unwrap();
-    let git_kind = match kind {
-        ObjectKind::Blob => GitObjectKind::Blob,
-        ObjectKind::Tree => GitObjectKind::Tree,
-        ObjectKind::Commit => GitObjectKind::Commit,
-    };
-    let actual = git_repo.objects.write_buf(git_kind, bytes).unwrap();
-    assert_eq!(actual.as_bytes(), validated.id.0);
-    validated.id
-}
-
 fn parse_commit_bytes(repository: &MachineGitRepository, id: Oid) -> devspace_kernel::Commit<'_> {
-    let bytes = Box::leak(read_commit_bytes(repository, id).into_boxed_slice());
+    let bytes = Box::leak(read_raw(repository, id).into_boxed_slice());
     parse_commit(bytes).unwrap()
-}
-
-fn read_commit_bytes(repository: &MachineGitRepository, id: Oid) -> Vec<u8> {
-    read_raw(
-        repository,
-        ObjectKey {
-            kind: ObjectKind::Commit,
-            id,
-        },
-    )
 }
 
 fn tree_entry(
@@ -594,56 +520,11 @@ fn tree_entry(
     tree: Oid,
     name: &[u8],
 ) -> Option<(TreeEntryKind, Vec<u8>, Oid)> {
-    let bytes = read_raw(
-        repository,
-        ObjectKey {
-            kind: ObjectKind::Tree,
-            id: tree,
-        },
-    );
+    let bytes = read_raw(repository, tree);
     parse_tree(&bytes)
         .unwrap()
         .entries
         .into_iter()
         .find(|entry| entry.name == name)
         .map(|entry| (entry.kind, entry.name.to_vec(), entry.oid))
-}
-
-fn read_raw(repository: &MachineGitRepository, key: ObjectKey) -> Vec<u8> {
-    gix::open(repository.git_repo_path())
-        .unwrap()
-        .find_object(gix::ObjectId::from_bytes_or_panic(&key.id.0))
-        .unwrap()
-        .data
-        .clone()
-}
-
-fn all_objects(repository: &MachineGitRepository) -> BTreeSet<String> {
-    String::from_utf8(run_git(
-        repository,
-        &[
-            "cat-file",
-            "--batch-all-objects",
-            "--batch-check=%(objectname)",
-        ],
-    ))
-    .unwrap()
-    .lines()
-    .map(str::to_owned)
-    .collect()
-}
-
-fn run_git(repository: &MachineGitRepository, args: &[&str]) -> Vec<u8> {
-    let output = Command::new("git")
-        .arg("--git-dir")
-        .arg(repository.git_repo_path())
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output.stdout
 }

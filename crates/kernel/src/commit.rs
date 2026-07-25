@@ -46,9 +46,7 @@ pub fn parse_commit(payload: &[u8]) -> Result<Commit<'_>, CommitError> {
 
     let tree_header = required_header(&headers, index, TREE_HEADER, "tree")?;
     let tree = header_oid(tree_header, "tree")?;
-    index = index
-        .checked_add(1)
-        .ok_or(CommitError::MissingHeader("author"))?;
+    index += 1;
 
     let mut parents = Vec::new();
     while let Some(header) = headers.get(index) {
@@ -56,37 +54,30 @@ pub fn parse_commit(payload: &[u8]) -> Result<Commit<'_>, CommitError> {
             break;
         }
         parents.push(header_oid(header, "parent")?);
-        index = index
-            .checked_add(1)
-            .ok_or(CommitError::MissingHeader("author"))?;
+        index += 1;
     }
 
     let author_header = required_header(&headers, index, AUTHOR_HEADER, "author")?;
     let author = parse_signature_header(author_header, "author")?;
-    index = index
-        .checked_add(1)
-        .ok_or(CommitError::MissingHeader("committer"))?;
+    index += 1;
 
     let committer_header = required_header(&headers, index, COMMITTER_HEADER, "committer")?;
     let committer = parse_signature_header(committer_header, "committer")?;
-    index = index
-        .checked_add(1)
-        .ok_or(CommitError::MissingHeader("commit body"))?;
+    index += 1;
 
     let encoding = match headers.get(index) {
         Some(header) if header.name == ENCODING_HEADER => {
             let value = single_line(header).ok_or(CommitError::InvalidHeader {
                 offset: header.offset,
             })?;
-            index = index
-                .checked_add(1)
-                .ok_or(CommitError::MissingHeader("commit body"))?;
+            index += 1;
             Some(value)
         }
         _ => None,
     };
+    debug_assert!(index <= headers.len());
 
-    for header in headers.get(index..).unwrap_or_default() {
+    for header in &headers[index..] {
         if matches!(
             header.name,
             TREE_HEADER | PARENT_HEADER | AUTHOR_HEADER | COMMITTER_HEADER | ENCODING_HEADER
@@ -98,17 +89,13 @@ pub fn parse_commit(payload: &[u8]) -> Result<Commit<'_>, CommitError> {
         }
     }
 
-    let change_id = headers
-        .get(index..)
-        .unwrap_or_default()
+    let change_id = headers[index..]
         .iter()
         .find(|header| header.name == CHANGE_ID_HEADER)
         .and_then(|header| single_line(header))
         .and_then(parse_reverse_hex_change_id);
 
-    let jj_trees = match headers
-        .get(index..)
-        .unwrap_or_default()
+    let jj_trees = match headers[index..]
         .iter()
         .find(|header| header.name == JJ_TREES_HEADER)
     {
@@ -116,9 +103,7 @@ pub fn parse_commit(payload: &[u8]) -> Result<Commit<'_>, CommitError> {
         None => Vec::new(),
     };
 
-    let conflict_labels = match headers
-        .get(index..)
-        .unwrap_or_default()
+    let conflict_labels = match headers[index..]
         .iter()
         .find(|header| header.name == JJ_CONFLICT_LABELS_HEADER)
     {
@@ -351,11 +336,8 @@ fn parse_reverse_hex_change_id(value: &[u8]) -> Option<[u8; 16]> {
         return None;
     }
     let mut output = [0_u8; 16];
-    for (index, pair) in value.chunks_exact(2).enumerate() {
-        let high = reverse_hex_digit(*pair.first()?)?;
-        let low = reverse_hex_digit(*pair.get(1)?)?;
-        let slot = output.get_mut(index)?;
-        *slot = high.checked_shl(4)? | low;
+    for (slot, pair) in output.iter_mut().zip(value.chunks_exact(2)) {
+        *slot = (reverse_hex_digit(pair[0])? << 4) | reverse_hex_digit(pair[1])?;
     }
     Some(output)
 }

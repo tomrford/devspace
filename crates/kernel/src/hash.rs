@@ -1,4 +1,4 @@
-use alloc::string::ToString;
+use alloc::string::ToString as _;
 
 use sha1_checked::{Digest, Sha1};
 

@@ -9,3 +9,6 @@ rust-version.workspace = true
 blake2.workspace = true
 prost.workspace = true
 sha1-checked = { version = "=0.10.0", default-features = false }
+
+[lints]
+workspace = true

@@ -4,6 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use blake2::{Blake2b512, Digest as _};
+use devspace_machine::encode_lower_hex;
 use futures::StreamExt as _;
 use gix::bstr::{BStr, BString};
 use jj_lib::backend::TreeValue;
@@ -24,10 +25,10 @@ const UNBORN_ROOT_REF: &str = "refs/jj/root";
 
 pub fn ensure(checkout_root: &Path, settings: &UserSettings) {
     if let Err(error) = ensure_inner(checkout_root, settings) {
-        tracing::warn!(
-            checkout = %checkout_root.display(),
-            "git shim refresh failed: {error}"
-        );
+        crate::boundary_sync::warn(&format!(
+            "git shim refresh failed in {}: {error}",
+            checkout_root.display()
+        ));
     }
 }
 
@@ -42,10 +43,10 @@ pub fn remove_guard(checkout_root: &Path) -> RemovalGuard {
     }) {
         Ok(lock) => RemovalGuard { _lock: Some(lock) },
         Err(error) => {
-            tracing::warn!(
-                checkout = %checkout_root.display(),
-                "git shim unlock failed: {error}"
-            );
+            crate::boundary_sync::warn(&format!(
+                "git shim unlock failed in {}: {error}",
+                checkout_root.display()
+            ));
             RemovalGuard { _lock: None }
         }
     }
@@ -83,7 +84,7 @@ fn ensure_inner(checkout_root: &Path, settings: &UserSettings) -> Result<(), Str
         initialize_minimal_git(checkout_root, &view.canonical_objects)?;
         remove_stale_index_lock(&git_dir)?;
         write_head(&git_dir, view.head_oid.as_deref())?;
-        if crate::git::failpoint_enabled(AFTER_HEAD_FAILPOINT) {
+        if crate::failpoint::failpoint_enabled(AFTER_HEAD_FAILPOINT) {
             return Err(format!("injected failure at {AFTER_HEAD_FAILPOINT}"));
         }
 
@@ -119,12 +120,15 @@ impl ShimView {
             hasher.update(head_oid.as_bytes());
         }
         for tree in [&self.parent_tree, &self.working_copy_tree] {
-            for id in tree.tree_ids().iter() {
+            for id in tree.tree_ids() {
                 hasher.update((id.as_bytes().len() as u64).to_le_bytes());
                 hasher.update(id.as_bytes());
             }
         }
-        format!("{STATE_VERSION}\n{}\n", hex_bytes(&hasher.finalize()))
+        format!(
+            "{STATE_VERSION}\n{}\n",
+            encode_lower_hex(&hasher.finalize())
+        )
     }
 }
 
@@ -421,10 +425,6 @@ fn finish_guard(result: Result<(), String>, guard: GitDirGuard<'_>) -> Result<()
     }
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 fn read_refresh_state(checkout_root: &Path) -> Option<String> {
     fs::read_to_string(checkout_root.join(".jj").join(STATE_FILE)).ok()
 }
@@ -491,7 +491,7 @@ impl CheckoutLock {
 
 impl Drop for CheckoutLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        self.file.unlock().ok();
     }
 }
 
@@ -522,10 +522,10 @@ impl Drop for GitDirGuard<'_> {
         if self.active
             && let Err(error) = make_git_dirs_read_only(self.checkout_root)
         {
-            tracing::warn!(
-                checkout = %self.checkout_root.display(),
-                "failed to restore Git shim guard: {error}"
-            );
+            crate::boundary_sync::warn(&format!(
+                "failed to restore Git shim guard in {}: {error}",
+                self.checkout_root.display()
+            ));
         }
     }
 }

@@ -11,10 +11,6 @@ pub struct FileLock {
     file: fs::File,
 }
 
-pub struct MutationLock {
-    _lock: FileLock,
-}
-
 impl FileLock {
     pub fn acquire(path: &Path) -> Result<Self> {
         let file = open_lock_file(path)?;
@@ -23,7 +19,16 @@ impl FileLock {
         Ok(Self { file })
     }
 
-    pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
+    /// Take the lock or fail with `busy`, so a second concurrent invocation
+    /// reports the conflict instead of queueing behind it.
+    pub fn try_acquire_or_err(path: &Path, busy: impl FnOnce() -> String) -> Result<Self> {
+        match Self::try_acquire(path)? {
+            Some(lock) => Ok(lock),
+            None => bail!(busy()),
+        }
+    }
+
+    fn try_acquire(path: &Path) -> Result<Option<Self>> {
         let file = open_lock_file(path)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { file })),
@@ -38,22 +43,7 @@ impl FileLock {
 impl Drop for FileLock {
     fn drop(&mut self) {
         // Best-effort; there is no meaningful recovery path in Drop.
-        let _ = self.file.unlock();
-    }
-}
-
-impl MutationLock {
-    /// Serialize project mutations on a lock file kept outside the project
-    /// (see `Store::lock_project_mutation`), so checkouts never carry lock
-    /// artifacts.
-    pub fn acquire(lock_path: &Path, project_dir: &Path) -> Result<Self> {
-        let Some(lock) = FileLock::try_acquire(lock_path)? else {
-            bail!(
-                "another mutation is in progress in {}",
-                project_dir.display()
-            );
-        };
-        Ok(Self { _lock: lock })
+        self.file.unlock().ok();
     }
 }
 

@@ -23,10 +23,18 @@ module, type-checks the Worker, runs Clippy for every Rust target, and checks
 Rust formatting. `pnpm test` runs the default Rust and Worker suites; tests
 that require live credentials remain ignored.
 
-Before deployment, run the ignored live journal, push, and fetch suites against
-a local `wrangler dev` instance with `DEVSPACE_URL` and
-`DEVSPACE_SHARED_SECRET` set. This credentialed rung exercises the real
-Rust-to-Worker boundary without deploying it.
+Before deployment, run the live suites against a local Worker. Start
+`nix develop -c pnpm dev`, then point the machine at it:
+
+```sh
+DEVSPACE_URL=<the address wrangler dev prints> \
+DEVSPACE_SHARED_SECRET=<the shared secret that Worker reads> \
+  nix develop -c cargo test --workspace -- --ignored
+```
+
+Every ignored test carries the same reason string and needs both variables.
+This credentialed rung exercises the real Rust-to-Worker boundary without
+deploying it.
 
 Build the Worker without deploying it:
 
@@ -79,10 +87,19 @@ ds status
 ds log
 
 # Remove a disposable checkout but retain its repository.
-ds remove ./project-worktree
+ds remove ./project-feature
+
+# Rename a repository in the cloud and in the machine catalog.
+ds repo rename project product
 
 # Inspect machine synchronization state.
 ds sync status
+
+# Check machine, cloud, daemon, Git, and checkout health.
+ds doctor
+
+# Materialize the pinned reference repositories of this checkout.
+ds context sync
 
 # Configure and use the explicit public Git boundary.
 ds git remote add origin git@example.com:owner/project.git
@@ -131,6 +148,32 @@ hidden-path filtering occurs only at the public Git projection boundary.
 
 Git mutation, import, and push through the shim are unsupported. The `.git`
 directory is read-only outside Devspace's guarded refresh.
+
+## Pinned context
+
+A checkout can pin read-only snapshots of external repositories under
+`.repos/`. This is a grepo-compatible convention. `ds context` manages it.
+
+`.repos/.lock` is the tracked source of truth. It records each alias, its
+source, and the exact commit. Each `.repos/<alias>` entry is a generated link
+to a shared cached snapshot: a plain read-only tree with the Git metadata
+removed. Treat a snapshot as reference material, not as project code.
+
+`ds context sync` materializes the aliases that the lockfile already records.
+`ds context update` advances the tracking aliases to their current upstream.
+
+Automatic reconciliation is off by default and is a machine setting:
+
+```sh
+ds config set context.auto-sync true
+```
+
+With it on, a working-copy transition clears the generated links first and
+reconciles the destination lockfile afterward. A destination without a regular
+`.repos/.lock` does not run the reload side. A clear or reload failure warns;
+it does not fail or undo the transition.
+
+Run `ds skill context` for the agent-facing version of this section.
 
 ## Synchronization
 
@@ -211,3 +254,4 @@ remain an open product decision.
 - [Git push](docs/git-push.md)
 - [Git fetch](docs/git-fetch.md)
 - [Hidden files](docs/hidden.md)
+- [Signing rewritten public commits](docs/sign-rewritten.md)

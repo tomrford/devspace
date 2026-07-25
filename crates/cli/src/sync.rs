@@ -16,6 +16,7 @@ use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;
 use jj_lib::settings::UserSettings;
 
+use crate::bare_workspace::require_local_store;
 use crate::checkout::reject_unsupported_global_options;
 use crate::git::{CLOUD_RUNTIME_ERROR, cloud_runtime};
 
@@ -81,9 +82,9 @@ async fn sync_repository(
                 "Repository `{name}` is not present in this machine store."
             ))
         })?;
-    match run_sync_entry(&store, &entry, command.settings()).await {
-        Ok(SyncRun::Completed) => Ok(()),
-        Ok(SyncRun::AlreadyLocked) => {
+    match run_sync_entry_locked(&store, &entry, command.settings()).await {
+        Ok(LockedSyncRun::Completed(_)) => Ok(()),
+        Ok(LockedSyncRun::AlreadyLocked) => {
             // A concurrent run owns the durable outbox. Operations recorded after
             // its upload phase remain local and are discovered by the next run.
             writeln!(
@@ -96,33 +97,17 @@ async fn sync_repository(
     }
 }
 
-pub(crate) enum SyncRun {
-    Completed,
-    AlreadyLocked,
-}
-
 pub(crate) enum LockedSyncRun {
     Completed(RepositorySyncGuard),
     AlreadyLocked,
 }
 
-pub(crate) async fn run_sync_entry(
-    store: &MachineStore,
-    entry: &CatalogEntry,
-    settings: &UserSettings,
-) -> Result<SyncRun, String> {
-    match run_sync_entry_locked(store, entry, settings).await? {
-        LockedSyncRun::Completed(_guard) => Ok(SyncRun::Completed),
-        LockedSyncRun::AlreadyLocked => Ok(SyncRun::AlreadyLocked),
-    }
-}
-
-async fn run_sync_entry_locked(
+pub(crate) async fn run_sync_entry_locked(
     store: &MachineStore,
     entry: &CatalogEntry,
     settings: &UserSettings,
 ) -> Result<LockedSyncRun, String> {
-    validate_sync_entry(entry)?;
+    require_local_store(entry).map_err(|message| format!("{message}."))?;
 
     let guard = match store.try_lock_repository_sync(&entry.identity) {
         Ok(guard) => guard,
@@ -140,7 +125,7 @@ pub(crate) async fn run_sync_entry_foreground_locked(
     entry: &CatalogEntry,
     settings: &UserSettings,
 ) -> Result<LockedSyncRun, String> {
-    validate_sync_entry(entry)?;
+    require_local_store(entry).map_err(|message| format!("{message}."))?;
     let Some(guard) = wait_for_repository_sync_lock(ui, store, entry)? else {
         return Ok(LockedSyncRun::AlreadyLocked);
     };
@@ -176,21 +161,6 @@ pub(crate) fn wait_for_repository_sync_lock(
             Err(error) => return Err(error.to_string()),
         }
     }
-}
-
-fn validate_sync_entry(entry: &CatalogEntry) -> Result<(), String> {
-    let name = &entry.name;
-    if !entry.native_repository_path.exists() {
-        return Err(format!(
-            "Repository `{name}` has an incomplete clone; run `ds add` again to finish it."
-        ));
-    }
-    if !crate::bare_workspace::is_stock_bare_repository(&entry.native_repository_path) {
-        return Err(format!(
-            "Repository `{name}` is registered locally, but its native repository is invalid."
-        ));
-    }
-    Ok(())
 }
 
 async fn run_sync_entry_after_lock(

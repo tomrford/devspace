@@ -17,6 +17,7 @@ use crate::checkout::{
     absolute_path, canonical_destination_path, ensure_destination_parent,
     reject_unsupported_global_options, workspace_name,
 };
+use crate::failpoint::abort_failpoint;
 use crate::git::display_error;
 use crate::repo::{
     CloudRepositoryCreationError, PendingRepositoryCreation, create_cloud_repository,
@@ -169,7 +170,7 @@ pub(crate) async fn import_git_repository(
         };
         (repository, head)
     };
-    failpoint(AFTER_CLOUD_REGISTRATION_FAILPOINT);
+    abort_failpoint(AFTER_CLOUD_REGISTRATION_FAILPOINT);
     let incomplete = format!(
         "Repository `{name}` was created in the cloud, but its local Git import is incomplete."
     );
@@ -509,12 +510,6 @@ fn fetched_bookmarks(lines: &[String]) -> String {
 
 fn post_registration_error(error: CommandError, context: &str) -> CommandError {
     user_error(format!("{}\n{context}", error.error))
-}
-
-fn failpoint(name: &str) {
-    if std::env::var_os("DEVSPACE_FAILPOINT").as_deref() == Some(std::ffi::OsStr::new(name)) {
-        std::process::exit(86);
-    }
 }
 
 #[cfg(test)]

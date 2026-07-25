@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Local machine-store proofs for jj-lib's Git backend.
 //!
 //! Git blobs, trees, and commits are packed from the bare object database.
@@ -25,6 +26,8 @@ mod pack_manifest;
 mod projection;
 mod store;
 mod wire;
+#[cfg(test)]
+mod worker_fixtures;
 
 pub use control_plane_client::{
     CloudRepository, ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind,
@@ -63,36 +66,26 @@ pub use object_closure::{
     MAX_OBJECT_BYTES, MachineObject, ObjectClosure, ObjectClosureError, ObjectKey,
 };
 pub use op_sync::{
-    CloudOpHeads, OpObjectKey, OpObjectKind, OpSyncEngine, OpSyncEngineError, OpSyncTransport,
+    CloudOpHeads, OpObjectKey, OpSyncEngine, OpSyncEngineError, OpSyncTransport,
     TransportError as OpTransportError,
 };
 pub use op_sync_state::{
     OpSyncState, OpSyncStateError, OpSyncStore, PendingOpHeadBatch, PendingOpHeadTransaction,
 };
 pub use pack::{
-    BuiltPack, BuiltPacks, Digest, MAX_CHUNK_BYTES, MAX_PACK_BYTES, MAX_PACK_OBJECTS,
-    MIN_CHUNK_BYTES, MIN_PACK_BYTES, PackBuildError, PackMetrics, PackOptions, PackProducer,
-    build_packs,
+    BuiltPack, Digest, MAX_CHUNK_BYTES, MAX_PACK_BYTES, MAX_PACK_OBJECTS, MIN_CHUNK_BYTES,
+    MIN_PACK_BYTES, PackBuildError, PackOptions, PackProducer, build_packs,
 };
 pub use pack_manifest::{ChunkEntry, ObjectEntry, PackManifest, PackManifestError};
 pub use projection::{
-    CommitMapping, HiddenSet, HiddenSetIdentity, ProjectionError, ProjectionMappings,
+    CommitMapping, DSPRIVATE, HiddenSet, HiddenSetIdentity, ProjectionError, ProjectionMappings,
     ProjectionResult,
 };
 pub use store::OpReconcileError;
 pub use store::{MachineGitRepository, MachineGitRepositoryError};
 pub use wire::{LowerHexError, decode_lower_hex, encode_lower_hex};
 
+pub use devspace_kernel::ops::OpObjectKind;
 pub use devspace_kernel::{ObjectKind, Oid};
 
 pub type OpId = [u8; 64];
-
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
-}

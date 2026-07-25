@@ -375,9 +375,9 @@ impl App {
         let existed = ProjectRoot::at(&self.cwd).is_some();
         let root = ProjectRoot::create_at(&self.cwd)?;
         let store = self.prepared_store()?;
-        let _lock = store.lock_project_mutation(&self.git, &root.dir)?;
+        let _lock = store.lock_project_mutation(&root.dir)?;
         let _store_lock = store.lock_mutation()?;
-        store.refresh_root(&self.git, &root.lock_path)?;
+        store.refresh_root(&root.lock_path)?;
         let status = if existed {
             "already initialized"
         } else {
@@ -393,7 +393,7 @@ impl App {
             None => ProjectRoot::create_at(&self.cwd)?,
         };
         let store = self.prepared_store()?;
-        let _lock = store.lock_project_mutation(&self.git, &root.dir)?;
+        let _lock = store.lock_project_mutation(&root.dir)?;
         let _store_lock = store.lock_mutation()?;
 
         let mut lockfile = root.load_lockfile()?;
@@ -408,7 +408,7 @@ impl App {
         let realized = self.realize(store, entry, false)?;
         let snapshot = self.apply(&root, &mut lockfile, &realized)?;
         lockfile.write(&root.lock_path)?;
-        store.refresh_root(&self.git, &root.lock_path)?;
+        store.refresh_root(&root.lock_path)?;
 
         let verb = if existing.is_some() {
             "replaced"
@@ -487,7 +487,7 @@ impl App {
     ) -> Result<SyncReport> {
         let root = self.required_root()?;
         let store = self.prepared_store()?;
-        let _lock = store.lock_project_mutation(&self.git, &root.dir)?;
+        let _lock = store.lock_project_mutation(&root.dir)?;
         let _store_lock = store.lock_mutation()?;
         let mut lockfile = root.load_lockfile()?;
         let mut dirty = false;
@@ -545,7 +545,7 @@ impl App {
         if dirty {
             lockfile.write(&root.lock_path)?;
         }
-        store.refresh_root(&self.git, &root.lock_path)?;
+        store.refresh_root(&root.lock_path)?;
         Ok(SyncReport { warned })
     }
 
@@ -554,7 +554,7 @@ impl App {
             return Ok(Vec::new());
         };
         let store = self.prepared_store()?;
-        let _lock = store.lock_project_mutation(&self.git, &root.dir)?;
+        let _lock = store.lock_project_mutation(&root.dir)?;
         let lockfile = root.load_lockfile()?;
         let mut messages = Vec::new();
 
@@ -579,8 +579,7 @@ impl App {
                 });
                 continue;
             };
-            let expected =
-                store.snapshot_path(&self.git, &entry.url, commit, entry.subdir.as_deref())?;
+            let expected = store.snapshot_path(&entry.url, commit, entry.subdir.as_deref());
             let actual =
                 fs::read_link(&path).with_context(|| format!("read link {}", path.display()))?;
             if actual != expected {
@@ -606,7 +605,7 @@ impl App {
     fn update(&self, ui: &mut Ui, aliases: &[String]) -> Result<bool> {
         let root = self.required_root()?;
         let store = self.prepared_store()?;
-        let _lock = store.lock_project_mutation(&self.git, &root.dir)?;
+        let _lock = store.lock_project_mutation(&root.dir)?;
         let _store_lock = store.lock_mutation()?;
         let mut lockfile = root.load_lockfile()?;
         let selected = lockfile.select(aliases)?;
@@ -665,7 +664,7 @@ impl App {
 
         if dirty {
             lockfile.write(&root.lock_path)?;
-            store.refresh_root(&self.git, &root.lock_path)?;
+            store.refresh_root(&root.lock_path)?;
         }
         Ok(warned)
     }
@@ -673,7 +672,7 @@ impl App {
     fn remove(&self, ui: &mut Ui, aliases: &[String]) -> Result<bool> {
         let root = self.required_root()?;
         let store = self.prepared_store()?;
-        let _lock = store.lock_project_mutation(&self.git, &root.dir)?;
+        let _lock = store.lock_project_mutation(&root.dir)?;
         let _store_lock = store.lock_mutation()?;
         let mut lockfile = root.load_lockfile()?;
         let selected = lockfile.select(aliases)?;
@@ -682,7 +681,7 @@ impl App {
             lockfile.remove(alias);
         }
         lockfile.write(&root.lock_path)?;
-        store.refresh_root(&self.git, &root.lock_path)?;
+        store.refresh_root(&root.lock_path)?;
 
         let mut warned = false;
         for alias in &selected {
@@ -697,7 +696,7 @@ impl App {
     fn gc(&self, ui: &mut Ui, verbose: bool) -> Result<bool> {
         let store = self.prepared_store()?;
         let _store_lock = store.lock_mutation()?;
-        let report = store.gc(&self.git)?;
+        let report = store.gc()?;
         let mut warned = false;
 
         let total = report.removed_snapshots.len()
@@ -804,9 +803,9 @@ impl App {
         entry: &GitLockEntry,
     ) -> Result<PathBuf> {
         let commit = entry.commit.as_deref().context("entry has no commit")?;
-        let snapshot =
-            self.store
-                .snapshot_path(&self.git, &entry.url, commit, entry.subdir.as_deref())?;
+        let snapshot = self
+            .store
+            .snapshot_path(&entry.url, commit, entry.subdir.as_deref());
         store::replace_symlink(&root.link_path(&entry.alias), &snapshot)?;
         lockfile.upsert(LockEntry::Git(entry.clone()));
         Ok(snapshot)
@@ -905,11 +904,7 @@ fn platform_cache_directory() -> Option<PathBuf> {
     {
         Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Caches"))
     }
-    #[cfg(target_os = "windows")]
-    {
-        Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?))
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(not(target_os = "macos"))]
     {
         if let Some(cache) = std::env::var_os("XDG_CACHE_HOME") {
             return Some(PathBuf::from(cache));
@@ -919,7 +914,7 @@ fn platform_cache_directory() -> Option<PathBuf> {
 }
 
 pub(crate) fn ensure_dir_mode(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt as _;
     fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .with_context(|| format!("set permissions on {}", path.display()))

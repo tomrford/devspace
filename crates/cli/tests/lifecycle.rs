@@ -4,35 +4,24 @@ use std::process::{Child, Output, Stdio};
 use std::thread;
 
 use devspace_machine::MachineGitRepository as MachineRepository;
-use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
+use devspace_machine::RepositoryName;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
 mod support;
-mod support_fs;
 
-use support::fake_worker::{create_server, repository_response, respond};
+use devspace_testutils::fake_worker::{create_server, repository_response, respond};
 use support::{
     commit_id, configure_machine, configure_machine_with_name, ds, ds_command, machine_store,
-    settings, stderr, stdout, write_cli_config,
+    registered_repository, settings, stderr, stdout, write_cli_config,
 };
 
 async fn local_repository(root: &Path, name: &str) -> PathBuf {
     configure_machine(root, "http://127.0.0.1:1");
-    let entry = machine_store(root)
-        .register_repository(
-            RepositoryName::parse(name).unwrap(),
-            RepositoryIdentity::new(
-                RepositoryId::parse("ab".repeat(32)).unwrap(),
-                RepositoryIncarnation::parse("cd".repeat(16)).unwrap(),
-            ),
-        )
-        .unwrap();
-    MachineRepository::init(&entry.native_repository_path, &settings())
+    registered_repository(root, name)
         .await
-        .unwrap();
-    entry.native_repository_path
+        .native_repository_path
 }
 
 fn add_checkout(
@@ -446,7 +435,7 @@ async fn remove_reports_the_registered_path_after_a_cross_volume_move_result() {
     let registered = PathBuf::from(added["root"].as_str().unwrap());
     fs::create_dir_all(moved.parent().unwrap()).unwrap();
     copy_directory(&original, &moved);
-    support_fs::remove_dir_all(&original);
+    support::fs_util::remove_dir_all(&original);
     assert!(
         dunce::canonicalize(checkout_repository_pointer(&moved)).is_err(),
         "the moved checkout must have a broken relative repository pointer"
@@ -489,7 +478,7 @@ async fn remove_reports_the_registered_path_when_its_parent_is_missing() {
     let registered = PathBuf::from(added["root"].as_str().unwrap());
     fs::create_dir_all(moved.parent().unwrap()).unwrap();
     copy_directory(&original, &moved);
-    support_fs::remove_dir_all(original.parent().unwrap());
+    support::fs_util::remove_dir_all(original.parent().unwrap());
 
     let output = remove_checkout(temp.path(), &config, &moved);
 
@@ -576,7 +565,7 @@ async fn remove_rejects_a_forged_marker_at_an_unregistered_canonical_path() {
     let workspace = WorkspaceNameBuf::from(added["workspace_id"].as_str().unwrap().to_owned());
     let marker = fs::read(path.join(".jj/devspace-checkout-owner")).unwrap();
     forget_workspace_in_repository_view(&repository_path, &workspace).await;
-    support_fs::remove_dir_all(&path);
+    support::fs_util::remove_dir_all(&path);
     fs::create_dir_all(path.join(".jj")).unwrap();
     fs::write(path.join(".jj/devspace-checkout-owner"), marker).unwrap();
     fs::write(path.join("keep"), "untouched").unwrap();
@@ -848,7 +837,7 @@ async fn remove_forgets_a_workspace_when_its_directory_was_already_gone() {
     let path = temp.path().join("checkout");
     let added = add_checkout(temp.path(), &config, "missing-directory", "root()", &path);
     let workspace = WorkspaceNameBuf::from(added["workspace_id"].as_str().unwrap().to_owned());
-    support_fs::remove_dir_all(&path);
+    support::fs_util::remove_dir_all(&path);
 
     let output = remove_checkout(temp.path(), &config, &path);
     assert!(output.status.success(), "{}", stderr(&output));

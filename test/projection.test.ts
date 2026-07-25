@@ -1,21 +1,21 @@
-import { env, exports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { gitToHex } from "../src/kernel";
 import { decodeGitManifest } from "../src/pack_protocol";
 import fixtures from "./fixtures/repository.json";
+import {
+  DEFAULT_MACHINE,
+  decodeHex,
+  ensureRepository,
+  json,
+  repositoryGitStub,
+  routeRequest,
+} from "./support";
 
-const defaultMachine = "a6".repeat(16);
 const recoveryMachine = "b7".repeat(16);
-const repositories = new Map<string, { repositoryId: string; incarnation: string }>();
-let authorization: Record<string, string>;
 
-beforeAll(() => {
-  authorization = authorizationFor(defaultMachine);
-});
-
-describe("Git projection journal v2", () => {
+describe("Git projection journal", () => {
   it("sanitizes unexpected projection storage failures", async () => {
     const repository = "git-journal-storage-failure";
     expect(await projectionSnapshot(repository)).toMatchObject({ status: 200 });
@@ -40,7 +40,7 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           await incarnation(repository),
           "01".repeat(16),
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("missing-canonical", null, "f1".repeat(20), publicOid),
         ),
       ),
@@ -58,7 +58,7 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           await incarnation(repository),
           "02".repeat(16),
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("missing-public", null, canonicalOid, "f2".repeat(20)),
         ),
       ),
@@ -78,7 +78,7 @@ describe("Git projection journal v2", () => {
     const request = projectionBatch(
       repositoryIncarnation,
       "03".repeat(16),
-      defaultMachine,
+      DEFAULT_MACHINE,
       projectionUpdate(
         "main",
         null,
@@ -115,7 +115,7 @@ describe("Git projection journal v2", () => {
     const request = projectionBatch(
       repositoryIncarnation,
       batchId,
-      defaultMachine,
+      DEFAULT_MACHINE,
       projectionUpdate("main", null, canonicalOid, publicOid),
     );
     expect(await projectionRequest(repository, "pushes", request)).toMatchObject({
@@ -142,7 +142,7 @@ describe("Git projection journal v2", () => {
       ]),
     ).toMatchObject({ status: 409, body: { code: "projection-replay-required" } });
     expect(
-      await recover(repository, batchId, repositoryIncarnation, defaultMachine, 1, [
+      await recover(repository, batchId, repositoryIncarnation, DEFAULT_MACHINE, 1, [
         { bookmark: "main", liveOid: publicOid },
       ]),
     ).toMatchObject({ status: 409, body: { code: "projection-owner-stale" } });
@@ -176,7 +176,7 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           repositoryIncarnation,
           batchId,
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("main", null, canonicalOid, publicOid),
         ),
       ),
@@ -195,7 +195,7 @@ describe("Git projection journal v2", () => {
       ),
     ).toMatchObject({ status: 409, body: { code: "push-in-progress" } });
     expect(
-      await recover(repository, batchId, repositoryIncarnation, defaultMachine, 1, [
+      await recover(repository, batchId, repositoryIncarnation, DEFAULT_MACHINE, 1, [
         { bookmark: "main", liveOid: null },
       ]),
     ).toEqual({
@@ -220,13 +220,13 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           repositoryIncarnation,
           batchId,
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("main", null, canonicalOid, publicOid),
         ),
       ),
     ).toMatchObject({ status: 200, body: { fence: 1 } });
     expect(
-      await recover(repository, batchId, repositoryIncarnation, defaultMachine, 1, [
+      await recover(repository, batchId, repositoryIncarnation, DEFAULT_MACHINE, 1, [
         { bookmark: "main", liveOid: publicOid },
       ]),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
@@ -244,7 +244,7 @@ describe("Git projection journal v2", () => {
       await projectionRequest(repository, "pushes", {
         incarnation: repositoryIncarnation,
         batchId: deletionBatchId,
-        machineId: defaultMachine,
+        machineId: DEFAULT_MACHINE,
         remote: "origin",
         updates: [
           {
@@ -258,7 +258,7 @@ describe("Git projection journal v2", () => {
       }),
     ).toMatchObject({ status: 200, body: { fence: 2 } });
     expect(
-      await recover(repository, deletionBatchId, repositoryIncarnation, defaultMachine, 2, [
+      await recover(repository, deletionBatchId, repositoryIncarnation, DEFAULT_MACHINE, 2, [
         { bookmark: "main", liveOid: null },
       ]),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
@@ -281,14 +281,14 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           repositoryIncarnation,
           batchId,
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("a", null, canonicalOne, publicOne),
           projectionUpdate("b", null, canonicalTwo, publicTwo),
         ),
       ),
     ).toMatchObject({ status: 200, body: { fence: 1 } });
     expect(
-      await recover(repository, batchId, repositoryIncarnation, defaultMachine, 1, [
+      await recover(repository, batchId, repositoryIncarnation, DEFAULT_MACHINE, 1, [
         { bookmark: "a", liveOid: publicOne },
         { bookmark: "b", liveOid: null },
       ]),
@@ -313,7 +313,7 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           repositoryIncarnation,
           "0a".repeat(16),
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("a", null, canonicalOid, publicOne),
         ),
       ),
@@ -331,7 +331,7 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           repositoryIncarnation,
           "0b".repeat(16),
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("b", null, canonicalOid, publicTwo),
         ),
       ),
@@ -347,7 +347,7 @@ describe("Git projection journal v2", () => {
     const request = {
       incarnation: repositoryIncarnation,
       fetchId,
-      machineId: defaultMachine,
+      machineId: DEFAULT_MACHINE,
       remote: "origin",
       refs: [
         fetchRef("a", publicOid, null, [projectionState(canonicalOne, publicOid)], 0),
@@ -385,7 +385,7 @@ describe("Git projection journal v2", () => {
     const request = {
       incarnation: repositoryIncarnation,
       fetchId,
-      machineId: defaultMachine,
+      machineId: DEFAULT_MACHINE,
       remote: "origin",
       refs: [
         {
@@ -426,7 +426,7 @@ describe("Git projection journal v2", () => {
     const request = {
       incarnation: repositoryIncarnation,
       batchId,
-      machineId: defaultMachine,
+      machineId: DEFAULT_MACHINE,
       remote: "origin",
       updates: [
         {
@@ -503,7 +503,7 @@ describe("Git projection journal v2", () => {
       await projectionRequest(repository, "pushes", {
         incarnation: repositoryIncarnation,
         batchId: seedBatch,
-        machineId: defaultMachine,
+        machineId: DEFAULT_MACHINE,
         remote: "origin",
         updates: [
           {
@@ -517,7 +517,7 @@ describe("Git projection journal v2", () => {
       }),
     ).toMatchObject({ status: 200, body: { fence: 1 } });
     expect(
-      await recover(repository, seedBatch, repositoryIncarnation, defaultMachine, 1, [
+      await recover(repository, seedBatch, repositoryIncarnation, DEFAULT_MACHINE, 1, [
         { bookmark: "seed", liveOid: identityOid },
       ]),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
@@ -527,7 +527,7 @@ describe("Git projection journal v2", () => {
       await projectionRequest(repository, "pushes", {
         incarnation: repositoryIncarnation,
         batchId: childBatch,
-        machineId: defaultMachine,
+        machineId: DEFAULT_MACHINE,
         remote: "origin",
         updates: [
           {
@@ -552,7 +552,7 @@ describe("Git projection journal v2", () => {
       (pendingSnapshot.body as { pending: Array<{ refs: unknown[] }> }).pending[0].refs,
     ).toEqual(expect.arrayContaining([expect.objectContaining({ bookmark: "clean", identityOid: cleanOid })]));
     expect(
-      await recover(repository, childBatch, repositoryIncarnation, defaultMachine, 2, [
+      await recover(repository, childBatch, repositoryIncarnation, DEFAULT_MACHINE, 2, [
         { bookmark: "clean", liveOid: cleanOid },
         { bookmark: "hidden", liveOid: hiddenPublic },
       ]),
@@ -587,7 +587,7 @@ describe("Git projection journal v2", () => {
       await projectionRequest(identityFirst, "pushes", {
         incarnation: identityIncarnation,
         batchId: identityBatch,
-        machineId: defaultMachine,
+        machineId: DEFAULT_MACHINE,
         remote: "origin",
         updates: [
           {
@@ -601,7 +601,7 @@ describe("Git projection journal v2", () => {
       }),
     ).toMatchObject({ status: 200 });
     expect(
-      await recover(identityFirst, identityBatch, identityIncarnation, defaultMachine, 1, [
+      await recover(identityFirst, identityBatch, identityIncarnation, DEFAULT_MACHINE, 1, [
         { bookmark: "identity", liveOid: canonicalOid },
       ]),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
@@ -612,7 +612,7 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           identityIncarnation,
           "2e".repeat(16),
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("rewritten", null, canonicalOid, publicOid),
         ),
       ),
@@ -628,7 +628,7 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           rewrittenIncarnation,
           "2f".repeat(16),
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("rewritten", null, rewrittenCanonical, rewrittenPublic),
         ),
       ),
@@ -638,7 +638,7 @@ describe("Git projection journal v2", () => {
       await projectionRequest(rewrittenFirst, "fetches", {
         incarnation: rewrittenIncarnation,
         fetchId: "30".repeat(16),
-        machineId: defaultMachine,
+        machineId: DEFAULT_MACHINE,
         remote: "origin",
         refs: [
           {
@@ -659,7 +659,7 @@ describe("Git projection journal v2", () => {
       await projectionRequest(repository, "pushes", {
         incarnation: repositoryIncarnation,
         batchId: "31".repeat(16),
-        machineId: defaultMachine,
+        machineId: DEFAULT_MACHINE,
         remote: "origin",
         updates: [
           {
@@ -678,7 +678,7 @@ describe("Git projection journal v2", () => {
       await projectionRequest(repository, "fetches", {
         incarnation: repositoryIncarnation,
         fetchId: "32".repeat(16),
-        machineId: defaultMachine,
+        machineId: DEFAULT_MACHINE,
         remote: "origin",
         refs: [fetchRef("main", identityOid, null, [state], 0)],
       }),
@@ -707,7 +707,7 @@ describe("Git projection journal v2", () => {
         await projectionRequest(repository, "pushes", {
           incarnation: repositoryIncarnation,
           batchId: (suffix === "identity-first" ? "33" : "34").repeat(16),
-          machineId: defaultMachine,
+          machineId: DEFAULT_MACHINE,
           remote: "origin",
           updates: [
             projectionUpdate("independent", null, independentCanonical, independentPublic),
@@ -737,7 +737,7 @@ describe("Git projection journal v2", () => {
       await projectionRequest(repository, "pushes", {
         incarnation: repositoryIncarnation,
         batchId: "35".repeat(16),
-        machineId: defaultMachine,
+        machineId: DEFAULT_MACHINE,
         remote: "origin",
         updates: [
           projectionUpdate("a", null, canonicalOid, publicOid, "11".repeat(64)),
@@ -765,7 +765,7 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           repositoryIncarnation,
           batchId,
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("a", null, canonicalOid, publicOid, "11".repeat(64)),
         ),
       ),
@@ -777,13 +777,13 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           repositoryIncarnation,
           "37".repeat(16),
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("b", null, canonicalOid, publicOid, "22".repeat(64)),
         ),
       ),
     ).toMatchObject({ status: 409, body: { code: "canonical-lineage-diverged" } });
     expect(
-      await recover(repository, batchId, repositoryIncarnation, defaultMachine, 1, [
+      await recover(repository, batchId, repositoryIncarnation, DEFAULT_MACHINE, 1, [
         { bookmark: "a", liveOid: publicOid },
       ]),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
@@ -794,7 +794,7 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           repositoryIncarnation,
           "38".repeat(16),
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("b", null, canonicalOid, publicOid, "22".repeat(64)),
         ),
       ),
@@ -821,7 +821,7 @@ describe("Git projection journal v2", () => {
       await projectionRequest(repository, "pushes", {
         incarnation: repositoryIncarnation,
         batchId: identityBatch,
-        machineId: defaultMachine,
+        machineId: DEFAULT_MACHINE,
         remote: "origin",
         updates: [identityUpdate],
       }),
@@ -849,13 +849,13 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           repositoryIncarnation,
           "3a".repeat(16),
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("rewritten", null, canonicalOid, publicOid),
         ),
       ),
     ).toMatchObject({ status: 409, body: { code: "canonical-oid-diverged" } });
     expect(
-      await recover(repository, identityBatch, repositoryIncarnation, defaultMachine, 1, [
+      await recover(repository, identityBatch, repositoryIncarnation, DEFAULT_MACHINE, 1, [
         { bookmark: "identity", liveOid: canonicalOid },
       ]),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
@@ -873,7 +873,7 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           repositoryIncarnation,
           "3b".repeat(16),
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("rewritten", null, canonicalOid, publicOid),
         ),
       ),
@@ -892,13 +892,13 @@ describe("Git projection journal v2", () => {
         projectionBatch(
           repositoryIncarnation,
           batchId,
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("main", null, canonicalOid, publicOid),
         ),
       ),
     ).toMatchObject({ status: 200, body: { fence: 1 } });
     expect(
-      await recover(repository, batchId, repositoryIncarnation, defaultMachine, 1, [
+      await recover(repository, batchId, repositoryIncarnation, DEFAULT_MACHINE, 1, [
         { bookmark: "main", liveOid: null },
       ]),
     ).toMatchObject({ status: 200, body: { outcome: "aborted" } });
@@ -926,14 +926,14 @@ describe("Git projection journal v2", () => {
         ...projectionBatch(
           repositoryIncarnation,
           originBatch,
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("main", null, canonicalOne, publicOne),
         ),
         remote: "origin",
       }),
     ).toMatchObject({ status: 200, body: { fence: 1 } });
     expect(
-      await recover(repository, originBatch, repositoryIncarnation, defaultMachine, 1, [
+      await recover(repository, originBatch, repositoryIncarnation, DEFAULT_MACHINE, 1, [
         { bookmark: "main", liveOid: publicOne },
       ]),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
@@ -944,14 +944,14 @@ describe("Git projection journal v2", () => {
         ...projectionBatch(
           repositoryIncarnation,
           backupBatch,
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("main", null, canonicalTwo, publicTwo),
         ),
         remote: "backup",
       }),
     ).toMatchObject({ status: 200, body: { fence: 2 } });
     expect(
-      await recover(repository, backupBatch, repositoryIncarnation, defaultMachine, 2, [
+      await recover(repository, backupBatch, repositoryIncarnation, DEFAULT_MACHINE, 2, [
         { bookmark: "main", liveOid: publicTwo },
       ]),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
@@ -962,7 +962,7 @@ describe("Git projection journal v2", () => {
         ...projectionBatch(
           repositoryIncarnation,
           pendingBatch,
-          defaultMachine,
+          DEFAULT_MACHINE,
           projectionUpdate("pending", null, canonicalThree, publicThree),
         ),
         remote: "origin",
@@ -1004,7 +1004,7 @@ describe("Git projection journal v2", () => {
       await projectionRequest(repository, "pushes", {
         incarnation: repositoryIncarnation,
         batchId,
-        machineId: defaultMachine,
+        machineId: DEFAULT_MACHINE,
         remote: "origin",
         updates: [
           {
@@ -1018,7 +1018,7 @@ describe("Git projection journal v2", () => {
       }),
     ).toMatchObject({ status: 200, body: { fence: 1 } });
     expect(
-      await recover(repository, batchId, repositoryIncarnation, defaultMachine, 1, [
+      await recover(repository, batchId, repositoryIncarnation, DEFAULT_MACHINE, 1, [
         { bookmark: "main", liveOid: states[256].publicOid },
       ]),
     ).toMatchObject({ status: 200, body: { outcome: "accepted" } });
@@ -1045,7 +1045,7 @@ describe("Git projection journal v2", () => {
     const request = projectionBatch(
       repositoryIncarnation,
       "14".repeat(16),
-      defaultMachine,
+      DEFAULT_MACHINE,
       {
         bookmark: "main",
         expectedOldOid: null,
@@ -1085,48 +1085,8 @@ interface EncodedFixture {
   chunks: string[];
 }
 
-async function ensureRepository(name: string) {
-  const existing = repositories.get(name);
-  if (existing !== undefined) return existing;
-  const response = await exports.default.fetch(
-    new Request("https://example.com/repositories", {
-      method: "POST",
-      headers: { ...authorization, "content-type": "application/json" },
-      body: JSON.stringify({ name, idempotencyKey: randomHex(16) }),
-    }),
-  );
-  if (!response.ok) throw new Error(`failed to create repository: ${await response.text()}`);
-  const repository = (await response.json()) as { repositoryId: string; incarnation: string };
-  repositories.set(name, repository);
-  return repository;
-}
-
 async function incarnation(repository: string) {
   return (await ensureRepository(repository)).incarnation;
-}
-
-async function repositoryGitStub(repository: string) {
-  const target = await ensureRepository(repository);
-  return env.REPOSITORIES.getByName(target.repositoryId);
-}
-
-async function routeRequest(
-  repository: string,
-  path: string,
-  init: RequestInit,
-  machineId = defaultMachine,
-) {
-  const target = await ensureRepository(repository);
-  return exports.default.fetch(
-    new Request(`https://example.com/repositories/${target.repositoryId}/${path}`, {
-      ...init,
-      headers: {
-        ...authorizationFor(machineId),
-        "x-devspace-incarnation": target.incarnation,
-        ...init.headers,
-      },
-    }),
-  );
 }
 
 async function installJournalFixture(repository: string): Promise<string[]> {
@@ -1177,7 +1137,7 @@ async function projectionRequest(
   repository: string,
   path: string,
   body: unknown,
-  machineId = defaultMachine,
+  machineId = DEFAULT_MACHINE,
 ) {
   const response = await routeRequest(
     repository,
@@ -1196,7 +1156,7 @@ async function projectionSnapshot(
   repository: string,
   after = 0,
   through?: number,
-  machineId = defaultMachine,
+  machineId = DEFAULT_MACHINE,
 ) {
   const highWater = through === undefined ? "" : `&through=${through}`;
   const response = await routeRequest(
@@ -1357,26 +1317,3 @@ function fetchRef(
   };
 }
 
-function authorizationFor(machineId: string): Record<string, string> {
-  return {
-    authorization: `Bearer ${env.DEVSPACE_SHARED_SECRET}`,
-    "x-devspace-machine-id": machineId,
-  };
-}
-
-function randomHex(bytes: number): string {
-  return Array.from(crypto.getRandomValues(new Uint8Array(bytes)), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
-}
-
-function decodeHex(value: string): Uint8Array {
-  return Uint8Array.from({ length: value.length / 2 }, (_, index) =>
-    Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
-  );
-}
-
-async function json(response: Response): Promise<unknown> {
-  expect(response.status).toBe(200);
-  return response.json();
-}

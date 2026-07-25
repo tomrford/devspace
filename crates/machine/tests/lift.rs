@@ -1,34 +1,21 @@
-use std::collections::BTreeSet;
-
-use devspace_kernel::{ObjectKind, Oid, parse_commit, validate};
+use devspace_kernel::{ObjectKind, Oid, parse_commit};
 use devspace_machine::{
     CommitMapping, LiftError, MachineGitRepository, ProjectionMappings, overlay_lift,
 };
-use gix::objs::{Kind as GitObjectKind, Write as _};
 use jj_lib::backend::{CommitId, TreeValue};
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::conflicts::{MaterializedTreeValue, materialize_tree_value};
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
 
-fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Lift Test"
-                email = "lift@example.invalid"
+mod common;
 
-                [git]
-                write-change-id-header = true
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
+use common::{all_objects, oid_hex, read_raw, write_commit, write_raw};
+
+const COMMIT_IDENTITY: &str = "Lift <lift@example.invalid>";
+
+fn settings() -> UserSettings {
+    devspace_testutils::settings("Lift Test", "lift@example.invalid", true)
 }
 
 struct HiddenSeed {
@@ -47,7 +34,14 @@ async fn hidden_seed(repository: &MachineGitRepository) -> HiddenSeed {
             ("public", b"base\n".as_slice()),
         ],
     );
-    let canonical = write_commit(repository, canonical_tree, &[], b"hidden base\n", &[]);
+    let canonical = write_commit(
+        repository,
+        COMMIT_IDENTITY,
+        canonical_tree,
+        &[],
+        b"hidden base\n",
+        &[],
+    );
     let mut projection = ProjectionMappings::default();
     let projected = repository
         .project_hidden_paths(&[canonical], &mut projection)
@@ -77,6 +71,7 @@ async fn owner_chain_carries_policy_and_hidden_file_through_deletion_and_materia
     );
     let first = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         first_tree,
         &[seed.public],
         b"feature one\n",
@@ -90,7 +85,14 @@ async fn owner_chain_carries_policy_and_hidden_file_through_deletion_and_materia
             ("public", b"edited\n".as_slice()),
         ],
     );
-    let tip = write_commit(&repository, tip_tree, &[first], b"feature two\n", &[]);
+    let tip = write_commit(
+        &repository,
+        COMMIT_IDENTITY,
+        tip_tree,
+        &[first],
+        b"feature two\n",
+        &[],
+    );
 
     let lifted = overlay_lift(&repository, &[tip], seed.mappings.clone())
         .await
@@ -131,11 +133,11 @@ async fn owner_chain_carries_policy_and_hidden_file_through_deletion_and_materia
         .unwrap();
     let path = path(".env");
     let value = commit.tree().path_value(&path).await.unwrap();
-    let mut materialized =
-        match materialize_tree_value(store, &path, value, commit.tree().labels()).await {
-            Ok(MaterializedTreeValue::File(file)) => file,
-            _ => panic!("working-copy materialization did not produce .env"),
-        };
+    let Ok(MaterializedTreeValue::File(mut materialized)) =
+        materialize_tree_value(store, &path, value, commit.tree().labels()).await
+    else {
+        panic!("working-copy materialization did not produce .env");
+    };
     assert_eq!(
         materialized.read_all(&path).await.unwrap(),
         b"local secret\n"
@@ -159,6 +161,7 @@ async fn accidental_hidden_commit_becomes_jj_tree_conflict_and_loud_disclosure()
     );
     let foreign = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         foreign_tree,
         &[seed.public],
         b"accidental disclosure\n",
@@ -198,7 +201,7 @@ async fn accidental_hidden_commit_becomes_jj_tree_conflict_and_loud_disclosure()
             .unwrap()
             .is_resolved()
     );
-    let raw = raw_object(&repository, mirror);
+    let raw = read_raw(&repository, mirror);
     assert!(
         raw.windows(b"jj:trees".len())
             .any(|part| part == b"jj:trees")
@@ -238,6 +241,7 @@ async fn foreign_merge_replays_both_lineages_and_preserves_hidden_parent_conflic
     );
     let left = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         left_tree,
         &[seed.canonical],
         b"left local\n",
@@ -245,6 +249,7 @@ async fn foreign_merge_replays_both_lineages_and_preserves_hidden_parent_conflic
     );
     let right = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         right_tree,
         &[seed.canonical],
         b"right local\n",
@@ -277,6 +282,7 @@ async fn foreign_merge_replays_both_lineages_and_preserves_hidden_parent_conflic
     );
     let left_foreign = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         left_foreign_tree,
         &[public_left],
         b"left foreign\n",
@@ -284,6 +290,7 @@ async fn foreign_merge_replays_both_lineages_and_preserves_hidden_parent_conflic
     );
     let right_foreign = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         right_foreign_tree,
         &[public_right],
         b"right foreign\n",
@@ -302,6 +309,7 @@ async fn foreign_merge_replays_both_lineages_and_preserves_hidden_parent_conflic
     );
     let merge = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         merge_tree,
         &[left_foreign, right_foreign],
         b"foreign merge\n",
@@ -314,7 +322,7 @@ async fn foreign_merge_replays_both_lineages_and_preserves_hidden_parent_conflic
 
     assert_eq!(lifted.mirrors.len(), 3);
     let canonical_merge = lifted.canonical_heads[0];
-    let canonical_merge_bytes = raw_object(&repository, canonical_merge);
+    let canonical_merge_bytes = read_raw(&repository, canonical_merge);
     let parsed = parse_commit(&canonical_merge_bytes).unwrap();
     assert_eq!(
         parsed.parents,
@@ -348,7 +356,7 @@ async fn hidden_free_history_is_identity_with_zero_mirrors_and_zero_rows() {
         .await
         .unwrap();
     let base_tree = write_flat_tree(&repository, &[("public", b"base\n")]);
-    let base = write_commit(&repository, base_tree, &[], b"base\n", &[]);
+    let base = write_commit(&repository, COMMIT_IDENTITY, base_tree, &[], b"base\n", &[]);
     let tip_tree = write_flat_tree(
         &repository,
         &[
@@ -356,7 +364,14 @@ async fn hidden_free_history_is_identity_with_zero_mirrors_and_zero_rows() {
             ("public", b"base\n".as_slice()),
         ],
     );
-    let tip = write_commit(&repository, tip_tree, &[base], b"tip\n", &[]);
+    let tip = write_commit(
+        &repository,
+        COMMIT_IDENTITY,
+        tip_tree,
+        &[base],
+        b"tip\n",
+        &[],
+    );
     let before = all_objects(&repository);
 
     let lifted = overlay_lift(&repository, &[tip], []).await.unwrap();
@@ -382,7 +397,7 @@ async fn foreign_non_file_dsprivate_entries_fail_before_lift_writes() {
 
         match (kind, error) {
             ("conflict", LiftError::ConflictedPublicCommit(error_commit)) => {
-                assert_eq!(error_commit, commit)
+                assert_eq!(error_commit, commit);
             }
             (_, LiftError::InvalidDsprivateEntry { commit_id, path }) => {
                 assert_eq!(commit_id, commit);
@@ -402,6 +417,7 @@ async fn shared_public_oid_uses_selected_parent_lineage_to_choose_canonical_seed
         .unwrap();
     let root_a = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         write_hidden_tree(&repository, b"root-a secret\n", b"root public\n"),
         &[],
         b"shared root\n",
@@ -409,6 +425,7 @@ async fn shared_public_oid_uses_selected_parent_lineage_to_choose_canonical_seed
     );
     let root_b = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         write_hidden_tree(&repository, b"root-b secret\n", b"root public\n"),
         &[],
         b"shared root\n",
@@ -426,6 +443,7 @@ async fn shared_public_oid_uses_selected_parent_lineage_to_choose_canonical_seed
 
     let child_a = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         write_hidden_tree(&repository, b"child-a secret\n", b"child public\n"),
         &[root_a],
         b"shared child\n",
@@ -433,6 +451,7 @@ async fn shared_public_oid_uses_selected_parent_lineage_to_choose_canonical_seed
     );
     let child_b = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         write_hidden_tree(&repository, b"child-b secret\n", b"child public\n"),
         &[root_b],
         b"shared child\n",
@@ -484,7 +503,14 @@ async fn lifted_pairs_seed_push_projection_and_short_circuit_mirror_replay() {
             ("public", b"base\n".as_slice()),
         ],
     );
-    let foreign = write_commit(&repository, foreign_tree, &[seed.public], b"foreign\n", &[]);
+    let foreign = write_commit(
+        &repository,
+        COMMIT_IDENTITY,
+        foreign_tree,
+        &[seed.public],
+        b"foreign\n",
+        &[],
+    );
     let lifted = overlay_lift(&repository, &[foreign], seed.mappings)
         .await
         .unwrap();
@@ -501,6 +527,7 @@ async fn lifted_pairs_seed_push_projection_and_short_circuit_mirror_replay() {
     );
     let local = write_commit(
         &repository,
+        COMMIT_IDENTITY,
         local_tree,
         &[lifted_tip],
         b"local after fetch\n",
@@ -515,7 +542,7 @@ async fn lifted_pairs_seed_push_projection_and_short_circuit_mirror_replay() {
 
     assert_eq!(projected.reached_mappings, lifted.new_mappings);
     assert_eq!(projected.new_mappings.len(), 1);
-    let public_local_bytes = raw_object(&repository, projected.public_heads[0]);
+    let public_local_bytes = read_raw(&repository, projected.public_heads[0]);
     let public_local = parse_commit(&public_local_bytes).unwrap();
     assert_eq!(public_local.parents, vec![foreign]);
     let mut replay = ProjectionMappings::from_rows(lifted.new_mappings).unwrap();
@@ -618,6 +645,7 @@ fn foreign_invalid_dsprivate_commit(repository: &MachineGitRepository, kind: &st
         let trees = format!("{} {} {}", oid_hex(left), oid_hex(base), oid_hex(right));
         return write_commit(
             repository,
+            COMMIT_IDENTITY,
             left,
             &[],
             b"conflicted foreign policy\n",
@@ -633,7 +661,14 @@ fn foreign_invalid_dsprivate_commit(repository: &MachineGitRepository, kind: &st
         "symlink" => write_raw(repository, ObjectKind::Blob, b"target"),
         "gitlink" => {
             let tree = write_flat_tree(repository, &[("submodule", b"value\n")]);
-            write_commit(repository, tree, &[], b"gitlink target\n", &[])
+            write_commit(
+                repository,
+                COMMIT_IDENTITY,
+                tree,
+                &[],
+                b"gitlink target\n",
+                &[],
+            )
         }
         _ => unreachable!(),
     };
@@ -647,74 +682,12 @@ fn foreign_invalid_dsprivate_commit(repository: &MachineGitRepository, kind: &st
     tree.extend_from_slice(b" .dsprivate\0");
     tree.extend_from_slice(&target.0);
     let tree = write_raw(repository, ObjectKind::Tree, &tree);
-    write_commit(repository, tree, &[], b"invalid foreign policy\n", &[])
-}
-
-fn write_commit(
-    repository: &MachineGitRepository,
-    tree: Oid,
-    parents: &[Oid],
-    message: &[u8],
-    extras: &[(&[u8], &[u8])],
-) -> Oid {
-    let mut bytes = format!("tree {}\n", oid_hex(tree)).into_bytes();
-    for parent in parents {
-        bytes.extend_from_slice(format!("parent {}\n", oid_hex(*parent)).as_bytes());
-    }
-    bytes.extend_from_slice(b"author Lift <lift@example.invalid> 1700000000 +0000\n");
-    bytes.extend_from_slice(b"committer Lift <lift@example.invalid> 1700000000 +0000\n");
-    for (name, value) in extras {
-        bytes.extend_from_slice(name);
-        bytes.push(b' ');
-        bytes.extend_from_slice(value);
-        bytes.push(b'\n');
-    }
-    bytes.push(b'\n');
-    bytes.extend_from_slice(message);
-    write_raw(repository, ObjectKind::Commit, &bytes)
-}
-
-fn write_raw(repository: &MachineGitRepository, kind: ObjectKind, bytes: &[u8]) -> Oid {
-    let expected = validate(kind, bytes).unwrap().id;
-    let git = gix::open(repository.git_repo_path()).unwrap();
-    let git_kind = match kind {
-        ObjectKind::Blob => GitObjectKind::Blob,
-        ObjectKind::Tree => GitObjectKind::Tree,
-        ObjectKind::Commit => GitObjectKind::Commit,
-    };
-    let actual = git.objects.write_buf(git_kind, bytes).unwrap();
-    assert_eq!(actual.as_bytes(), expected.0);
-    expected
-}
-
-fn raw_object(repository: &MachineGitRepository, id: Oid) -> Vec<u8> {
-    gix::open(repository.git_repo_path())
-        .unwrap()
-        .find_object(gix::ObjectId::from_bytes_or_panic(&id.0))
-        .unwrap()
-        .data
-        .clone()
-}
-
-fn all_objects(repository: &MachineGitRepository) -> BTreeSet<String> {
-    let output = std::process::Command::new("git")
-        .arg("--git-dir")
-        .arg(repository.git_repo_path())
-        .args([
-            "cat-file",
-            "--batch-all-objects",
-            "--batch-check=%(objectname)",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(str::to_owned)
-        .collect()
-}
-
-fn oid_hex(id: Oid) -> String {
-    id.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    write_commit(
+        repository,
+        COMMIT_IDENTITY,
+        tree,
+        &[],
+        b"invalid foreign policy\n",
+        &[],
+    )
 }

@@ -1,7 +1,6 @@
 //! Fetch-side replay of hidden state onto foreign Git history.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -19,7 +18,7 @@ use jj_lib::store::Store;
 use thiserror::Error;
 
 use crate::projection::{
-    HiddenSetCache, ProjectionError, resolve_hidden_set_for_tree, rewrite_commit,
+    DSPRIVATE, HiddenSetCache, ProjectionError, resolve_hidden_set_for_tree, rewrite_commit,
 };
 use crate::{CommitMapping, HiddenSet, MachineGitRepository};
 
@@ -56,7 +55,7 @@ impl Disclosure {
         format!(
             "WARNING: DATA DISCLOSURE: foreign commit {} contains hidden path `{}`; \
              that foreign version is publicly visible on the remote",
-            crate::hex(&self.public_commit.0),
+            crate::encode_lower_hex(&self.public_commit.0),
             self.path.as_internal_file_string(),
         )
     }
@@ -332,7 +331,7 @@ fn collect_hidden_paths_in_tree<'a>(
         let mut paths = Vec::new();
         for entry in tree.entries_non_recursive() {
             let entry_path = path.join(entry.name());
-            if entry.name().as_internal_str() == ".dsprivate" {
+            if entry.name().as_internal_str() == DSPRIVATE {
                 match entry.value() {
                     TreeValue::File { .. } => paths.push(entry_path),
                     TreeValue::Tree(_) | TreeValue::Symlink(_) | TreeValue::GitSubmodule(_) => {

@@ -1,7 +1,7 @@
 import type { AuthenticatedPrincipal } from "./control_plane";
+import { IDENTIFIER_PATTERN } from "./validation";
 
 const MACHINE_ID_PATTERN = /^[0-9a-f]{32}$/;
-const USER_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 
 /**
  * Traditional Worker secrets are configured with `wrangler secret put`, so
@@ -45,7 +45,7 @@ export async function authenticateDevelopmentRequest(
     };
   }
   const userId = env.DEVSPACE_DEVELOPMENT_USER_ID;
-  if (!USER_ID_PATTERN.test(userId)) {
+  if (!IDENTIFIER_PATTERN.test(userId)) {
     return { ok: false, status: 500, error: "development authentication is not configured" };
   }
   return { ok: true, principal: { userId, machineId } };

@@ -1,4 +1,5 @@
 #![no_std]
+#![forbid(unsafe_code)]
 //! A no-I/O validation kernel for Git blob, tree, and commit payloads.
 //!
 //! The parser is hand-written and has no `gix` or `jj-lib` dependency. It
@@ -84,15 +85,12 @@ impl Oid {
     }
 
     pub fn from_hex(hex: &[u8]) -> Option<Self> {
-        if hex.len() != Self::LENGTH.checked_mul(2)? {
+        if hex.len() != Self::LENGTH * 2 {
             return None;
         }
         let mut bytes = [0_u8; Self::LENGTH];
-        for (index, pair) in hex.chunks_exact(2).enumerate() {
-            let high = hex_digit(*pair.first()?)?;
-            let low = hex_digit(*pair.get(1)?)?;
-            let slot = bytes.get_mut(index)?;
-            *slot = high.checked_shl(4)? | low;
+        for (slot, pair) in bytes.iter_mut().zip(hex.chunks_exact(2)) {
+            *slot = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
         }
         Some(Self(bytes))
     }
@@ -151,12 +149,8 @@ pub fn validate(kind: ObjectKind, payload: &[u8]) -> Result<ValidatedObject, Val
             .collect(),
         ObjectKind::Commit => {
             let commit = parse_commit(payload)?;
-            let mut references = Vec::with_capacity(
-                1_usize
-                    .checked_add(commit.parents.len())
-                    .and_then(|value| value.checked_add(commit.jj_trees.len()))
-                    .unwrap_or(0),
-            );
+            let mut references =
+                Vec::with_capacity(1 + commit.parents.len() + commit.jj_trees.len());
             references.push(ObjectReference {
                 kind: ReferenceKind::Tree,
                 id: commit.tree,

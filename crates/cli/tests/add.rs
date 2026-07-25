@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::thread;
 
+use devspace_machine::RepositoryName;
 use devspace_machine::{
     BuiltPack, MachineGitRepository as MachineRepository, Oid, PackOptions, build_packs,
+    encode_lower_hex,
 };
-use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::{StoreFactories, StoreLoadError};
@@ -15,35 +16,18 @@ use jj_lib::workspace::{Workspace, WorkspaceLoadError, default_working_copy_fact
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
 mod support;
-mod support_fs;
 
-use support::fake_worker::{create_server, repository_response, respond, respond_bytes};
+use devspace_testutils::fake_worker::{create_server, repository_response, respond, respond_bytes};
 use support::{
-    TEST_MACHINE_ID, commit_id, configure_machine, ds, ds_command, machine_store, settings, stderr,
-    write_cli_config,
+    TEST_MACHINE_ID, commit_id, configure_machine, ds, ds_command, machine_store,
+    registered_repository, request_json, settings, stderr, write_cli_config,
 };
 
 async fn local_repository(root: &Path, repository_name: &str) -> PathBuf {
-    let store = machine_store(root);
     configure_machine(root, "http://127.0.0.1:1");
-    let entry = store
-        .register_repository(
-            RepositoryName::parse(repository_name).unwrap(),
-            RepositoryIdentity::new(
-                RepositoryId::parse("ab".repeat(32)).unwrap(),
-                RepositoryIncarnation::parse("cd".repeat(16)).unwrap(),
-            ),
-        )
-        .unwrap();
-    MachineRepository::init(&entry.native_repository_path, &settings())
+    registered_repository(root, repository_name)
         .await
-        .unwrap();
-    entry.native_repository_path
-}
-
-fn request_body(request: &str) -> serde_json::Value {
-    let (_, body) = request.split_once("\r\n\r\n").unwrap();
-    serde_json::from_str(body).unwrap()
+        .native_repository_path
 }
 
 struct CloudFixture {
@@ -63,7 +47,7 @@ async fn cloud_fixture(root: &Path) -> CloudFixture {
     let repository = MachineRepository::open(&repository_path, &settings())
         .await
         .unwrap();
-    let operation_head = hex_bytes(repository.current_operation_heads().await.unwrap()[0]);
+    let operation_head = encode_lower_hex(&repository.current_operation_heads().await.unwrap()[0]);
     let mut op_objects = BTreeMap::new();
     for kind in ["operations", "views"] {
         for entry in fs::read_dir(repository.operation_store_path().join(kind)).unwrap() {
@@ -89,7 +73,6 @@ async fn cloud_fixture(root: &Path) -> CloudFixture {
         PackOptions::default(),
     )
     .unwrap()
-    .packs
     .into_iter()
     .next()
     .unwrap();
@@ -100,13 +83,6 @@ async fn cloud_fixture(root: &Path) -> CloudFixture {
     }
 }
 
-fn hex_bytes<const N: usize>(bytes: [u8; N]) -> String {
-    bytes
-        .into_iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 fn create_cloud_sync_server(fixture: CloudFixture) -> (String, thread::JoinHandle<Vec<String>>) {
     create_server(move |_, request, stream| {
         let request_line = request.lines().next().unwrap();
@@ -115,7 +91,7 @@ fn create_cloud_sync_server(fixture: CloudFixture) -> (String, thread::JoinHandl
                 stream,
                 "200 OK",
                 &serde_json::json!({
-                    "packs": [{"sequence": 1, "id": hex_bytes(fixture.pack.id)}],
+                    "packs": [{"sequence": 1, "id": encode_lower_hex(&fixture.pack.id)}],
                     "nextAfter": 1,
                     "through": 1,
                     "hasMore": false,
@@ -173,7 +149,7 @@ fn create_cloud_sync_server(fixture: CloudFixture) -> (String, thread::JoinHandl
             );
         } else if request_line.starts_with("POST ") && request_line.contains("/git/ops/inventory ")
         {
-            let keys = request_body(request)["keys"].clone();
+            let keys = request_json(request)["keys"].clone();
             respond(
                 stream,
                 "200 OK",
@@ -579,14 +555,13 @@ async fn add_fresh_creates_deterministic_owned_workspace() {
         fs::read_to_string(canonical_destination.join(".jj/working_copy/type")).unwrap(),
         "devspace-local"
     );
-    let load_error = match Workspace::load(
+    let Err(load_error) = Workspace::load(
         &settings(),
         &canonical_destination,
         &StoreFactories::default(),
         &default_working_copy_factories(),
-    ) {
-        Ok(_) => panic!("stock jj factories loaded a Devspace working copy"),
-        Err(error) => error,
+    ) else {
+        panic!("stock jj factories loaded a Devspace working copy");
     };
     assert!(matches!(
         load_error,
@@ -1076,7 +1051,7 @@ async fn add_rejects_registered_workspace_at_a_different_revision() {
     let new = ds(&destination, &config, &["new", "-m", "working copy"]);
     assert!(new.status.success(), "{}", stderr(&new));
     let matching_parent = commit_id(&destination, &config, "@-");
-    support_fs::remove_dir_all(&destination);
+    support::fs_util::remove_dir_all(&destination);
 
     let mismatch = add(
         temp.path(),
@@ -1116,7 +1091,7 @@ async fn add_rebuilds_after_completed_checkout_is_removed() {
         &destination,
     );
     fs::write(destination.join("untracked"), "discarded").unwrap();
-    support_fs::remove_dir_all(&destination);
+    support::fs_util::remove_dir_all(&destination);
 
     let second = add_json(
         temp.path(),

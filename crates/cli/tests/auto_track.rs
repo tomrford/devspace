@@ -2,30 +2,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use devspace_machine::MachineGitRepository as MachineRepository;
-use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName,
-};
+use devspace_machine::MACHINE_STORE_OVERRIDE;
 
 mod support;
 
-use support::{configure_machine, ds, machine_store, settings, stderr, stdout, write_cli_config};
+use support::{configure_machine, ds, registered_repository, stderr, stdout, write_cli_config};
 
 async fn checkout(root: &Path, config: &Path, name: &str) -> PathBuf {
     configure_machine(root, "http://127.0.0.1:1");
-    let store = machine_store(root);
-    let entry = store
-        .register_repository(
-            RepositoryName::parse(name).unwrap(),
-            RepositoryIdentity::new(
-                RepositoryId::parse("ab".repeat(32)).unwrap(),
-                RepositoryIncarnation::parse("cd".repeat(16)).unwrap(),
-            ),
-        )
-        .unwrap();
-    MachineRepository::init(&entry.native_repository_path, &settings())
-        .await
-        .unwrap();
+    registered_repository(root, name).await;
     let checkout = root.join("checkout");
     let output = Command::new(env!("CARGO_BIN_EXE_ds"))
         .current_dir(root)

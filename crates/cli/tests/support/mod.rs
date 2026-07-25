@@ -2,46 +2,28 @@
 
 use std::env;
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use blake2::{Blake2b512, Digest as _};
 use devspace_machine::MachineGitRepository as MachineRepository;
 use devspace_machine::{
-    MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineStore, SharedSecret,
+    CatalogEntry, MACHINE_STORE_OVERRIDE, MachineConfig, MachineId, MachineStore, RepositoryId,
+    RepositoryIdentity, RepositoryIncarnation, RepositoryName, SharedSecret,
 };
-use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::settings::UserSettings;
-#[cfg(unix)]
-use rustix::net::SocketAddrUnix;
-#[cfg(unix)]
-use rustix::process::getuid;
 
-pub mod fake_worker;
+pub mod worker;
 
 pub const TEST_MACHINE_ID: &str = "12121212121212121212121212121212";
 pub const TEST_SHARED_SECRET: &str = "cli-development-secret";
+const TEST_REPOSITORY_ID: &str = "abababababababababababababababababababababababababababababababab";
+const TEST_INCARNATION: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
 pub fn settings() -> UserSettings {
-    let mut config = StackedConfig::with_defaults();
-    config.add_layer(
-        ConfigLayer::parse(
-            ConfigSource::User,
-            r#"
-                [user]
-                name = "Devspace Test"
-                email = "devspace@example.invalid"
-            "#,
-        )
-        .unwrap(),
-    );
-    UserSettings::from_config(config).unwrap()
+    devspace_testutils::settings("Devspace Test", "devspace@example.invalid", false)
 }
 
 pub fn write_cli_config(root: &Path) -> PathBuf {
@@ -62,6 +44,13 @@ pub fn write_cli_config(root: &Path) -> PathBuf {
     )
     .unwrap();
     path
+}
+
+/// Append more TOML to a config already written by [`write_cli_config`].
+pub fn append_cli_config(path: &Path, extra: &str) {
+    let mut contents = fs::read_to_string(path).unwrap();
+    contents.push_str(extra);
+    fs::write(path, contents).unwrap();
 }
 
 pub fn ds(cwd: &Path, config: &Path, args: &[&str]) -> Output {
@@ -242,26 +231,166 @@ pub fn poll_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> boo
     condition()
 }
 
-#[cfg(unix)]
 pub fn daemon_socket_path(store_root: &Path) -> PathBuf {
-    let canonical_root = dunce::canonicalize(store_root).unwrap();
-    let encoded = format!("unix:{}", hex_bytes(canonical_root.as_os_str().as_bytes()));
-    let digest = Blake2b512::digest(encoded.as_bytes());
-    let socket_name = format!("{}.sock", hex_bytes(&digest[..12]));
-
-    if let Some(temp_root) = env::var_os("TMPDIR").map(PathBuf::from)
-        && temp_root.is_absolute()
-    {
-        let candidate = temp_root.join("devspace-daemon").join(&socket_name);
-        if SocketAddrUnix::new(&candidate).is_ok() {
-            return candidate;
-        }
-    }
-
-    PathBuf::from(format!("/tmp/devspace-daemon-{}", getuid().as_raw())).join(socket_name)
+    devspace_cli::daemon_socket_path(store_root).expect("a supported daemon socket path")
 }
 
-#[cfg(unix)]
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+/// The identity every local-only fixture registers its repository under.
+pub fn test_identity() -> RepositoryIdentity {
+    RepositoryIdentity::new(
+        RepositoryId::parse(TEST_REPOSITORY_ID).unwrap(),
+        RepositoryIncarnation::parse(TEST_INCARNATION).unwrap(),
+    )
+}
+
+/// A distinct identity per `byte`, for suites that register several repositories.
+pub fn identity(byte: u8) -> RepositoryIdentity {
+    RepositoryIdentity::new(
+        RepositoryId::parse(format!("{byte:02x}").repeat(32)).unwrap(),
+        RepositoryIncarnation::parse(format!("{:02x}", byte + 1).repeat(16)).unwrap(),
+    )
+}
+
+/// Register `name` under the test identity and initialize its native repository.
+pub async fn registered_repository(root: &Path, name: &str) -> CatalogEntry {
+    registered_repository_with_identity(root, name, test_identity()).await
+}
+
+pub async fn registered_repository_with_identity(
+    root: &Path,
+    name: &str,
+    identity: RepositoryIdentity,
+) -> CatalogEntry {
+    let entry = machine_store(root)
+        .register_repository(RepositoryName::parse(name).unwrap(), identity)
+        .unwrap();
+    MachineRepository::init(&entry.native_repository_path, &settings())
+        .await
+        .unwrap();
+    entry
+}
+
+pub fn request_body(request: &str) -> &str {
+    request.split_once("\r\n\r\n").unwrap().1
+}
+
+pub fn request_json(request: &str) -> serde_json::Value {
+    serde_json::from_str(request_body(request)).unwrap()
+}
+
+pub fn set_bookmark(cwd: &Path, home: &Path, config: &Path, name: &str, revision: &str) {
+    let output = ds_with_home(
+        cwd,
+        home,
+        config,
+        &["bookmark", "set", name, "-r", revision],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+/// The Git object a bare remote's `refs/heads/{bookmark}` points at.
+pub fn remote_ref(remote: &Path, bookmark: &str) -> Option<[u8; 20]> {
+    let output = git_command(
+        &[
+            "show-ref",
+            "--hash",
+            "--verify",
+            &format!("refs/heads/{bookmark}"),
+        ],
+        Some(remote),
+    )
+    .output()
+    .unwrap();
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).unwrap();
+    Some(parse_git_oid(value.trim()))
+}
+
+pub fn parse_git_oid(value: &str) -> [u8; 20] {
+    std::array::from_fn(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap())
+}
+
+pub fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+pub fn git(args: &[&str], git_dir: Option<&Path>) {
+    let output = git_command(args, git_dir).output().unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        stderr(&output)
+    );
+}
+
+pub fn git_output(args: &[&str], git_dir: Option<&Path>) -> String {
+    let output = git_command(args, git_dir).output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    String::from_utf8(output.stdout).unwrap()
+}
+
+pub fn git_command(args: &[&str], git_dir: Option<&Path>) -> Command {
+    let mut command = Command::new("git");
+    if let Some(git_dir) = git_dir {
+        command.arg("--git-dir").arg(git_dir);
+    }
+    command.args(args);
+    command
+}
+
+pub fn assert_no_private_objects(remote: &Path, sentinel: &[u8]) {
+    let objects = git_output(
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname) %(objecttype)",
+        ],
+        Some(remote),
+    );
+    for line in objects.lines() {
+        let (id, _) = line.split_once(' ').unwrap();
+        let object = git_output(&["cat-file", "-p", id], Some(remote));
+        assert!(!contains_bytes(object.as_bytes(), sentinel));
+    }
+}
+
+/// A repository name unique to this process and temporary directory, so the live
+/// suites never collide on a shared Worker.
+pub fn unique_repository_name(temp: &Path, prefix: &str) -> String {
+    let suffix = temp
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| byte.to_ascii_lowercase() as char)
+        .collect::<String>();
+    format!("{prefix}-{}-{suffix}", std::process::id())
+}
+
+pub mod fs_util {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+
+    pub fn remove_dir_all(path: &Path) {
+        make_directories_writable(path);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    fn make_directories_writable(path: &Path) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                make_directories_writable(&entry.path());
+            }
+        }
+        let mut permissions = fs::symlink_metadata(path).unwrap().permissions();
+        permissions.set_mode(permissions.mode() | 0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
 }

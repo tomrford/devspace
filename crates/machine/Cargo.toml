@@ -18,5 +18,9 @@ thiserror.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+devspace-testutils = { path = "../testutils" }
 futures.workspace = true
 tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

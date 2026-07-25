@@ -10,8 +10,9 @@ mod support;
 use jj_lib::ref_name::RefName;
 use jj_lib::repo::Repo as _;
 use support::{
-    configure_machine_as, ds_command_with_home as ds_command, ds_with_home as ds, machine_store,
-    settings, stderr, stdout, write_cli_config,
+    assert_no_private_objects, configure_machine_as, contains_bytes,
+    ds_command_with_home as ds_command, ds_with_home as ds, git, git_command, git_output,
+    machine_store, settings, stderr, stdout, unique_repository_name, write_cli_config,
 };
 
 const MACHINE_ID: &str = "56565656565656565656565656565656";
@@ -103,7 +104,7 @@ async fn hidden_path_pollution_warns_materializes_a_tombstone_and_pushes_a_delet
     let pushed = fixture.ds(&["git", "push", "-b", "main"]);
     assert!(pushed.status.success(), "{}", stderr(&pushed));
     for path in ["main:secret.bin", "main:fresh.bin"] {
-        let show = git_command(&fixture.remote, &["show", path])
+        let show = git_command(&["show", path], Some(&fixture.remote))
             .output()
             .unwrap();
         assert!(
@@ -159,7 +160,7 @@ async fn concurrent_local_and_remote_moves_create_a_jj_bookmark_conflict() {
 async fn force_pushed_remote_history_fails_closed_without_journal_mutation() {
     let fixture = LiveFixture::new("rewrite").await;
     let collaborator = fixture.prepare_tracked_main();
-    let original = git_output(&fixture.remote, &["rev-parse", "main"]);
+    let original = git_output(&["rev-parse", "main"], Some(&fixture.remote));
     fs::write(collaborator.join("visible.txt"), b"accepted remote\n").unwrap();
     collaborator_commit(&collaborator, "accepted remote move");
     let accepted = fixture.fetch(&["-b", "main"]);
@@ -167,8 +168,8 @@ async fn force_pushed_remote_history_fails_closed_without_journal_mutation() {
     let before = fixture.snapshot().await;
 
     git(
-        &fixture.remote,
         &["update-ref", "refs/heads/main", original.trim()],
+        Some(&fixture.remote),
     );
     let rejected = fixture.fetch(&["-b", "main"]);
     assert_eq!(rejected.status.code(), Some(1));
@@ -248,7 +249,7 @@ impl LiveFixture {
         fs::create_dir_all(&home).unwrap();
         configure_machine_as(&home, &base_url, MACHINE_ID, &shared_secret);
         let config = write_cli_config(&home);
-        let repository_name = unique_repository_name(temp.path(), label);
+        let repository_name = unique_repository_name(temp.path(), &format!("git-fetch-{label}"));
         let created = ds(&home, &home, &config, &["repo", "new", &repository_name]);
         assert!(created.status.success(), "{}", stderr(&created));
         let checkout = home.join("checkout");
@@ -423,23 +424,6 @@ fn collaborator_commit(worktree: &Path, description: &str) {
     git_worktree(worktree, &["push", "origin", "main"]);
 }
 
-fn git(remote: &Path, args: &[&str]) {
-    let output = git_command(remote, args).output().unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
-}
-
-fn git_output(remote: &Path, args: &[&str]) -> String {
-    let output = git_command(remote, args).output().unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
-    String::from_utf8(output.stdout).unwrap()
-}
-
-fn git_command(remote: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new("git");
-    command.arg("--git-dir").arg(remote).args(args);
-    command
-}
-
 fn git_worktree(worktree: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -448,41 +432,4 @@ fn git_worktree(worktree: &Path, args: &[&str]) {
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
-}
-
-fn assert_no_private_objects(remote: &Path, sentinel: &[u8]) {
-    let objects = git_output(
-        remote,
-        &[
-            "cat-file",
-            "--batch-all-objects",
-            "--batch-check=%(objectname) %(objecttype)",
-        ],
-    );
-    for line in objects.lines() {
-        let (id, _) = line.split_once(' ').unwrap();
-        let output = git_command(remote, &["cat-file", "-p", id])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert!(!contains_bytes(&output.stdout, sentinel));
-    }
-}
-
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
-}
-
-fn unique_repository_name(temp: &Path, label: &str) -> String {
-    let suffix = temp
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .bytes()
-        .filter(|byte| byte.is_ascii_alphanumeric())
-        .map(|byte| byte.to_ascii_lowercase() as char)
-        .collect::<String>();
-    format!("git-fetch-{label}-{}-{suffix}", std::process::id())
 }

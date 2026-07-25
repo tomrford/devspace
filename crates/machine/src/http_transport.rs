@@ -1,21 +1,20 @@
-//! HTTP transport for the Worker's v2 Git-object pack store.
+//! HTTP transport for the Worker's Git-object pack store.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::fmt::Write as _;
 
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::http_client::hardened_http_client;
 use crate::pack_manifest::MAX_MANIFEST_BYTES;
 use crate::{
     BuiltPack, CloudOpHeads, Digest, MAX_CHUNK_BYTES, ObjectKey, Oid, OpId, OpObjectKey,
     OpObjectKind, OpSyncTransport, OpTransportError, PackManifest, PackManifestError, PackOptions,
-    PackProducer, PendingOpHeadTransaction, hex,
+    PackProducer, PendingOpHeadTransaction, decode_lower_hex, encode_lower_hex,
 };
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_JSON_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_GIT_INVENTORY_KEYS: usize = 4_096;
@@ -23,8 +22,6 @@ const PROJECTION_PAGE_ROWS: usize = 256;
 const MAX_PROJECTION_SNAPSHOT_ROWS: usize = 65_536;
 const MAX_PROJECTION_SNAPSHOT_PAGES: usize = MAX_PROJECTION_SNAPSHOT_ROWS / PROJECTION_PAGE_ROWS;
 const MAX_PROJECTION_SNAPSHOT_REFS: usize = 512;
-const TEST_HOOKS_ENV: &str = "DEVSPACE_HTTP_TEST_HOOKS";
-const TEST_REQUEST_TIMEOUT_MS_ENV: &str = "DEVSPACE_HTTP_TEST_REQUEST_TIMEOUT_MS";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitPackCatalogEntry {
@@ -90,7 +87,7 @@ pub struct ProjectionGitFetchRef {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectionGitFetchResult {
-    #[serde(deserialize_with = "deserialize_short_id")]
+    #[serde(deserialize_with = "deserialize_hex")]
     pub fetch_id: [u8; 16],
     pub activation_cursor: u64,
 }
@@ -127,10 +124,10 @@ pub struct ProjectionGitClaimResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectionGitReplay {
-    #[serde(deserialize_with = "deserialize_short_id")]
+    #[serde(deserialize_with = "deserialize_hex")]
     pub batch_id: [u8; 16],
     pub remote: String,
-    #[serde(deserialize_with = "deserialize_short_id")]
+    #[serde(deserialize_with = "deserialize_hex")]
     pub owner_machine: [u8; 16],
     pub fence: u64,
     #[serde(deserialize_with = "deserialize_updates")]
@@ -180,10 +177,10 @@ pub struct PendingProjectionGitRef {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingProjectionGitBatch {
-    #[serde(deserialize_with = "deserialize_short_id")]
+    #[serde(deserialize_with = "deserialize_hex")]
     pub batch_id: [u8; 16],
     pub remote: String,
-    #[serde(deserialize_with = "deserialize_short_id")]
+    #[serde(deserialize_with = "deserialize_hex")]
     pub owner_machine: [u8; 16],
     pub fence: u64,
     pub refs: Vec<PendingProjectionGitRef>,
@@ -305,10 +302,10 @@ impl GitHttpTransport {
         repository_id: &str,
         incarnation: &str,
     ) -> Result<Self, GitHttpTransportError> {
-        validate_lower_hex(machine_id, 32).map_err(|_| GitHttpTransportError::InvalidMachineId)?;
-        validate_lower_hex(repository_id, 64)
+        decode_lower_hex::<16>(machine_id).map_err(|_| GitHttpTransportError::InvalidMachineId)?;
+        decode_lower_hex::<32>(repository_id)
             .map_err(|_| GitHttpTransportError::InvalidRepositoryId)?;
-        validate_lower_hex(incarnation, 32)
+        decode_lower_hex::<16>(incarnation)
             .map_err(|_| GitHttpTransportError::InvalidIncarnation)?;
         if shared_secret.is_empty()
             || shared_secret.len() > 8 * 1024
@@ -328,18 +325,7 @@ impl GitHttpTransport {
         let mut authorization = HeaderValue::from_str(&format!("Bearer {shared_secret}"))
             .map_err(GitHttpTransportError::InvalidAuthorization)?;
         authorization.set_sensitive(true);
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            "x-devspace-client",
-            HeaderValue::from_str(&format!("ds/{} git-pack/2", env!("CARGO_PKG_VERSION")))
-                .expect("client version header is static ASCII"),
-        );
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(request_timeout())
-            .build()
-            .map_err(GitHttpTransportError::Client)?;
+        let client = hardened_http_client().map_err(GitHttpTransportError::Client)?;
         Ok(Self {
             client,
             repository_url: format!(
@@ -359,7 +345,7 @@ impl GitHttpTransport {
     ) -> Result<GitPackCatalogPage, GitHttpTransportError> {
         let mut url = format!("{}/packs?after={after}", self.repository_url);
         if let Some(through) = through {
-            url.push_str(&format!("&through={through}"));
+            write!(url, "&through={through}").expect("writing to a String cannot fail");
         }
         let response: CatalogResponse = self
             .read_json(self.send(self.client.get(url)).await?)
@@ -386,7 +372,7 @@ impl GitHttpTransport {
         &self,
         id: Digest,
     ) -> Result<DownloadedGitPack, GitHttpTransportError> {
-        let pack_url = format!("{}/packs/{}", self.repository_url, hex(&id));
+        let pack_url = format!("{}/packs/{}", self.repository_url, encode_lower_hex(&id));
         let manifest = self
             .fetch_bytes(format!("{pack_url}/manifest"), MAX_MANIFEST_BYTES)
             .await?;
@@ -427,7 +413,11 @@ impl GitHttpTransport {
         id: Digest,
         bytes: &[u8],
     ) -> Result<GitUploadReceipt, GitHttpTransportError> {
-        let url = format!("{}/packs/{}/manifest", self.repository_url, hex(&id));
+        let url = format!(
+            "{}/packs/{}/manifest",
+            self.repository_url,
+            encode_lower_hex(&id)
+        );
         let response = self.send(self.client.put(url).body(bytes.to_vec())).await?;
         self.read_json(response).await
     }
@@ -441,7 +431,7 @@ impl GitHttpTransport {
         let url = format!(
             "{}/packs/{}/chunks/{position}",
             self.repository_url,
-            hex(&id)
+            encode_lower_hex(&id)
         );
         let response = self.send(self.client.put(url).body(bytes.to_vec())).await?;
         self.read_json(response).await
@@ -451,7 +441,11 @@ impl GitHttpTransport {
         &self,
         id: Digest,
     ) -> Result<GitInstallReceipt, GitHttpTransportError> {
-        let url = format!("{}/packs/{}/install", self.repository_url, hex(&id));
+        let url = format!(
+            "{}/packs/{}/install",
+            self.repository_url,
+            encode_lower_hex(&id)
+        );
         let response = self.send(self.client.post(url)).await?;
         self.read_json(response).await
     }
@@ -538,7 +532,7 @@ impl GitHttpTransport {
                     .body(bytes.to_vec()),
             )
             .await?;
-        let _: serde_json::Value = self.read_json(response).await?;
+        self.read_json::<serde_json::Value>(response).await?;
         Ok(())
     }
 
@@ -558,9 +552,9 @@ impl GitHttpTransport {
     ) -> Result<CloudOpHeads, GitHttpTransportError> {
         let body = serde_json::json!({
             "incarnation": self.incarnation,
-            "idempotencyKey": hex(&pending.idempotency_key),
-            "newHead": hex(&pending.new_head),
-            "observedHeads": pending.observed_heads.iter().map(|head| hex(head)).collect::<Vec<_>>(),
+            "idempotencyKey": encode_lower_hex(&pending.idempotency_key),
+            "newHead": encode_lower_hex(&pending.new_head),
+            "observedHeads": pending.observed_heads.iter().map(|head| encode_lower_hex(head)).collect::<Vec<_>>(),
         });
         let response = self
             .send(
@@ -658,7 +652,7 @@ impl GitHttpTransport {
     ) -> Result<ProjectionGitBatchResult, GitHttpTransportError> {
         let body = serde_json::json!({
             "incarnation": self.incarnation,
-            "batchId": hex(&batch_id),
+            "batchId": encode_lower_hex(&batch_id),
             "machineId": self.machine_id,
             "remote": remote,
             "updates": updates.iter().map(update_json).collect::<Vec<_>>(),
@@ -687,7 +681,7 @@ impl GitHttpTransport {
                     .post(format!(
                         "{}/projection/pushes/{}/claim",
                         self.repository_url,
-                        hex(&batch_id)
+                        encode_lower_hex(&batch_id)
                     ))
                     .json(&body),
             )
@@ -702,7 +696,7 @@ impl GitHttpTransport {
         let url = format!(
             "{}/projection/pushes/{}/replay?incarnation={}",
             self.repository_url,
-            hex(&batch_id),
+            encode_lower_hex(&batch_id),
             self.incarnation
         );
         let response = self.send(self.client.get(url)).await?;
@@ -721,7 +715,7 @@ impl GitHttpTransport {
             "fence": fence,
             "observations": observations.iter().map(|observation| serde_json::json!({
                 "bookmark": observation.bookmark,
-                "liveOid": observation.live_oid.map(|oid| hex(&oid.0)),
+                "liveOid": observation.live_oid.map(|oid| encode_lower_hex(&oid.0)),
             })).collect::<Vec<_>>(),
         });
         let response = self
@@ -730,7 +724,7 @@ impl GitHttpTransport {
                     .post(format!(
                         "{}/projection/pushes/{}/recover",
                         self.repository_url,
-                        hex(&batch_id)
+                        encode_lower_hex(&batch_id)
                     ))
                     .json(&body),
             )
@@ -746,16 +740,16 @@ impl GitHttpTransport {
     ) -> Result<ProjectionGitFetchResult, GitHttpTransportError> {
         let body = serde_json::json!({
             "incarnation": self.incarnation,
-            "fetchId": hex(&fetch_id),
+            "fetchId": encode_lower_hex(&fetch_id),
             "machineId": self.machine_id,
             "remote": remote,
             "refs": refs.iter().map(|fetch_ref| serde_json::json!({
                 "bookmark": fetch_ref.bookmark,
-                "observedPublicOid": hex(&fetch_ref.observed_public_oid.0),
-                "expectedCursorOid": fetch_ref.expected_cursor_oid.map(|oid| hex(&oid.0)),
+                "observedPublicOid": encode_lower_hex(&fetch_ref.observed_public_oid.0),
+                "expectedCursorOid": fetch_ref.expected_cursor_oid.map(|oid| encode_lower_hex(&oid.0)),
                 "states": fetch_ref.states.iter().map(state_json).collect::<Vec<_>>(),
                 "proposedState": fetch_ref.proposed_state,
-                "identityOid": fetch_ref.identity_oid.map(|oid| hex(&oid.0)),
+                "identityOid": fetch_ref.identity_oid.map(|oid| encode_lower_hex(&oid.0)),
             })).collect::<Vec<_>>(),
         });
         let response = self
@@ -1079,48 +1073,20 @@ fn validate_projection_snapshot_rows(
     Ok(())
 }
 
-fn request_timeout() -> Duration {
-    if std::env::var_os(TEST_HOOKS_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
-        && let Some(milliseconds) = std::env::var(TEST_REQUEST_TIMEOUT_MS_ENV)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-        && milliseconds > 0
-    {
-        return Duration::from_millis(milliseconds);
-    }
-    REQUEST_TIMEOUT
-}
-
-fn validate_lower_hex(value: &str, length: usize) -> Result<(), ()> {
-    if value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        Ok(())
-    } else {
-        Err(())
-    }
-}
-
 fn decode_digest(value: &str) -> Result<Digest, GitHttpTransportError> {
-    validate_lower_hex(value, 128).map_err(|_| {
+    decode_lower_hex(value).map_err(|_| {
         GitHttpTransportError::Protocol(format!(
             "pack ID must be 128 lowercase hex characters, got {value:?}"
         ))
-    })?;
-    Ok(std::array::from_fn(|index| {
-        u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .expect("validated lowercase hexadecimal pair")
-    }))
+    })
 }
 
 fn op_key(key: &OpObjectKey) -> String {
-    let prefix = match key.kind {
-        OpObjectKind::View => "v",
-        OpObjectKind::Operation => "o",
-    };
-    format!("{prefix}:{}", hex(&key.id))
+    format!(
+        "{}:{}",
+        key.kind.inventory_prefix(),
+        encode_lower_hex(&key.id)
+    )
 }
 
 fn git_object_key(key: &ObjectKey) -> String {
@@ -1129,7 +1095,7 @@ fn git_object_key(key: &ObjectKey) -> String {
         devspace_kernel::ObjectKind::Tree => "t",
         devspace_kernel::ObjectKind::Commit => "c",
     };
-    format!("{prefix}:{}", hex(&key.id.0))
+    format!("{prefix}:{}", encode_lower_hex(&key.id.0))
 }
 
 fn decode_git_object_key(value: &str) -> Result<ObjectKey, GitHttpTransportError> {
@@ -1153,26 +1119,16 @@ fn decode_git_object_key(value: &str) -> Result<ObjectKey, GitHttpTransportError
 }
 
 fn op_key_path(key: OpObjectKey) -> String {
-    let directory = match key.kind {
-        OpObjectKind::View => "views",
-        OpObjectKind::Operation => "operations",
-    };
-    format!("{directory}/{}", hex(&key.id))
+    format!("{}/{}", key.kind.directory(), encode_lower_hex(&key.id))
 }
 
 fn decode_op_key(value: &str) -> Result<OpObjectKey, GitHttpTransportError> {
     let (prefix, id) = value.split_once(':').ok_or_else(|| {
         GitHttpTransportError::Protocol("operation inventory key lacks a kind".to_owned())
     })?;
-    let kind = match prefix {
-        "v" => OpObjectKind::View,
-        "o" => OpObjectKind::Operation,
-        _ => {
-            return Err(GitHttpTransportError::Protocol(
-                "operation inventory key has an unknown kind".to_owned(),
-            ));
-        }
-    };
+    let kind = OpObjectKind::from_inventory_prefix(prefix).ok_or_else(|| {
+        GitHttpTransportError::Protocol("operation inventory key has an unknown kind".to_owned())
+    })?;
     Ok(OpObjectKey {
         kind,
         id: decode_op_id(id)?,
@@ -1180,14 +1136,11 @@ fn decode_op_key(value: &str) -> Result<OpObjectKey, GitHttpTransportError> {
 }
 
 fn decode_op_id(value: &str) -> Result<OpId, GitHttpTransportError> {
-    validate_lower_hex(value, 128).map_err(|_| {
+    decode_lower_hex(value).map_err(|_| {
         GitHttpTransportError::Protocol(
             "operation ID must be 128 lowercase hex characters".to_owned(),
         )
-    })?;
-    Ok(std::array::from_fn(|index| {
-        u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).expect("validated operation ID")
-    }))
+    })
 }
 
 fn decode_op_heads(response: OpHeadsResponse) -> Result<CloudOpHeads, GitHttpTransportError> {
@@ -1204,19 +1157,19 @@ fn decode_op_heads(response: OpHeadsResponse) -> Result<CloudOpHeads, GitHttpTra
 
 fn state_json(state: &ProjectionGitState) -> serde_json::Value {
     serde_json::json!({
-        "canonicalOid": hex(&state.canonical_oid.0),
-        "publicOid": hex(&state.public_oid.0),
-        "hiddenSetId": state.hidden_set_id.as_ref().map(|id| hex(id)),
+        "canonicalOid": encode_lower_hex(&state.canonical_oid.0),
+        "publicOid": encode_lower_hex(&state.public_oid.0),
+        "hiddenSetId": state.hidden_set_id.as_ref().map(|id| encode_lower_hex(id)),
     })
 }
 
 fn update_json(update: &ProjectionGitUpdate) -> serde_json::Value {
     serde_json::json!({
         "bookmark": update.bookmark,
-        "expectedOldOid": update.expected_old_oid.map(|oid| hex(&oid.0)),
+        "expectedOldOid": update.expected_old_oid.map(|oid| encode_lower_hex(&oid.0)),
         "states": update.states.iter().map(state_json).collect::<Vec<_>>(),
         "proposedState": update.proposed_state,
-        "identityOid": update.identity_oid.map(|oid| hex(&oid.0)),
+        "identityOid": update.identity_oid.map(|oid| encode_lower_hex(&oid.0)),
     })
 }
 
@@ -1224,18 +1177,9 @@ fn deserialize_hex<'de, const N: usize, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<[u8; N], D::Error> {
     let value = String::deserialize(deserializer)?;
-    validate_lower_hex(&value, N * 2).map_err(|()| {
+    decode_lower_hex(&value).map_err(|_| {
         serde::de::Error::custom(format!("expected {} lowercase hex characters", N * 2))
-    })?;
-    Ok(std::array::from_fn(|index| {
-        u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).expect("validated hex")
-    }))
-}
-
-fn deserialize_short_id<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<[u8; 16], D::Error> {
-    deserialize_hex(deserializer)
+    })
 }
 
 fn deserialize_oid<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Oid, D::Error> {
@@ -1246,11 +1190,9 @@ fn deserialize_optional_oid<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Oid>, D::Error> {
     Option::<String>::deserialize(deserializer)?.map_or(Ok(None), |value| {
-        validate_lower_hex(&value, 40)
-            .map_err(|()| serde::de::Error::custom("expected 40 lowercase hex characters"))?;
-        Oid::from_hex(value.as_bytes())
-            .map(Some)
-            .ok_or_else(|| serde::de::Error::custom("invalid Git object ID"))
+        decode_lower_hex::<20>(&value)
+            .map(|id| Some(Oid(id)))
+            .map_err(|_| serde::de::Error::custom("expected 40 lowercase hex characters"))
     })
 }
 

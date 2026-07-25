@@ -8,15 +8,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use devspace_machine::MachineGitRepository as MachineRepository;
-use devspace_machine::{RepositoryId, RepositoryIdentity, RepositoryIncarnation, RepositoryName};
 use gix::bstr::BStr;
 use jj_lib::repo::Repo as _;
 
 mod support;
 
 use support::{
-    commit_id, configure_machine, ds, ds_command, machine_store, set_machine_git_shim, settings,
-    stderr, stdout, write_cli_config,
+    commit_id, configure_machine, ds, ds_command, machine_store, registered_repository,
+    set_machine_git_shim, settings, stderr, stdout, write_cli_config,
 };
 
 async fn local_repository(root: &Path, name: &str) -> PathBuf {
@@ -24,19 +23,9 @@ async fn local_repository(root: &Path, name: &str) -> PathBuf {
     if store.load_config().is_err() {
         configure_machine(root, "http://127.0.0.1:1");
     }
-    let entry = machine_store(root)
-        .register_repository(
-            RepositoryName::parse(name).unwrap(),
-            RepositoryIdentity::new(
-                RepositoryId::parse("ab".repeat(32)).unwrap(),
-                RepositoryIncarnation::parse("cd".repeat(16)).unwrap(),
-            ),
-        )
-        .unwrap();
-    MachineRepository::init(&entry.native_repository_path, &settings())
+    registered_repository(root, name)
         .await
-        .unwrap();
-    entry.native_repository_path
+        .native_repository_path
 }
 
 fn set_git_shim(config: &Path, enabled: bool) {
@@ -412,7 +401,6 @@ async fn unchanged_view_skips_refresh_and_concurrent_refreshes_serialize() {
     let state_before = fs::read(checkout.join(".jj/devspace-git-shim.state")).unwrap();
 
     let no_op = ds_command(&checkout, &config)
-        .env("JJ_LOG", "warn")
         .env("DEVSPACE_FAILPOINT", "git_shim_after_head")
         .arg("status")
         .output()
@@ -429,7 +417,6 @@ async fn unchanged_view_skips_refresh_and_concurrent_refreshes_serialize() {
         .map(|_| {
             let mut command = ds_command(&checkout, &config);
             command
-                .env("JJ_LOG", "warn")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .arg("status")
@@ -462,7 +449,6 @@ async fn interrupted_refresh_and_stale_index_lock_are_repaired() {
     fs::write(checkout.join("recovered.txt"), "visible\n").unwrap();
 
     let interrupted = ds_command(&checkout, &config)
-        .env("JJ_LOG", "warn")
         .env("DEVSPACE_FAILPOINT", "git_shim_after_head")
         .arg("status")
         .output()
@@ -505,7 +491,6 @@ async fn interrupted_refresh_is_repaired_after_view_returns_to_previous_state() 
 
     fs::write(checkout.join("next.txt"), "next\n").unwrap();
     let interrupted = ds_command(&checkout, &config)
-        .env("JJ_LOG", "warn")
         .env("DEVSPACE_FAILPOINT", "git_shim_after_head")
         .args(["new", "-m", "next"])
         .output()

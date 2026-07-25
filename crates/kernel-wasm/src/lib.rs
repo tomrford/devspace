@@ -3,12 +3,12 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::string::ToString;
+use alloc::string::ToString as _;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use blake2::digest::Update;
-use blake2::{Blake2b512, Digest};
+use blake2::{Blake2b512, Digest as _};
 use devspace_kernel::ops::{
     OpObjectKind, OpReferenceKind, OpValidatedObject, ValidationError as OpValidationError,
     validate_op,
@@ -218,7 +218,7 @@ fn leak(bytes: Vec<u8>) -> u32 {
     if bytes.is_empty() {
         return 0;
     }
-    Box::into_raw(bytes.into_boxed_slice()) as *mut u8 as u32
+    Box::into_raw(bytes.into_boxed_slice()).cast::<u8>() as u32
 }
 
 struct RawHasher(Blake2b512);

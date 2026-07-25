@@ -11,3 +11,6 @@ crate-type = ["cdylib"]
 [dependencies]
 blake2.workspace = true
 devspace-kernel = { path = "../kernel" }
+
+[lints]
+workspace = true

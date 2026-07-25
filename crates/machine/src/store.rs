@@ -58,11 +58,7 @@ impl MachineGitRepository {
         settings: &UserSettings,
     ) -> Result<Self, MachineGitRepositoryError> {
         let path = path.as_ref();
-        require_store_type(path, "store", GitBackend::name())?;
-        require_store_type(path, "op_store", SimpleOpStore::name())?;
-        require_store_type(path, "op_heads", SimpleOpHeadsStore::name())?;
-        require_store_type(path, "index", DefaultIndexStore::name())?;
-        require_store_type(path, "submodule_store", DefaultSubmoduleStore::name())?;
+        Self::check_stock_layout(path)?;
         // `extra/` is a cache, but GitBackend::load expects its TableStore
         // scaffolding to exist. Recreate only that empty scaffolding; commit
         // reads repopulate it from Git object headers or synthetic IDs.
@@ -76,6 +72,16 @@ impl MachineGitRepository {
         let loader = RepoLoader::init_from_file_system(settings, path, &StoreFactories::default())?;
         let repo = loader.load_at_head().await?;
         Self::from_repo(path, repo)
+    }
+
+    /// The stock jj store layout Devspace requires, checked without opening the
+    /// repository. `open` refuses anything this rejects.
+    pub fn check_stock_layout(path: &Path) -> Result<(), MachineGitRepositoryError> {
+        require_store_type(path, "store", GitBackend::name())?;
+        require_store_type(path, "op_store", SimpleOpStore::name())?;
+        require_store_type(path, "op_heads", SimpleOpHeadsStore::name())?;
+        require_store_type(path, "index", DefaultIndexStore::name())?;
+        require_store_type(path, "submodule_store", DefaultSubmoduleStore::name())
     }
 
     fn from_repo(path: &Path, repo: Arc<ReadonlyRepo>) -> Result<Self, MachineGitRepositoryError> {

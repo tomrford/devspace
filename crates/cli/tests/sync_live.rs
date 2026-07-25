@@ -14,7 +14,8 @@ use support::daemon_socket_path;
 use support::{
     commit_id_with_home as commit_id, configure_machine_as as configure_machine,
     ds_command_with_home, ds_with_home as ds, machine_store, operation_heads, poll_until,
-    repository_commit_ids, seal_commit, settings, stderr, stdout, write_cli_config,
+    repository_commit_ids, seal_commit, settings, stderr, stdout, unique_repository_name,
+    write_cli_config,
 };
 
 const FIRST_MACHINE_ID: &str = "12121212121212121212121212121212";
@@ -35,7 +36,7 @@ async fn two_machine_cli_sync_converges_through_a_live_worker() {
     configure_machine(&home_b, &base_url, SECOND_MACHINE_ID, &shared_secret);
     let config_a = write_cli_config(&home_a);
     let config_b = write_cli_config(&home_b);
-    let repository_name = unique_repository_name(temp.path());
+    let repository_name = unique_repository_name(temp.path(), "boundary-live");
 
     let created = ds(
         &home_a,
@@ -189,7 +190,7 @@ async fn virgin_repository_syncs_and_clones_before_any_checkout_exists() {
     configure_machine(&home_b, &base_url, SECOND_MACHINE_ID, &shared_secret);
     let config_a = write_cli_config(&home_a);
     let config_b = write_cli_config(&home_b);
-    let repository_name = unique_repository_name(temp.path());
+    let repository_name = unique_repository_name(temp.path(), "boundary-live");
 
     let created = ds(
         &home_a,
@@ -252,7 +253,7 @@ async fn boundary_sync_uploads_machine_a_without_explicit_sync() {
     configure_machine(&home_b, &base_url, SECOND_MACHINE_ID, &shared_secret);
     let config_a = write_cli_config(&home_a);
     let config_b = write_cli_config(&home_b);
-    let repository_name = unique_repository_name(temp.path());
+    let repository_name = unique_repository_name(temp.path(), "boundary-live");
 
     let created = ds_boundary(
         &home_a,
@@ -336,7 +337,7 @@ async fn daemon_disabled_boundaries_converge_two_offline_divergent_machines() {
     configure_machine(&home_b, &base_url, SECOND_MACHINE_ID, &shared_secret);
     let config_a = write_cli_config(&home_a);
     let config_b = write_cli_config(&home_b);
-    let repository_name = unique_repository_name(temp.path());
+    let repository_name = unique_repository_name(temp.path(), "boundary-live");
 
     let created = ds_degraded(
         &home_a,
@@ -488,7 +489,7 @@ async fn daemon_polling_converges_without_a_machine_b_command() {
     configure_machine(&home_b, &base_url, SECOND_MACHINE_ID, &shared_secret);
     let config_a = write_cli_config(&home_a);
     let config_b = write_cli_config(&home_b);
-    let repository_name = unique_repository_name(temp.path());
+    let repository_name = unique_repository_name(temp.path(), "boundary-live");
 
     let created = ds_boundary(
         &home_a,
@@ -583,7 +584,7 @@ async fn daemon_restart_drains_one_offline_commit_exactly_once() {
     fs::create_dir_all(&home).unwrap();
     configure_machine(&home, &base_url, FIRST_MACHINE_ID, &shared_secret);
     let config = write_cli_config(&home);
-    let repository_name = unique_repository_name(temp.path());
+    let repository_name = unique_repository_name(temp.path(), "boundary-live");
 
     let created = ds(&home, &home, &config, &["repo", "new", &repository_name]);
     assert!(created.status.success(), "{}", stderr(&created));
@@ -822,16 +823,4 @@ fn sync_log(store: &MachineStore, repository_name: &str) -> String {
             .join("sync.log"),
     )
     .unwrap_or_else(|error| format!("<unavailable: {error}>"))
-}
-
-fn unique_repository_name(temp: &Path) -> String {
-    let suffix = temp
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .bytes()
-        .filter(|byte| byte.is_ascii_alphanumeric())
-        .map(|byte| byte.to_ascii_lowercase() as char)
-        .collect::<String>();
-    format!("boundary-live-{}-{suffix}", std::process::id())
 }

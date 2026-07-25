@@ -4,8 +4,11 @@ import { compareGitBytes } from "./kernel";
 import { lowerHexBytesSchema } from "./validation";
 
 export const MAX_OPERATION_HEADS = 4_096;
-export const MAX_OBSERVED_HEADS = MAX_OPERATION_HEADS;
+export const MAX_OP_INVENTORY_KEYS = 4_096;
 export const MAX_HEAD_REQUEST_BYTES = 640 * 1_024;
+
+const INVENTORY_BOUNDS_ERROR =
+  "operation-store inventory request must contain only a bounded keys array";
 
 const shortHex = (label: string) => lowerHexBytesSchema(16, label);
 const operationId = (label: string) => lowerHexBytesSchema(64, label);
@@ -17,7 +20,7 @@ const headTransactionSchema = z
     newHead: operationId("newHead").refine((value) => value.some((byte) => byte !== 0), {
       error: "newHead must not be the implicit zero operation",
     }),
-    observedHeads: z.array(operationId("observed head")).max(MAX_OBSERVED_HEADS),
+    observedHeads: z.array(operationId("observed head")).max(MAX_OPERATION_HEADS),
   })
   .transform((request, context) => {
     request.observedHeads.sort(compareGitBytes);
@@ -31,6 +34,32 @@ const headTransactionSchema = z
       }
     }
     return request;
+  });
+
+export const opInventorySchema = z
+  .strictObject(
+    {
+      keys: z
+        .array(
+          z.string().regex(/^[vo]:[0-9a-f]{128}$/, {
+            error: "operation-store inventory key is invalid",
+          }),
+          { error: INVENTORY_BOUNDS_ERROR },
+        )
+        .max(MAX_OP_INVENTORY_KEYS, { error: INVENTORY_BOUNDS_ERROR }),
+    },
+    { error: INVENTORY_BOUNDS_ERROR },
+  )
+  .superRefine((request, context) => {
+    for (let index = 1; index < request.keys.length; index += 1) {
+      if (request.keys[index - 1] >= request.keys[index]) {
+        context.addIssue({
+          code: "custom",
+          path: ["keys", index],
+          message: "operation-store inventory keys must be strictly sorted",
+        });
+      }
+    }
   });
 
 export type HeadTransactionRequest = z.output<typeof headTransactionSchema>;

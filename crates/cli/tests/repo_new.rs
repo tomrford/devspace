@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use devspace_machine::MachineGitRepository as MachineRepository;
-use devspace_machine::{MachineStore, RepositoryName};
+use devspace_machine::{MachineStore, RepositoryName, encode_lower_hex};
 use jj_lib::default_index::DefaultIndexStore;
 use jj_lib::default_submodule_store::DefaultSubmoduleStore;
 use jj_lib::git_backend::GitBackend;
@@ -13,12 +13,11 @@ use jj_lib::simple_op_store::SimpleOpStore;
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
 mod support;
-mod support_fs;
 
-use support::fake_worker::{create_server, repository_response, respond};
+use devspace_testutils::fake_worker::{create_server, repository_response, respond};
 use support::{
-    TEST_SHARED_SECRET, configure_machine, ds, machine_store, settings, stderr, stdout,
-    write_cli_config,
+    TEST_SHARED_SECRET, configure_machine, ds, machine_store, request_json, settings, stderr,
+    stdout, write_cli_config,
 };
 
 fn write_unknown_signing_config(root: &Path) -> PathBuf {
@@ -39,11 +38,6 @@ fn write_unknown_signing_config(root: &Path) -> PathBuf {
     )
     .unwrap();
     path
-}
-
-fn request_json(request: &str) -> serde_json::Value {
-    let (_, body) = request.split_once("\r\n\r\n").unwrap();
-    serde_json::from_str(body).unwrap()
 }
 
 fn checkout_repository_path(checkout: &Path) -> PathBuf {
@@ -110,12 +104,7 @@ async fn repo_new_replays_a_lost_response_with_the_durable_request_key() {
             .expect("intent must reach durable storage before the HTTP request");
         assert_eq!(
             request_json(request)["idempotencyKey"],
-            persisted
-                .key()
-                .bytes()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
+            encode_lower_hex(&persisted.key().bytes())
         );
         if index == 1 {
             respond(stream, "200 OK", &response);
@@ -380,7 +369,7 @@ async fn repo_new_attaches_two_independent_checkouts_to_one_machine_repository()
             .clone();
     assert_eq!(operation_after_collisions, operation_before_collisions);
 
-    support_fs::remove_dir_all(&first_path);
+    support::fs_util::remove_dir_all(&first_path);
     assert!(entry.native_repository_path.exists());
     let surviving = ds(
         &second_path,

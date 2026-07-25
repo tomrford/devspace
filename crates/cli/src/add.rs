@@ -20,12 +20,13 @@ use jj_lib::repo::StoreFactories;
 use jj_lib::workspace::Workspace;
 use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
 
-use crate::bare_workspace::{is_stock_bare_repository, workspace_for_repository};
+use crate::bare_workspace::{require_local_store, workspace_for_repository};
 use crate::checkout::{
     CHECKOUT_OWNER_FILE, CheckoutOwner, absolute_path, canonical_destination_path,
     destination_hash, ensure_destination_parent, owned_directory_matches,
     reject_unsupported_global_options, workspace_name,
 };
+use crate::failpoint::checkout_failpoint;
 use crate::git::cloud_runtime;
 use crate::sync::wait_for_repository_sync_lock;
 use crate::tx::{
@@ -139,16 +140,14 @@ pub(crate) async fn add_checkout(
             let entry = store
                 .register_repository(repository.name, repository.identity)
                 .map_err(|error| user_error(error.to_string()))?;
-            failpoint("after_clone_registration");
+            checkout_failpoint("after_clone_registration");
             entry
         }
     };
     if !entry.native_repository_path.exists() {
         clone_repository(ui, command, &store, &entry, &machine).await?;
-    } else if !is_stock_bare_repository(&entry.native_repository_path) {
-        return Err(user_error(format!(
-            "Repository `{name}` is registered locally, but its native repository is invalid."
-        )));
+    } else {
+        require_local_store(&entry).map_err(|message| user_error(format!("{message}.")))?;
     }
     crate::boundary_sync::record(&entry);
 
@@ -250,7 +249,7 @@ pub(crate) async fn add_checkout(
             )
             .await
             .map_err(user_error)?;
-            failpoint("after_workspace_registration");
+            checkout_failpoint("after_workspace_registration");
             let operation_id = repo.op_id().clone();
             rebuild_checkout(
                 &entry,
@@ -371,12 +370,7 @@ async fn clone_repository(
     };
 
     if entry.native_repository_path.exists() {
-        if is_stock_bare_repository(&entry.native_repository_path) {
-            return Ok(());
-        }
-        return Err(user_error(format!(
-            "Repository `{name}` is registered locally, but its native repository is invalid."
-        )));
+        return require_local_store(entry).map_err(|message| user_error(format!("{message}.")));
     }
 
     let (settings, _) = command.settings_for_new_workspace(ui, &entry.native_repository_path)?;
@@ -385,12 +379,9 @@ async fn clone_repository(
         .await
         .map_err(|error| user_error(error.to_string()))?
     else {
-        if is_stock_bare_repository(&entry.native_repository_path) {
-            return Ok(());
-        }
-        return Err(user_error(format!(
-            "Repository `{name}` is registered locally, but its native repository is invalid."
-        )));
+        // `stage_repository_clone` yields nothing only when a concurrent run
+        // published the repository while this one waited for the lock.
+        return require_local_store(entry).map_err(|message| user_error(format!("{message}.")));
     };
     let sync_path = staging.sync_path().to_owned();
     crate::sync::run_sync_engine(
@@ -634,14 +625,14 @@ async fn rebuild_checkout(
             }
         })?;
     sync_directory(&staging).map_err(|error| format!("failed to sync staged checkout: {error}"))?;
-    failpoint("after_checkout_staging");
+    checkout_failpoint("after_checkout_staging");
     if let Err(error) = publish_directory_noclobber(&staging, destination) {
         if owned_directory_matches(destination, owner).unwrap_or(false) {
             crate::boundary_sync::relocate_checkout(&staging, destination);
         }
         return Err(error);
     }
-    failpoint("after_final_publication");
+    checkout_failpoint("after_final_publication");
     if !owned_directory_matches(destination, owner)? {
         return Err(
             "checkout parent or destination was replaced during atomic publication; no replacement path was modified"
@@ -802,7 +793,6 @@ fn record_workspace_destination(
         .map_err(|error| format!("failed to record checkout location: {error}"))
 }
 
-#[cfg(unix)]
 fn publish_directory_noclobber(staging: &Path, destination: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -844,40 +834,4 @@ fn publish_directory_noclobber(staging: &Path, destination: &Path) -> Result<(),
     parent_file
         .sync_all()
         .map_err(|error| format!("failed to sync checkout parent: {error}"))
-}
-
-#[cfg(not(unix))]
-fn publish_directory_noclobber(staging: &Path, destination: &Path) -> Result<(), String> {
-    fs::rename(staging, destination).map_err(|error| {
-        format!(
-            "failed to publish checkout at {} without replacing existing data: {error}",
-            destination.display()
-        )
-    })?;
-    sync_directory(
-        destination
-            .parent()
-            .expect("checkout destination has a parent"),
-    )
-    .map_err(|error| format!("failed to sync checkout parent: {error}"))
-}
-
-fn failpoint(name: &str) {
-    if std::env::var_os("DEVSPACE_TEST_CHECKOUT_FAILPOINT").as_deref()
-        != Some(std::ffi::OsStr::new(name))
-    {
-        return;
-    }
-    if let Some(path) = std::env::var_os("DEVSPACE_TEST_CHECKOUT_FAILPOINT_READY") {
-        let _ = fs::write(path, name);
-    }
-    if let Some(path) = std::env::var_os("DEVSPACE_TEST_CHECKOUT_FAILPOINT_CONTINUE") {
-        while !Path::new(&path).exists() {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        return;
-    }
-    loop {
-        std::thread::park();
-    }
 }

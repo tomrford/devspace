@@ -17,10 +17,9 @@ use jj_lib::settings::UserSettings;
 use devspace_machine::{CatalogEntry, MachineStore};
 
 use crate::checkout::reject_unsupported_global_options;
+use crate::failpoint::abort_failpoint;
 
-use super::{
-    cloud_runtime, failpoint_enabled, locked_checkout_entry, open_cloud_session, short_oid,
-};
+use super::{cloud_runtime, locked_checkout_entry, open_cloud_session, short_oid};
 
 const AFTER_FETCH_RECORD_FAILPOINT: &str = "after_fetch_record_before_view";
 
@@ -97,9 +96,7 @@ pub(crate) async fn fetch_entry(
             &GitProcessEnvironment::default(),
         ))
         .map_err(|error| user_error(error.to_string()))?;
-    if failpoint_enabled(AFTER_FETCH_RECORD_FAILPOINT) {
-        std::process::exit(86);
-    }
+    abort_failpoint(AFTER_FETCH_RECORD_FAILPOINT);
 
     let mut lines = fetch_lines(&before.cursors, &remote_name, &bookmark_names, &outcome)?;
     lines.extend(

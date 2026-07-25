@@ -5,11 +5,12 @@ import { OpGitStore } from "./op_store";
 import { GitPackStore } from "./pack_store";
 import { ProjectionGitStore } from "./projection_store";
 import { initializeGitSchema } from "./schema";
+import { hexBytes } from "./validation";
 
 class RepositoryAuthorityError extends Error {
   constructor(
     message: string,
-    readonly code: "repository-retired" | "repository-authority-stale",
+    readonly code: "repository-authority-stale",
   ) {
     super(message);
   }
@@ -20,7 +21,6 @@ interface AuthorityRow extends Record<string, SqlStorageValue> {
   user_id: string;
   repository_id: string;
   creation_nonce: string | null;
-  retired: number;
 }
 
 interface RepositoryRetirement {
@@ -69,8 +69,8 @@ export class Repository extends DurableObject<Env> {
         }
         this.ctx.storage.sql.exec(
           `INSERT INTO repository_state
-           (singleton, incarnation, user_id, repository_id, creation_nonce, retired)
-           VALUES (1, ?, ?, ?, ?, 0)`,
+           (singleton, incarnation, user_id, repository_id, creation_nonce)
+           VALUES (1, ?, ?, ?, ?)`,
           exactGitBuffer(incarnationBytes(authority.incarnation)),
           authority.userId,
           authority.repositoryId,
@@ -234,26 +234,6 @@ export class Repository extends DurableObject<Env> {
     );
   }
 
-  countObjects() {
-    return this.packs.countObjects();
-  }
-
-  countObjectReferences() {
-    return this.packs.countObjectReferences();
-  }
-
-  countInstalledPacks() {
-    return this.packs.countInstalledPacks();
-  }
-
-  countQuarantinedPacks() {
-    return this.packs.countQuarantinedPacks();
-  }
-
-  countOpObjects() {
-    return this.ops.countObjects();
-  }
-
   private withAuthority<T>(authority: RepositoryAuthority, operation: () => T) {
     try {
       this.requireAuthority(authority);
@@ -266,7 +246,7 @@ export class Repository extends DurableObject<Env> {
   private authorityState(): AuthorityRow | undefined {
     return this.ctx.storage.sql
       .exec<AuthorityRow>(
-        `SELECT incarnation, user_id, repository_id, creation_nonce, retired
+        `SELECT incarnation, user_id, repository_id, creation_nonce
          FROM repository_state WHERE singleton = 1`,
       )
       .toArray()[0];
@@ -285,9 +265,6 @@ export class Repository extends DurableObject<Env> {
         "repository authority is stale",
         "repository-authority-stale",
       );
-    }
-    if (state.retired !== 0) {
-      throw new RepositoryAuthorityError("repository was deleted", "repository-retired");
     }
   }
 }
@@ -318,7 +295,5 @@ function incarnationBytes(value: string): Uint8Array {
       "repository-authority-stale",
     );
   }
-  return Uint8Array.from({ length: 16 }, (_, index) =>
-    Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
-  );
+  return hexBytes(value);
 }

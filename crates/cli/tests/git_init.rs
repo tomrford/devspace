@@ -9,8 +9,9 @@ mod support;
 
 use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
 use support::{
-    configure_machine_from_env as configure_machine, ds_command_with_home as ds_command,
-    ds_with_home as ds, settings, stderr, stdout, write_cli_config,
+    assert_no_private_objects, configure_machine_from_env as configure_machine,
+    ds_command_with_home as ds_command, ds_with_home as ds, settings, stderr, stdout,
+    write_cli_config,
 };
 
 const PRIVATE_SENTINEL: &[u8] = b"INIT_PRIVATE_SENTINEL\0\xff";
@@ -203,56 +204,6 @@ fn init_replays_the_creation_intent_after_a_lost_cloud_response() {
     assert!(checkout.join("visible.txt").exists());
 }
 
-#[test]
-#[ignore = "requires DEVSPACE_URL and DEVSPACE_SHARED_SECRET for a live Worker"]
-fn init_imports_deep_history_through_receipt_pages_and_retries_after_page_crash() {
-    const COMMITS: usize = 60;
-    let fixture = LiveFixture::new("paged-history");
-    let remote = fixture.linear_remote(COMMITS);
-    let checkout = fixture.root.join("deep-checkout");
-    let mut command = fixture.init_command(&remote, &checkout, None);
-    let output = command
-        .env("DEVSPACE_HTTP_TEST_HOOKS", "1")
-        .env("DEVSPACE_TEST_RECEIPT_PAGE_SIZE", "16")
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert_history_count(&fixture, &checkout, COMMITS);
-    assert_eq!(
-        fs::read(checkout.join("visible.txt")).unwrap(),
-        b"history\n"
-    );
-    let status = fixture.ds(&checkout, &["status"]);
-    assert!(status.status.success(), "{}", stderr(&status));
-
-    let retry_fixture = LiveFixture::new("paged-retry");
-    let retry_remote = retry_fixture.linear_remote(COMMITS);
-    let retry_checkout = retry_fixture.root.join("retry-checkout");
-    let mut failed = retry_fixture.init_command(&retry_remote, &retry_checkout, None);
-    let failed = failed
-        .env("DEVSPACE_HTTP_TEST_HOOKS", "1")
-        .env("DEVSPACE_TEST_RECEIPT_PAGE_SIZE", "16")
-        .env("DEVSPACE_FAILPOINT", "after_receipt_page")
-        .output()
-        .unwrap();
-    assert_eq!(failed.status.code(), Some(86), "{}", stderr(&failed));
-    assert!(!retry_checkout.exists());
-
-    let mut retried = retry_fixture.init_command(&retry_remote, &retry_checkout, None);
-    let retried = retried
-        .env("DEVSPACE_HTTP_TEST_HOOKS", "1")
-        .env("DEVSPACE_TEST_RECEIPT_PAGE_SIZE", "16")
-        .output()
-        .unwrap();
-    assert!(retried.status.success(), "{}", stderr(&retried));
-    assert_history_count(&retry_fixture, &retry_checkout, COMMITS);
-    assert_eq!(
-        fs::read(retry_checkout.join("visible.txt")).unwrap(),
-        b"history\n"
-    );
-    assert_checkout_tracks_origin_head(&retry_fixture, &retry_checkout);
-}
-
 struct LiveFixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -312,25 +263,6 @@ impl LiveFixture {
         remote
     }
 
-    fn linear_remote(&self, commits: usize) -> PathBuf {
-        assert!(commits > 0);
-        let source = self.root.join(format!("{}-source", self.name));
-        run_git(["init", "-b", "main", path(&source)]);
-        configure_git_identity(&source);
-        fs::write(source.join("visible.txt"), b"history\n").unwrap();
-        git_worktree(&source, &["add", "visible.txt"]);
-        git_worktree(&source, &["commit", "-m", "commit 0"]);
-        for index in 1..commits {
-            git_worktree(
-                &source,
-                &["commit", "--allow-empty", "-m", &format!("commit {index}")],
-            );
-        }
-        let remote = self.root.join(format!("{}.git", self.name));
-        run_git(["clone", "--bare", path(&source), path(&remote)]);
-        remote
-    }
-
     fn init(&self, remote: &Path, checkout: &Path, name: Option<&str>) -> Output {
         self.init_command(remote, checkout, name).output().unwrap()
     }
@@ -360,22 +292,6 @@ impl LiveFixture {
             .await
             .unwrap()
     }
-}
-
-fn assert_history_count(fixture: &LiveFixture, checkout: &Path, expected: usize) {
-    let log = fixture.ds(
-        checkout,
-        &[
-            "log",
-            "--no-graph",
-            "-r",
-            "root()..main@origin",
-            "-T",
-            "commit_id ++ \"\\n\"",
-        ],
-    );
-    assert!(log.status.success(), "{}", stderr(&log));
-    assert_eq!(stdout(&log).lines().count(), expected, "{}", stdout(&log));
 }
 
 fn assert_checkout_tracks_origin_head(fixture: &LiveFixture, checkout: &Path) {
@@ -428,35 +344,6 @@ fn git_worktree(worktree: &Path, args: &[&str]) {
 fn run_git<const N: usize>(args: [&str; N]) {
     let output = Command::new("git").args(args).output().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
-}
-
-fn assert_no_private_objects(remote: &Path, sentinel: &[u8]) {
-    let objects = Command::new("git")
-        .args([
-            "--git-dir",
-            remote.to_str().unwrap(),
-            "cat-file",
-            "--batch-all-objects",
-            "--batch-check=%(objectname) %(objecttype)",
-        ])
-        .output()
-        .unwrap();
-    assert!(objects.status.success(), "{}", stderr(&objects));
-    for line in stdout(&objects).lines() {
-        let (id, _) = line.split_once(' ').unwrap();
-        let output = Command::new("git")
-            .args(["--git-dir", remote.to_str().unwrap(), "cat-file", "-p", id])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert!(!contains_bytes(&output.stdout, sentinel));
-    }
-}
-
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
 }
 
 fn path(path: &Path) -> &str {

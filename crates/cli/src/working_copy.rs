@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use devspace_machine::DSPRIVATE;
 use jj_lib::commit::Commit;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::{Matcher, UnionMatcher, Visit, VisitDirs, VisitFiles};
@@ -23,7 +24,6 @@ use jj_lib::workspace::{
     default_working_copy_factory,
 };
 
-const DSPRIVATE: &str = ".dsprivate";
 pub(crate) const DEVSPACE_WORKING_COPY_TYPE: &str = "devspace-local";
 
 pub(crate) fn devspace_working_copy_factory() -> Box<dyn WorkingCopyFactory> {

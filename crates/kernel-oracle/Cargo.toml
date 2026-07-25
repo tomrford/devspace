@@ -16,3 +16,6 @@ tempfile.workspace = true
 [[bin]]
 name = "kernel-oracle"
 path = "src/main.rs"
+
+[lints]
+workspace = true

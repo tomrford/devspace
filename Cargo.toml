@@ -1,5 +1,12 @@
 [workspace]
-members = ["crates/cli", "crates/kernel", "crates/kernel-oracle", "crates/kernel-wasm", "crates/machine"]
+members = [
+    "crates/cli",
+    "crates/kernel",
+    "crates/kernel-oracle",
+    "crates/kernel-wasm",
+    "crates/machine",
+    "crates/testutils",
+]
 resolver = "2"
 
 [workspace.package]
@@ -24,8 +31,41 @@ serde_json = "1"
 tempfile = "=3.27.0"
 thiserror = "=2.0.18"
 toml = "=1.1.2"
-tracing = "=0.1.44"
 rustix = { version = "=1.1.4", features = ["event", "fs", "net", "process"] }
+
+# Adopted verbatim from jj 0.42.0 so the next bump can diff the two tables.
+[workspace.lints.clippy]
+borrow_as_ptr = "warn"
+cast_lossless = "warn"
+cloned_instead_of_copied = "warn"
+elidable_lifetime_names = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+flat_map_option = "warn"
+format_collect = "warn"
+format_push_string = "warn"
+implicit_clone = "warn"
+manual_let_else = "warn"
+needless_for_each = "warn"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+ref_as_ptr = "warn"
+ref_option = "warn"
+semicolon_if_nothing_returned = "warn"
+single_char_pattern = "warn"
+stable_sort_primitive = "warn"
+uninlined_format_args = "warn"
+unnecessary_literal_bound = "warn"
+unnecessary_semicolon = "warn"
+unnested_or_patterns = "warn"
+unused_trait_names = "warn"
+use_self = "warn"
+useless_conversion = "warn"
+while_let_loop = "warn"
+
+[workspace.lints.rust]
+let_underscore_drop = "warn"
+redundant_imports = "warn"
 
 [profile.release]
 codegen-units = 1

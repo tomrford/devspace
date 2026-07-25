@@ -1,21 +1,12 @@
 import { expect, it } from "vitest";
-import gitKernelModule from "../dist/kernel.wasm";
 import gitGolden from "../crates/kernel/tests/git_golden.txt?raw";
 import gitGoldenOracle from "../crates/kernel/tests/git_golden_oracle.txt?raw";
 import opsGolden from "../crates/kernel/tests/ops_golden.txt?raw";
-import { Kernel, OP_REFERENCE_KIND } from "../src/kernel";
-
-interface GitKernelExports extends WebAssembly.Exports {
-  memory: WebAssembly.Memory;
-  kernel_alloc(length: number): number;
-  kernel_dealloc(pointer: number, length: number): void;
-  kernel_validate(kind: number, pointer: number, length: number): bigint;
-}
-
-const kindByName = { blob: 0, tree: 1, commit: 2 } as const;
+import { GIT_OBJECT_KIND, Kernel, OP_REFERENCE_KIND, gitToHex } from "../src/kernel";
+import { hexBytes } from "../src/validation";
 
 it("matches native Git IDs and acceptance for all 40 vectors through Wasm", () => {
-  const exports = new WebAssembly.Instance(gitKernelModule, {}).exports as GitKernelExports;
+  const kernel = new Kernel();
   const lines = `${gitGolden}\n${gitGoldenOracle}`
     .split("\n")
     .filter((line) => line !== "" && !line.startsWith("#"));
@@ -23,13 +14,10 @@ it("matches native Git IDs and acceptance for all 40 vectors through Wasm", () =
 
   for (const line of lines) {
     const [kindName, expectedId, payloadHex] = line.split("|");
-    if (!(kindName in kindByName)) throw new Error(`unknown Git object kind ${kindName}`);
-    const result = validate(
-      exports,
-      kindByName[kindName as keyof typeof kindByName],
-      decodeHex(payloadHex),
-    );
-    expect(encodeHex(result), `${kindName} ID`).toBe(expectedId);
+    if (!(kindName in GIT_OBJECT_KIND)) throw new Error(`unknown Git object kind ${kindName}`);
+    const kind = GIT_OBJECT_KIND[kindName as keyof typeof GIT_OBJECT_KIND];
+    const validated = kernel.validate(kind, hexBytes(payloadHex));
+    expect(gitToHex(validated.id), `${kindName} ID`).toBe(expectedId);
   }
 });
 
@@ -49,7 +37,7 @@ it("matches ported operation IDs and enforces 20-byte Git view references throug
           ? kernel.validateOperation(bytes)
           : undefined;
     if (validated === undefined) throw new Error(`unknown operation-store kind ${kind}`);
-    expect(encodeHex(validated.id)).toBe(expectedId);
+    expect(gitToHex(validated.id)).toBe(expectedId);
   }
 
   const view = new Uint8Array([
@@ -85,51 +73,20 @@ it("rejects swapped and duplicate tree entries through Wasm", () => {
   ).toThrow("duplicates an earlier name");
 });
 
-function validate(exports: GitKernelExports, kind: number, bytes: Uint8Array): Uint8Array {
-  const inputPointer = exports.kernel_alloc(bytes.byteLength);
-  try {
-    new Uint8Array(exports.memory.buffer, inputPointer, bytes.byteLength).set(bytes);
-    const packed = exports.kernel_validate(kind, inputPointer, bytes.byteLength);
-    const outputPointer = Number(packed & 0xffff_ffffn);
-    const outputLength = Number(packed >> 32n);
-    try {
-      const output = new Uint8Array(
-        exports.memory.buffer,
-        outputPointer,
-        outputLength,
-      ).slice();
-      if (output[0] === 1) {
-        throw new Error(new TextDecoder().decode(output.subarray(1)));
-      }
-      if (output[0] !== 0 || output.byteLength < 25) {
-        throw new Error("Git validation kernel returned a malformed response");
-      }
-      const referenceCount = new DataView(output.buffer, output.byteOffset + 21, 4).getUint32(
-        0,
-        true,
-      );
-      if (output.byteLength !== 25 + referenceCount * 21) {
-        throw new Error("Git validation kernel returned malformed references");
-      }
-      return output.slice(1, 21);
-    } finally {
-      exports.kernel_dealloc(outputPointer, outputLength);
-    }
-  } finally {
-    exports.kernel_dealloc(inputPointer, bytes.byteLength);
-  }
-}
+it("stays usable after a trap, so one poisoned request cannot wedge the object", () => {
+  const kernel = new Kernel();
+  const payload = treeEntry("100644", "a", 0x11);
+  const expected = kernel.validate(1, payload);
 
-function decodeHex(value: string): Uint8Array {
-  if (value.length % 2 !== 0) throw new Error("odd-length hex payload");
-  return Uint8Array.from({ length: value.length / 2 }, (_, index) =>
-    Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
-  );
-}
+  expect(() =>
+    kernel.contained(() => {
+      throw new WebAssembly.RuntimeError("unreachable");
+    }),
+  ).toThrow(WebAssembly.RuntimeError);
 
-function encodeHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
+  expect(kernel.validate(1, payload)).toEqual(expected);
+  expect(kernel.hash([payload])).toEqual(new Kernel().hash([payload]));
+});
 
 function decodeRle(value: string): Uint8Array {
   return Uint8Array.from(

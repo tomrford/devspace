@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use crate::{Oid, hex};
+use crate::{Oid, encode_lower_hex};
 
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const MAX_OBSERVATION_BYTES: usize = 1024 * 1024;
@@ -457,7 +457,9 @@ fn push_command(
     ];
     let mut safe = os_strings(&args);
     for (reference, update) in updates {
-        let expected = update.expected_old_oid.map_or_else(String::new, oid_hex);
+        let expected = update
+            .expected_old_oid
+            .map_or_else(String::new, |oid| encode_lower_hex(&oid.0));
         let lease = format!("--force-with-lease={reference}:{expected}");
         args.push(lease.clone().into());
         safe.push(lease);
@@ -469,7 +471,7 @@ fn push_command(
     for (reference, update) in updates {
         let refspec = update.new_oid.map_or_else(
             || format!(":{reference}"),
-            |oid| format!("{}:{reference}", oid_hex(oid)),
+            |oid| format!("{}:{reference}", encode_lower_hex(&oid.0)),
         );
         args.push(refspec.clone().into());
         safe.push(refspec);
@@ -607,10 +609,6 @@ fn os_strings(values: &[OsString]) -> Vec<String> {
         .map(|value| value.to_string_lossy().into_owned())
         .collect()
 }
-fn oid_hex(oid: Oid) -> String {
-    hex(&oid.0)
-}
-
 fn command_environment(environment: &GitProcessEnvironment) -> BTreeMap<OsString, OsString> {
     let mut values = environment.extra.clone();
     values.insert("LC_ALL".into(), "C".into());
