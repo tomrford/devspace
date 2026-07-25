@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use blake2::{Blake2b512, Digest as _};
 use devspace_kernel::{ValidationError, validate};
@@ -80,14 +80,7 @@ pub fn build_packs(
     options: PackOptions,
 ) -> Result<BuiltPacks, PackBuildError> {
     options.validate()?;
-    let mut source_objects = closure.objects.iter().collect::<Vec<_>>();
-    source_objects.sort_unstable_by_key(|object| object.key);
-    if let Some(pair) = source_objects
-        .windows(2)
-        .find(|pair| pair[0].key == pair[1].key)
-    {
-        return Err(PackBuildError::DuplicateObject(pair[0].key));
-    }
+    let mut source_objects = dependency_order(&closure.objects)?;
     let skipped_known_objects = source_objects
         .iter()
         .filter(|object| known_objects.contains(&object.key))
@@ -149,6 +142,58 @@ pub fn build_packs(
     })
 }
 
+fn dependency_order(
+    objects: &[crate::MachineObject],
+) -> Result<Vec<&crate::MachineObject>, PackBuildError> {
+    let mut by_key = BTreeMap::new();
+    for object in objects {
+        if by_key.insert(object.key, object).is_some() {
+            return Err(PackBuildError::DuplicateObject(object.key));
+        }
+    }
+
+    let mut remaining_dependencies = BTreeMap::new();
+    let mut dependents = BTreeMap::<ObjectKey, Vec<ObjectKey>>::new();
+    for object in by_key.values() {
+        for dependency in &object.dependencies {
+            if !by_key.contains_key(dependency) {
+                return Err(PackBuildError::MissingDependency {
+                    source_key: object.key,
+                    target: *dependency,
+                });
+            }
+            dependents.entry(*dependency).or_default().push(object.key);
+        }
+        remaining_dependencies.insert(object.key, object.dependencies.len());
+    }
+
+    let mut ready = remaining_dependencies
+        .iter()
+        .filter_map(|(key, count)| (*count == 0).then_some(*key))
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(by_key.len());
+    while let Some(key) = ready.pop_first() {
+        ordered.push(
+            by_key
+                .remove(&key)
+                .expect("ready objects must remain in the closure"),
+        );
+        for dependent in dependents.get(&key).into_iter().flatten() {
+            let count = remaining_dependencies
+                .get_mut(dependent)
+                .expect("closure dependencies must have a count");
+            *count -= 1;
+            if *count == 0 {
+                ready.insert(*dependent);
+            }
+        }
+    }
+    if !by_key.is_empty() {
+        return Err(PackBuildError::DependencyCycle);
+    }
+    Ok(ordered)
+}
+
 struct PackBuilder {
     options: PackOptions,
     length: u64,
@@ -181,7 +226,8 @@ impl PackBuilder {
         self.objects.push((key, bytes));
     }
 
-    fn finish(self, head_commits: &[Oid]) -> Result<BuiltPack, PackBuildError> {
+    fn finish(mut self, head_commits: &[Oid]) -> Result<BuiltPack, PackBuildError> {
+        self.objects.sort_unstable_by_key(|(key, _)| *key);
         let mut data = Vec::with_capacity(self.length as usize);
         let mut entries = Vec::with_capacity(self.objects.len());
         for (key, bytes) in self.objects {
@@ -249,6 +295,13 @@ pub enum PackBuildError {
     TooManyHeads(usize),
     #[error("object closure contains duplicate {0:?}")]
     DuplicateObject(ObjectKey),
+    #[error("object {source_key:?} references {target:?} outside its closure")]
+    MissingDependency {
+        source_key: ObjectKey,
+        target: ObjectKey,
+    },
+    #[error("object closure contains a dependency cycle")]
+    DependencyCycle,
     #[error("object {key:?} changed length from {discovered} to {actual}")]
     ObjectLengthChanged {
         key: ObjectKey,

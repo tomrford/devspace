@@ -18,6 +18,7 @@ pub struct ObjectKey {
 pub struct MachineObject {
     pub key: ObjectKey,
     pub length: u64,
+    pub(crate) dependencies: Vec<ObjectKey>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,23 +61,24 @@ impl MachineGitRepository {
                     actual: hex(&validated.id.0),
                 });
             }
+            let mut dependencies = Vec::new();
             for reference in validated.references {
-                let kind = match reference.kind {
-                    ReferenceKind::Blob | ReferenceKind::Executable | ReferenceKind::Symlink => {
-                        ObjectKind::Blob
-                    }
-                    ReferenceKind::Tree => ObjectKind::Tree,
-                    ReferenceKind::Commit => ObjectKind::Commit,
-                    ReferenceKind::Gitlink => continue,
+                let Some(kind) = reference_kind(reference.kind) else {
+                    continue;
                 };
-                pending.insert(ObjectKey {
+                let dependency = ObjectKey {
                     kind,
                     id: reference.id,
-                });
+                };
+                pending.insert(dependency);
+                dependencies.push(dependency);
             }
+            dependencies.sort_unstable();
+            dependencies.dedup();
             objects.push(MachineObject {
                 key,
                 length: bytes.len() as u64,
+                dependencies,
             });
         }
         objects.sort_unstable_by_key(|object| object.key);
@@ -115,6 +117,17 @@ impl MachineGitRepository {
             });
         }
         Ok(object.data.clone())
+    }
+}
+
+fn reference_kind(kind: ReferenceKind) -> Option<ObjectKind> {
+    match kind {
+        ReferenceKind::Blob | ReferenceKind::Executable | ReferenceKind::Symlink => {
+            Some(ObjectKind::Blob)
+        }
+        ReferenceKind::Tree => Some(ObjectKind::Tree),
+        ReferenceKind::Commit => Some(ObjectKind::Commit),
+        ReferenceKind::Gitlink => None,
     }
 }
 

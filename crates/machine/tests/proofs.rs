@@ -5,8 +5,8 @@ use std::process::Command;
 use blake2::{Blake2b512, Digest as _};
 use devspace_kernel::{ObjectKind, Oid, validate};
 use devspace_machine::{
-    GitHttpTransport, GitInstallReceipt, GitUploadReceipt, MachineGitRepository, ObjectKey,
-    PackInstallError, PackOptions, build_packs,
+    GitHttpTransport, GitInstallReceipt, GitUploadReceipt, MIN_PACK_BYTES, MachineGitRepository,
+    ObjectKey, PackInstallError, PackOptions, build_packs,
 };
 use futures::executor::block_on;
 use gix::objs::{Kind as GitObjectKind, Write as _};
@@ -152,6 +152,76 @@ fn deterministic_pack_rebuilds_exact_objects_and_semantics_without_extras() {
         &closure,
         foreign_commit,
     ));
+}
+
+#[test]
+fn forced_split_packs_install_in_dependency_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = block_on(MachineGitRepository::init(
+        temp.path().join("source"),
+        &settings(),
+    ))
+    .unwrap();
+    let fixture = write_adverse_dependency_chain(&source);
+    assert!(fixture.middle_tree < fixture.leaf_tree);
+    assert!(fixture.child_commit < fixture.parent_commit);
+
+    let closure = source.object_closure([fixture.child_commit]).unwrap();
+    let options = PackOptions {
+        pack_objects: 1,
+        ..PackOptions::default()
+    };
+    let first = build_packs(&source, &closure, &BTreeSet::new(), options).unwrap();
+    let second = build_packs(&source, &closure, &BTreeSet::new(), options).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.packs.len(), closure.objects.len());
+
+    let destination = block_on(MachineGitRepository::init(
+        temp.path().join("destination"),
+        &settings(),
+    ))
+    .unwrap();
+    for pack in &first.packs {
+        let installed = destination
+            .install_pack(pack.id, &pack.manifest_bytes, &pack.chunks)
+            .unwrap();
+        assert_eq!(installed.inserted_objects, 1);
+        assert_eq!(installed.existing_objects, 0);
+    }
+    assert_eq!(
+        destination.object_closure([fixture.child_commit]).unwrap(),
+        closure
+    );
+
+    let size_options = PackOptions {
+        pack_bytes: MIN_PACK_BYTES,
+        ..PackOptions::default()
+    };
+    let first = build_packs(&source, &closure, &BTreeSet::new(), size_options).unwrap();
+    let second = build_packs(&source, &closure, &BTreeSet::new(), size_options).unwrap();
+    assert_eq!(first, second);
+    assert!(first.packs.len() > 1);
+
+    let destination = block_on(MachineGitRepository::init(
+        temp.path().join("size-destination"),
+        &settings(),
+    ))
+    .unwrap();
+    let inserted_objects = first
+        .packs
+        .iter()
+        .map(|pack| {
+            destination
+                .install_pack(pack.id, &pack.manifest_bytes, &pack.chunks)
+                .unwrap()
+                .inserted_objects
+        })
+        .sum::<usize>();
+    assert_eq!(inserted_objects, closure.objects.len());
+    assert_eq!(
+        destination.object_closure([fixture.child_commit]).unwrap(),
+        closure
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -532,6 +602,71 @@ fn write_foreign_commit(repository: &MachineGitRepository, contents: &[u8]) -> O
     let tree = write_raw(repository, ObjectKind::Tree, &tree);
     let commit = format!(
         "tree {}\nauthor Foreign <foreign@example.invalid> 1700000000 +0000\ncommitter Foreign <foreign@example.invalid> 1700000000 +0000\n\nforeign commit\n",
+        oid_hex(tree)
+    );
+    write_raw(repository, ObjectKind::Commit, commit.as_bytes())
+}
+
+struct AdverseDependencyChain {
+    leaf_tree: Oid,
+    middle_tree: Oid,
+    parent_commit: Oid,
+    child_commit: Oid,
+}
+
+fn write_adverse_dependency_chain(repository: &MachineGitRepository) -> AdverseDependencyChain {
+    let first_blob = write_raw(repository, ObjectKind::Blob, &vec![b'a'; 600 * 1024]);
+    let second_blob = write_raw(repository, ObjectKind::Blob, &vec![b'b'; 600 * 1024]);
+    let mut leaf_tree = b"100644 first.bin\0".to_vec();
+    leaf_tree.extend_from_slice(&first_blob.0);
+    leaf_tree.extend_from_slice(b"100644 second.bin\0");
+    leaf_tree.extend_from_slice(&second_blob.0);
+    let leaf_tree = write_raw(repository, ObjectKind::Tree, &leaf_tree);
+    let middle_tree = (0..1024)
+        .find_map(|nonce| {
+            let tree =
+                write_tree_entry(repository, "40000", &format!("leaf-{nonce:04}"), leaf_tree);
+            (tree < leaf_tree).then_some(tree)
+        })
+        .expect("a bounded nonce search should produce adverse tree OID ordering");
+    let root_tree = write_tree_entry(repository, "40000", "middle", middle_tree);
+    let parent_commit = write_commit(repository, root_tree, None, "parent");
+    let child_commit = (0..1024)
+        .find_map(|nonce| {
+            let commit = write_commit(
+                repository,
+                root_tree,
+                Some(parent_commit),
+                &format!("child {nonce:04}"),
+            );
+            (commit < parent_commit).then_some(commit)
+        })
+        .expect("a bounded nonce search should produce adverse commit OID ordering");
+    AdverseDependencyChain {
+        leaf_tree,
+        middle_tree,
+        parent_commit,
+        child_commit,
+    }
+}
+
+fn write_tree_entry(repository: &MachineGitRepository, mode: &str, name: &str, target: Oid) -> Oid {
+    let mut tree = format!("{mode} {name}\0").into_bytes();
+    tree.extend_from_slice(&target.0);
+    write_raw(repository, ObjectKind::Tree, &tree)
+}
+
+fn write_commit(
+    repository: &MachineGitRepository,
+    tree: Oid,
+    parent: Option<Oid>,
+    message: &str,
+) -> Oid {
+    let parent = parent
+        .map(|parent| format!("parent {}\n", oid_hex(parent)))
+        .unwrap_or_default();
+    let commit = format!(
+        "tree {}\n{parent}author Foreign <foreign@example.invalid> 1700000000 +0000\ncommitter Foreign <foreign@example.invalid> 1700000000 +0000\n\n{message}\n",
         oid_hex(tree)
     );
     write_raw(repository, ObjectKind::Commit, commit.as_bytes())
