@@ -1,6 +1,8 @@
+import { z } from "zod";
 import { canonicalHeadTransactionBytes, decodeHeadTransaction } from "./op_protocol";
 import {
   Kernel,
+  KernelValidationError,
   OP_REFERENCE_KIND,
   equalGitBytes,
   exactGitBuffer,
@@ -66,10 +68,18 @@ export class OpGitStore {
         throw new OpStoreError(`operation-store object exceeds ${MAX_OP_OBJECT_BYTES} byte limit`);
       }
       const id = decodeId(idValue, "operation-store object ID");
-      const validated =
-        kindName === "view"
-          ? this.kernel.validateView(bytes)
-          : this.kernel.validateOperation(bytes);
+      let validated;
+      try {
+        validated =
+          kindName === "view"
+            ? this.kernel.validateView(bytes)
+            : this.kernel.validateOperation(bytes);
+      } catch (error) {
+        if (error instanceof KernelValidationError) {
+          throw new OpStoreError(error.message);
+        }
+        throw error;
+      }
       if (!equalGitBytes(id, validated.id)) {
         throw new OpStoreError("operation-store object ID does not match canonical bytes");
       }
@@ -459,12 +469,23 @@ export class OpGitStore {
 
   private failure(error: unknown) {
     if (error instanceof WebAssembly.RuntimeError) this.kernel.reset();
-    return {
-      ok: false as const,
-      status: error instanceof OpStoreError ? error.status : 400,
-      error: error instanceof Error ? error.message : "operation-store request failed",
-      code: error instanceof OpStoreError ? error.code : "invalid-op-request",
-    };
+    if (error instanceof OpStoreError) {
+      return {
+        ok: false as const,
+        status: error.status,
+        error: error.message,
+        code: error.code,
+      };
+    }
+    if (error instanceof z.ZodError) {
+      return {
+        ok: false as const,
+        status: 400,
+        error: error.message,
+        code: "invalid-op-request",
+      };
+    }
+    throw error;
   }
 }
 

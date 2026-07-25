@@ -95,7 +95,7 @@ export class ControlPlane extends DurableObject<Env> {
     try {
       identity = decodeIdentity(identityValue);
     } catch (error) {
-      return failure(error, 400);
+      return validationFailure(error);
     }
     const repositoryId = repositoryIdSchema.safeParse(repositoryIdValue);
     if (!repositoryId.success) {
@@ -105,7 +105,7 @@ export class ControlPlane extends DurableObject<Env> {
     try {
       incarnation = requireIncarnation(incarnationValue);
     } catch (error) {
-      return failure(error, 400);
+      return validationFailure(error);
     }
     const repository = this.repositoryById(identity.userId, repositoryId.data);
     if (
@@ -131,7 +131,7 @@ export class ControlPlane extends DurableObject<Env> {
     try {
       authority = decodeRepositoryAuthority(authorityValue);
     } catch (error) {
-      return failure(error, 400);
+      return validationFailure(error);
     }
     const repository = this.repositoryById(authority.userId, authority.repositoryId);
     if (
@@ -152,7 +152,7 @@ export class ControlPlane extends DurableObject<Env> {
       identity = decodeIdentity(identityValue);
       request = decodeCreateRepository(value);
     } catch (error) {
-      return failure(error, 400);
+      return validationFailure(error);
     }
 
     const retiring = this.ctx.storage.transactionSync(() => {
@@ -318,7 +318,7 @@ export class ControlPlane extends DurableObject<Env> {
       identity = decodeIdentity(identityValue);
       name = requireRepositoryName(nameValue);
     } catch (error) {
-      return failure(error, 400);
+      return validationFailure(error);
     }
     const repository = this.ctx.storage.sql
       .exec<RepositoryRow>(
@@ -344,7 +344,7 @@ export class ControlPlane extends DurableObject<Env> {
     try {
       identity = decodeIdentity(identityValue);
     } catch (error) {
-      return failure(error, 400);
+      return validationFailure(error);
     }
     const repositories = this.ctx.storage.sql
       .exec<RepositoryRow>(
@@ -370,7 +370,7 @@ export class ControlPlane extends DurableObject<Env> {
       oldName = requireRepositoryName(oldNameValue);
       request = renameRepositorySchema.parse(value);
     } catch (error) {
-      return failure(error, 400);
+      return validationFailure(error);
     }
     try {
       return this.ctx.storage.transactionSync(() => {
@@ -447,7 +447,7 @@ export class ControlPlane extends DurableObject<Env> {
       identity = decodeIdentity(identityValue);
       repositoryId = requireRepositoryId(repositoryIdValue);
     } catch (error) {
-      return failure(error, 400);
+      return validationFailure(error);
     }
     try {
       return this.ctx.storage.transactionSync(() => {
@@ -479,7 +479,7 @@ export class ControlPlane extends DurableObject<Env> {
       name = requireRepositoryName(nameValue);
       request = decodeDeleteRepository(value);
     } catch (error) {
-      return failure(error, 400);
+      return validationFailure(error);
     }
     let status: string;
     try {
@@ -651,6 +651,11 @@ function randomHex(bytes: number): string {
 
 function expectedFailure(error: unknown) {
   if (error instanceof ControlPlaneError) return failure(error, error.status);
+  throw error;
+}
+
+function validationFailure(error: unknown) {
+  if (error instanceof z.ZodError) return failure(error, 400);
   throw error;
 }
 

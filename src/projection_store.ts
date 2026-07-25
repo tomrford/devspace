@@ -8,6 +8,7 @@ import {
   ProjectionGitObservation,
   ProjectionGitProtocolError,
   ProjectionGitState,
+  ProjectionGitValidationError,
   RecordGitFetchRequest,
   canonicalGitFetchBytes,
   canonicalProjectionGitBatchBytes,
@@ -287,7 +288,7 @@ export class ProjectionGitStore {
       batchId = exactGitBuffer(decodeProjectionGitShortId(batchIdValue, "batchId"));
       incarnation = exactGitBuffer(decodeProjectionGitShortId(incarnationValue, "incarnation"));
     } catch (error) {
-      return failure(error, 400);
+      return requestFailure(error);
     }
     try {
       this.requireIncarnation(incarnation);
@@ -349,10 +350,10 @@ export class ProjectionGitStore {
     }
     const incarnation = exactGitBuffer(request.incarnation);
     const batchId = exactGitBuffer(request.batchId);
-    const requestHash = exactGitBuffer(
-      this.kernel.hash([canonicalProjectionGitBatchBytes(request)]),
-    );
     try {
+      const requestHash = exactGitBuffer(
+        this.kernel.hash([canonicalProjectionGitBatchBytes(request)]),
+      );
       return this.ctx.storage.transactionSync(() => {
         this.requireIncarnation(incarnation);
         const result = this.batchResult(batchId);
@@ -462,9 +463,9 @@ export class ProjectionGitStore {
     }
     const incarnation = exactGitBuffer(request.incarnation);
     const fetchId = exactGitBuffer(request.fetchId);
-    const requestHash = exactGitBuffer(this.kernel.hash([canonicalGitFetchBytes(request)]));
     const nowMs = Date.now();
     try {
+      const requestHash = exactGitBuffer(this.kernel.hash([canonicalGitFetchBytes(request)]));
       this.ctx.storage.transactionSync(() => {
         this.requireIncarnation(incarnation, "repository-incarnation-mismatch");
         this.pruneExpiredFetchResults(nowMs - REPLAY_RETENTION_MS);
@@ -1456,6 +1457,8 @@ export class ProjectionGitStore {
   private handleExpected(error: unknown) {
     if (error instanceof WebAssembly.RuntimeError) this.kernel.reset();
     if (error instanceof ProjectionGitStoreError) return failure(error, error.status);
+    if (error instanceof ProjectionGitProtocolError) return failure(error, 400, error.code);
+    if (error instanceof ProjectionGitValidationError) return failure(error, 400);
     throw error;
   }
 }
@@ -1523,6 +1526,13 @@ function defaultProjectionGitErrorCode(status: number): string {
 }
 
 function requestFailure(error: unknown, code?: string) {
+  if (
+    !(error instanceof ProjectionGitStoreError) &&
+    !(error instanceof ProjectionGitProtocolError) &&
+    !(error instanceof ProjectionGitValidationError)
+  ) {
+    throw error;
+  }
   return failure(
     error,
     error instanceof ProjectionGitStoreError ? error.status : 400,
@@ -1534,7 +1544,7 @@ function requestFailure(error: unknown, code?: string) {
 
 function remoteRequestFailure(error: unknown) {
   if (error instanceof RemoteProtocolError) return failure(error, 400, error.code);
-  return failure(error, 400, "invalid-remote-request");
+  throw error;
 }
 
 function requireAuthenticatedMachine(

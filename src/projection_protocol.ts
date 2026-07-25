@@ -124,6 +124,8 @@ export class ProjectionGitProtocolError extends Error {
   }
 }
 
+export class ProjectionGitValidationError extends Error {}
+
 export function decodeBeginProjectionGitBatch(value: unknown): BeginProjectionGitBatchRequest {
   const request = parseProjectionGit(beginProjectionGitBatchSchema, value);
   for (const [index, update] of request.updates.entries()) {
@@ -145,20 +147,26 @@ export function decodeRecordGitFetch(value: unknown): RecordGitFetchRequest {
       requireRewrittenState(state, `refs[${index}].states[${stateIndex}]`);
     }
     if (ref.proposedState !== null && ref.proposedState >= ref.states.length) {
-      throw new Error(`refs[${index}].proposedState is outside states`);
+      throw new ProjectionGitValidationError(`refs[${index}].proposedState is outside states`);
     }
     if (
       ref.proposedState !== null &&
       compareGitBytes(ref.states[ref.proposedState].publicOid, ref.observedPublicOid) !== 0
     ) {
-      throw new Error(`refs[${index}].proposedState must map the observed public OID`);
+      throw new ProjectionGitValidationError(
+        `refs[${index}].proposedState must map the observed public OID`,
+      );
     }
     if (ref.identityOid !== null) {
       if (ref.proposedState !== null || ref.states.length !== 0) {
-        throw new Error(`refs[${index}].identityOid requires no states or proposedState`);
+        throw new ProjectionGitValidationError(
+          `refs[${index}].identityOid requires no states or proposedState`,
+        );
       }
       if (compareGitBytes(ref.identityOid, ref.observedPublicOid) !== 0) {
-        throw new Error(`refs[${index}].identityOid must equal the observed public OID`);
+        throw new ProjectionGitValidationError(
+          `refs[${index}].identityOid must equal the observed public OID`,
+        );
       }
     }
   }
@@ -180,7 +188,9 @@ export function decodeRecoverProjectionGitBatch(value: unknown): RecoverProjecti
 }
 
 export function decodeProjectionGitShortId(value: unknown, label: string): Uint8Array {
-  return shortIdSchema(label).parse(value);
+  const result = shortIdSchema(label).safeParse(value);
+  if (result.success) return result.data;
+  throw new ProjectionGitValidationError(firstZodMessage(result.error));
 }
 
 export function canonicalProjectionGitBatchBytes(
@@ -242,25 +252,33 @@ function parseProjectionGit<T>(schema: z.ZodType<T>, value: unknown): T {
       "invalid-hidden-set-id",
     );
   }
-  throw new Error(firstZodMessage(result.error));
+  throw new ProjectionGitValidationError(firstZodMessage(result.error));
 }
 
 function validateUpdate(update: ProjectionGitUpdate, index: number) {
   if (update.proposedState !== null && update.proposedState >= update.states.length) {
-    throw new Error(`updates[${index}].proposedState is outside states`);
+    throw new ProjectionGitValidationError(
+      `updates[${index}].proposedState is outside states`,
+    );
   }
   if (update.identityOid !== null) {
     if (update.proposedState !== null || update.states.length !== 0) {
-      throw new Error(`updates[${index}].identityOid requires no states or proposedState`);
+      throw new ProjectionGitValidationError(
+        `updates[${index}].identityOid requires no states or proposedState`,
+      );
     }
   } else if (update.proposedState === null && update.states.length !== 0) {
-    throw new Error(`updates[${index}].states must be empty without a proposed state`);
+    throw new ProjectionGitValidationError(
+      `updates[${index}].states must be empty without a proposed state`,
+    );
   }
   const stateKeys = update.states
     .map((state) => `${gitToHex(state.canonicalOid)}:${gitToHex(state.publicOid)}`)
     .sort();
   if (stateKeys.some((key, stateIndex) => stateIndex > 0 && key === stateKeys[stateIndex - 1])) {
-    throw new Error(`updates[${index}].states must not contain duplicate mappings`);
+    throw new ProjectionGitValidationError(
+      `updates[${index}].states must not contain duplicate mappings`,
+    );
   }
 }
 
@@ -276,7 +294,9 @@ function requireRewrittenState(state: ProjectionGitState, field: string) {
 function requireStateLimit(values: Array<{ states: ProjectionGitState[] }>, field: string) {
   const count = values.reduce((total, value) => total + value.states.length, 0);
   if (count > MAX_GIT_PROJECTION_STATES) {
-    throw new Error(`${field} exceeds the ${MAX_GIT_PROJECTION_STATES}-state limit`);
+    throw new ProjectionGitValidationError(
+      `${field} exceeds the ${MAX_GIT_PROJECTION_STATES}-state limit`,
+    );
   }
 }
 
@@ -291,7 +311,7 @@ function encodeProjectionGitState(state: ProjectionGitState) {
 function requireUniqueNames(values: Array<{ bookmark: string }>, field: string) {
   for (let index = 1; index < values.length; index += 1) {
     if (values[index - 1].bookmark === values[index].bookmark) {
-      throw new Error(`${field} must not contain duplicate bookmarks`);
+      throw new ProjectionGitValidationError(`${field} must not contain duplicate bookmarks`);
     }
   }
 }

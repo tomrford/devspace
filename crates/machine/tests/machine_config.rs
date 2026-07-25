@@ -138,7 +138,19 @@ fn write_config_replaces_the_previous_contents() {
     store.write_config(&first).unwrap();
     store.write_config(&second).unwrap();
     assert_eq!(store.load_config().unwrap(), second);
-    assert!(format!("{second:?}").contains("second-sensitive-value"));
+}
+
+#[test]
+fn debug_output_redacts_shared_secrets_at_the_type_boundary() {
+    let secret_value = "secret-that-must-not-appear";
+    let secret = SharedSecret::new(secret_value).unwrap();
+    let secret_debug = format!("{secret:?}");
+    assert_eq!(secret_debug, "SharedSecret([REDACTED])");
+    assert!(!secret_debug.contains(secret_value));
+
+    let config_debug = format!("{:?}", config(secret_value));
+    assert!(config_debug.contains("shared_secret: SharedSecret([REDACTED])"));
+    assert!(!config_debug.contains(secret_value));
 }
 
 #[test]

@@ -133,7 +133,8 @@ View and operation IDs are 64-byte Blake2b values. The machine validates local
 objects before upload. The Worker validates them again before insertion.
 
 Inventory requests are bounded batches of `(kind, id)` keys. The Worker returns
-the missing keys; the machine uploads or downloads only those objects. Git
+the keys already present, and the machine computes which objects are missing
+and uploads only those objects. Git
 commit references in views must become durable through the Git-pack path
 before an operation head can advance.
 

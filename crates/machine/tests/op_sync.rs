@@ -57,6 +57,22 @@ struct FakeCloud {
 }
 
 impl OpSyncTransport for FakeCloud {
+    async fn download_git_objects(
+        &mut self,
+        _repository: &MachineGitRepository,
+        after: u64,
+    ) -> Result<u64, OpTransportError> {
+        Ok(after)
+    }
+
+    async fn upload_git_objects(
+        &mut self,
+        _repository: &MachineGitRepository,
+        _heads: &BTreeSet<devspace_machine::Oid>,
+    ) -> Result<(), OpTransportError> {
+        Ok(())
+    }
+
     async fn inventory_op_objects(
         &mut self,
         candidates: &[OpObjectKey],

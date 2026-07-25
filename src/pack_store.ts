@@ -2,6 +2,7 @@ import {
   GIT_OBJECT_KIND,
   GIT_REFERENCE_KIND,
   Kernel,
+  KernelValidationError,
   equalGitBytes,
   exactGitBuffer,
   gitHashFromHex,
@@ -610,10 +611,12 @@ export class GitPackStore {
     try {
       validated = this.kernel.validate(object.kind, bytes);
     } catch (error) {
-      if (error instanceof WebAssembly.RuntimeError) throw error;
-      throw new GitPackValidationError(
-        `object ${object.position} is invalid: ${error instanceof Error ? error.message : "validation failed"}`,
-      );
+      if (error instanceof KernelValidationError) {
+        throw new GitPackValidationError(
+          `object ${object.position} is invalid: ${error.message}`,
+        );
+      }
+      throw error;
     }
     if (!equalGitBytes(validated.id, new Uint8Array(object.id))) {
       throw new GitPackValidationError(`object ${object.position} ID does not match manifest`);

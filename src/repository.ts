@@ -23,10 +23,16 @@ interface AuthorityRow extends Record<string, SqlStorageValue> {
   retired: number;
 }
 
+interface RepositoryRetirement {
+  authority: RepositoryAuthority;
+  completion: Promise<void>;
+}
+
 export class Repository extends DurableObject<Env> {
   private readonly packs: GitPackStore;
   private readonly ops: OpGitStore;
   private readonly projection: ProjectionGitStore;
+  private retirement: RepositoryRetirement | undefined;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -87,10 +93,31 @@ export class Repository extends DurableObject<Env> {
   }
 
   async retireRepository(authority: RepositoryAuthority) {
+    const retirement = this.retirement;
+    if (retirement !== undefined) {
+      if (!sameRepositoryAuthority(retirement.authority, authority)) {
+        return authorityFailure(
+          new RepositoryAuthorityError(
+            "repository authority is stale",
+            "repository-authority-stale",
+          ),
+        );
+      }
+      await retirement.completion;
+      return { ok: true as const, retired: true };
+    }
+
     try {
       const state = this.authorityState();
       if (state !== undefined) this.requireAuthority(authority);
-      await this.ctx.storage.deleteAll();
+      const completion = this.ctx.storage.deleteAll();
+      this.retirement = { authority: { ...authority }, completion };
+      try {
+        await completion;
+      } catch (error) {
+        if (this.retirement?.completion === completion) this.retirement = undefined;
+        throw error;
+      }
       return { ok: true as const, retired: true };
     } catch (error) {
       return authorityFailure(error);
@@ -266,19 +293,31 @@ export class Repository extends DurableObject<Env> {
 }
 
 function authorityFailure(error: unknown) {
+  if (!(error instanceof RepositoryAuthorityError)) throw error;
   return {
     ok: false as const,
     status: 409,
-    error: error instanceof Error ? error.message : "repository authority is stale",
-    code:
-      error instanceof RepositoryAuthorityError
-        ? error.code
-        : "repository-authority-stale",
+    error: error.message,
+    code: error.code,
   };
 }
 
+function sameRepositoryAuthority(left: RepositoryAuthority, right: RepositoryAuthority): boolean {
+  return (
+    left.userId === right.userId &&
+    left.repositoryId === right.repositoryId &&
+    left.incarnation === right.incarnation &&
+    left.creationNonce === right.creationNonce
+  );
+}
+
 function incarnationBytes(value: string): Uint8Array {
-  if (!/^[0-9a-f]{32}$/.test(value)) throw new Error("repository authority is invalid");
+  if (!/^[0-9a-f]{32}$/.test(value)) {
+    throw new RepositoryAuthorityError(
+      "repository authority is stale",
+      "repository-authority-stale",
+    );
+  }
   return Uint8Array.from({ length: 16 }, (_, index) =>
     Number.parseInt(value.slice(index * 2, index * 2 + 2), 16),
   );

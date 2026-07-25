@@ -16,6 +16,19 @@ beforeAll(() => {
 });
 
 describe("Git projection journal v2", () => {
+  it("sanitizes unexpected projection storage failures", async () => {
+    const repository = "git-journal-storage-failure";
+    expect(await projectionSnapshot(repository)).toMatchObject({ status: 200 });
+    await runInDurableObject(await repositoryGitStub(repository), (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE projection_git_meta");
+    });
+
+    expect(await projectionSnapshot(repository)).toEqual({
+      status: 500,
+      body: { error: "Git repository storage failed" },
+    });
+  });
+
   it("rejects missing canonical and missing public commits at begin", async () => {
     const repository = "git-journal-durability";
     const [canonicalOid, publicOid] = await installJournalFixture(repository);

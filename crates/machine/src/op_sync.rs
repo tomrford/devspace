@@ -43,18 +43,14 @@ pub struct CloudOpHeads {
 pub trait OpSyncTransport {
     async fn download_git_objects(
         &mut self,
-        _repository: &MachineGitRepository,
+        repository: &MachineGitRepository,
         after: u64,
-    ) -> Result<u64, TransportError> {
-        Ok(after)
-    }
+    ) -> Result<u64, TransportError>;
     async fn upload_git_objects(
         &mut self,
-        _repository: &MachineGitRepository,
-        _heads: &BTreeSet<Oid>,
-    ) -> Result<(), TransportError> {
-        Ok(())
-    }
+        repository: &MachineGitRepository,
+        heads: &BTreeSet<Oid>,
+    ) -> Result<(), TransportError>;
     async fn inventory_op_objects(
         &mut self,
         candidates: &[OpObjectKey],

@@ -228,6 +228,28 @@ describe("Git v2 repository object store", () => {
     expect(await response.json()).toEqual({ error: "Git repository storage failed" });
   });
 
+  it("sanitizes unexpected repository authority storage failures as 500 responses", async () => {
+    const name = "git-authority-storage-failure";
+    expect(
+      await json(
+        await routeRequest(name, "git/objects/inventory", {
+          method: "POST",
+          body: JSON.stringify({ keys: [] }),
+        }),
+      ),
+    ).toEqual({ keys: [] });
+    await runInDurableObject(await repositoryGitStub(name), (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE repository_state");
+    });
+
+    const response = await routeRequest(name, "git/objects/inventory", {
+      method: "POST",
+      body: JSON.stringify({ keys: [] }),
+    });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "request failed" });
+  });
+
   it("rejects an incomplete closure, then installs it after the dependency arrives", async () => {
     const missing = decodedFixture(fixtures.missingReference);
     await putManifest("git-closure", missing);
@@ -272,6 +294,26 @@ describe("Git v2 repository object store", () => {
     expect(await stub.countObjectReferences()).toBe(0);
     expect(await stub.countInstalledPacks()).toBe(0);
     expect(await stub.countQuarantinedPacks()).toBe(1);
+  });
+
+  it("sanitizes unexpected Git kernel failures instead of classifying them as validation", async () => {
+    const name = "git-kernel-invariant";
+    const fixture = decodedFixture(fixtures.complete);
+    await putManifest(name, fixture);
+    await putChunk(name, fixture, 0);
+    const internalMessage = "injected malformed Git kernel response";
+    await runInDurableObject(await repositoryGitStub(name), (instance) => {
+      const repository = instance as unknown as {
+        packs: { kernel: { validate: () => never } };
+      };
+      repository.packs.kernel.validate = () => {
+        throw new Error(internalMessage);
+      };
+    });
+
+    const response = await install(name, fixture.id);
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "Git repository storage failed" });
   });
 
   it("enforces authentication, authority rechecks, identifiers and body bounds", async () => {
@@ -497,6 +539,29 @@ describe("Git v2 operation store and heads", () => {
       heads: [operation],
     });
     expect(await (await repositoryGitStub(name)).countOpObjects()).toBe(2);
+  });
+
+  it("keeps validation public but sanitizes unexpected operation storage failures", async () => {
+    const name = "git-ops-storage-failure";
+    const invalid = await routeRequest(name, "git/ops/inventory", {
+      method: "POST",
+      body: JSON.stringify({ keys: ["not-an-operation-key"] }),
+    });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toEqual({
+      error: "operation-store inventory key is invalid",
+      code: "invalid-op-request",
+    });
+
+    await runInDurableObject(await repositoryGitStub(name), (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE op_objects");
+    });
+    const response = await routeRequest(name, "git/ops/inventory", {
+      method: "POST",
+      body: JSON.stringify({ keys: [`v:${"01".repeat(64)}`] }),
+    });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "Git repository storage failed" });
   });
 });
 

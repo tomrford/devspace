@@ -39,6 +39,8 @@ export interface KernelResult {
   references: Array<{ kind: number; id: Uint8Array }>;
 }
 
+export class KernelValidationError extends Error {}
+
 export class Kernel {
   private exports: KernelExports;
 
@@ -162,7 +164,9 @@ function instantiate(): KernelExports {
 }
 
 function decodeKernelResult(bytes: Uint8Array): KernelResult {
-  if (bytes[0] === 1) throw new Error(new TextDecoder().decode(bytes.subarray(1)));
+  if (bytes[0] === 1) {
+    throw new KernelValidationError(new TextDecoder().decode(bytes.subarray(1)));
+  }
   if (bytes[0] !== 0 || bytes.byteLength < 25) {
     throw new Error("Git validation kernel returned a malformed response");
   }
@@ -183,7 +187,9 @@ function decodeKernelResult(bytes: Uint8Array): KernelResult {
 }
 
 function decodeOpKernelResult(bytes: Uint8Array): KernelResult {
-  if (bytes[0] === 1) throw new Error(new TextDecoder().decode(bytes.subarray(1)));
+  if (bytes[0] === 1) {
+    throw new KernelValidationError(new TextDecoder().decode(bytes.subarray(1)));
+  }
   if (bytes[0] !== 0 || bytes.byteLength < 69) {
     throw new Error("operation-store validation kernel returned a malformed response");
   }

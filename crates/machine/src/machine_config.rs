@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use thiserror::Error;
 
 use crate::machine_store::MachineStore;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SharedSecret(String);
 
@@ -26,6 +27,12 @@ impl SharedSecret {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Debug for SharedSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SharedSecret([REDACTED])")
     }
 }
 

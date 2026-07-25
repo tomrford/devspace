@@ -189,6 +189,19 @@ describe("cloud identity and repository directory", () => {
     });
   });
 
+  it("sanitizes unexpected control-plane storage failures", async () => {
+    const machineId = "37".repeat(16);
+    const control = env.CONTROL_PLANE.getByName("directory");
+    await runInDurableObject(control, (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE repositories");
+    });
+
+    const response = await apiRequest(machineId, "/repositories");
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "request failed" });
+    await evictDurableObject(control);
+  });
+
   it("replays lost create responses and rejects idempotency-key reuse", async () => {
     const machineId = "41".repeat(16);
     const idempotencyKey = "41".repeat(16);
@@ -336,6 +349,80 @@ describe("cloud identity and repository directory", () => {
         new Uint8Array(),
       ),
     ).toMatchObject({ ok: false, status: 409, code: "repository-authority-stale" });
+  });
+
+  it("retries retirement after deletion succeeds but control-plane finalization fails", async () => {
+    const userId = env.DEVSPACE_DEVELOPMENT_USER_ID;
+    const machineId = "43".repeat(16);
+    const repository = await createRepository(
+      machineId,
+      "retirement-lost-response",
+      "43".repeat(16),
+    );
+    const control = env.CONTROL_PLANE.getByName("directory");
+    const authorized = await control.authorizeRepository(
+      { userId, machineId },
+      repository.repositoryId,
+      repository.incarnation,
+    );
+    if (!authorized.ok) throw new Error(authorized.error);
+    const repositoryStub = env.REPOSITORIES.getByName(repository.repositoryId);
+    expect(await repositoryStub.initializeRepository(authorized.authority)).toMatchObject({
+      ok: true,
+    });
+
+    await runInDurableObject(control, (_instance, state) => {
+      state.storage.sql.exec(`
+        CREATE TRIGGER fail_repository_finalization
+        BEFORE UPDATE OF status ON repositories
+        WHEN NEW.status = 'deleted'
+        BEGIN
+          SELECT RAISE(FAIL, 'injected repository finalization failure');
+        END
+      `);
+    });
+    const deletionRequest = {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repositoryId: repository.repositoryId,
+        incarnation: repository.incarnation,
+      }),
+    };
+    const failed = await apiRequest(
+      machineId,
+      "/repositories/retirement-lost-response",
+      deletionRequest,
+    );
+    expect(failed.status).toBe(500);
+    expect(await failed.json()).toEqual({ error: "request failed" });
+    await runInDurableObject(repositoryStub, (_instance, state) => {
+      expect(
+        state.storage.sql
+          .exec<{ count: number }>(
+            "SELECT count(*) AS count FROM sqlite_master WHERE type = 'table'",
+          )
+          .one().count,
+      ).toBe(0);
+    });
+
+    await runInDurableObject(control, (_instance, state) => {
+      state.storage.sql.exec("DROP TRIGGER fail_repository_finalization");
+    });
+    const replacement = await createRepository(
+      machineId,
+      "retirement-lost-response",
+      "4c".repeat(16),
+    );
+    expect(replacement.repositoryId).not.toBe(repository.repositoryId);
+    expect(replacement.incarnation).not.toBe(repository.incarnation);
+    expect(
+      await control.authorizeRepository(
+        { userId, machineId },
+        repository.repositoryId,
+        repository.incarnation,
+      ),
+    ).toMatchObject({ ok: false, status: 404, code: "repository-not-found" });
   });
 
   it("reports a replay whose repository is concurrently retiring", async () => {
