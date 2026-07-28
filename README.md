@@ -1,5 +1,20 @@
 # Devspace
 
+## UPDATE
+
+After a period of dogfooding, I've decided devspace was a good experiment but not a genuinely valuable tool for a few reasons:
+
+- The VCS UX gains I missed from `jj` are barely handled by me anymore (agents or harnesses do 90+% of my VCS interactions).
+- `jj` as the VCS choice is nice for the few humans that used it, but not relevant for the masses of tools or other users that assume git.
+- The product increasingly feels like glue between a bunch of individually nice ideas, but nothing that can't be replaced by 2 or 3 separate tools.
+- Multi-machine versioning (even private) never felt valuable enough to me when things like agent memories or tools also didn't transfer; local worktrees were just easier.
+
+I'll leave the repo up as an example, with a few things that I think might be good ideas to pursue - `ds context` is already available as [grepo](https://github.com/tomrford/grepo), `.dsprivate` could get a local helper.
+
+In the end, devspace proved that we can legitimately synchronise jj storage across machines with a dropbox-like background sync, with history rewriting for private files - which is pretty cool.
+
+---
+
 Devspace is a Cloudflare-native store for Jujutsu repositories. `ds` embeds
 Jujutsu, keeps the canonical repository on each machine in a bare Git object
 database, and replicates Git objects plus Jujutsu operation history through a
