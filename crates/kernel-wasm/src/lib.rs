@@ -104,7 +104,7 @@ pub extern "C" fn kernel_hash_new() -> u32 {
     Box::into_raw(Box::new(RawHasher::new())) as u32
 }
 
-/// Adds bytes to a raw Blake2b-512 hash state used for pack and chunk IDs.
+/// Adds bytes to a raw Blake2b-512 hash state used for request hashes.
 ///
 /// # Safety
 ///
