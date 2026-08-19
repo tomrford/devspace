@@ -1038,7 +1038,9 @@ async function incarnation(repository: string) {
 
 async function installJournalFixture(repository: string): Promise<string[]> {
   await ensureRepository(repository);
-  return ["a1".repeat(20), "b2".repeat(20), "c3".repeat(20)];
+  return Array.from({ length: 257 }, (_, index) =>
+    (index + 1).toString(16).padStart(40, "0"),
+  );
 }
 
 async function expectNoPairMutation(repository: string) {

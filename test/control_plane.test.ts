@@ -473,9 +473,9 @@ describe("cloud identity and repository directory", () => {
     expect(await firstStub.initializeRepository(firstAuthority)).toMatchObject({ ok: true });
     await runInDurableObject(firstStub, (_instance, state) => {
       state.storage.sql.exec(
-        "INSERT INTO objects (kind, id, bytes) VALUES (?, ?, ?)",
+        "INSERT INTO op_objects (kind, id, bytes) VALUES (?, ?, ?)",
         1,
-        new Uint8Array(20).fill(1),
+        new Uint8Array(64).fill(1),
         new Uint8Array([2]),
       );
     });
