@@ -23,6 +23,7 @@
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             binaryen
+            git
             nodejs
             pnpm
             rust
