@@ -9,7 +9,8 @@ use devspace_machine::{
     RepositoryName, RepositorySyncGuard,
 };
 use devspace_machine::{
-    GitHttpTransport, MachineGitRepository, OpSyncEngine, OpSyncEngineError, OpSyncStore,
+    CanonicalGitRemote, GitHttpTransport, MachineGitRepository, OpSyncEngine, OpSyncEngineError,
+    OpSyncStore,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -197,9 +198,11 @@ pub(crate) fn run_sync_engine(
         identity.incarnation.as_str(),
     )
     .map_err(|error| error.to_string())?;
+    let git_remote = CanonicalGitRemote::from_env(config.machine_id().clone())
+        .map_err(|error| error.to_string())?;
     let runtime = cloud_runtime().map_err(|_| CLOUD_RUNTIME_ERROR.to_owned())?;
     runtime
-        .block_on(OpSyncEngine::new(repository, &state, &mut transport).run())
+        .block_on(OpSyncEngine::new(repository, &state, &mut transport, &git_remote).run())
         .map(|_| ())
         .map_err(|error| sync_error_message(&error))
 }

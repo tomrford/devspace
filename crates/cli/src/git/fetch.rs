@@ -90,6 +90,7 @@ pub(crate) async fn fetch_entry(
         .block_on(fetch_with_journal(
             &session.repository,
             &session.transport,
+            &session.git_remote,
             &remote_name,
             &bookmark_names,
             new_fetch_id().map_err(user_error)?,

@@ -3,9 +3,9 @@ use std::process::Command;
 
 use devspace_kernel::{ObjectKind, Oid, parse_commit};
 use devspace_machine::{
-    GitHttpTransport, GitProcessEnvironment, GitProcessMode, JournalFlowError, LeaseUpdate,
-    MachineGitRepository, PushErrorKind, PushFailpoint, PushHead, QualifiedRef, RemoteUrl,
-    fetch_with_journal, push, push_with_journal,
+    CanonicalGitRemote, GitHttpTransport, GitProcessEnvironment, GitProcessMode, JournalFlowError,
+    LeaseUpdate, MachineGitRepository, MachineId, PushErrorKind, PushFailpoint, PushHead,
+    QualifiedRef, RemoteUrl, fetch_with_journal, init_bare_remote, push, push_with_journal,
 };
 use devspace_testutils::fake_worker::{create_server, respond};
 use jj_lib::settings::UserSettings;
@@ -23,6 +23,15 @@ const SIGNATURE: &[(&[u8], &[u8])] = &[(
 
 fn settings() -> UserSettings {
     devspace_testutils::settings("Journal Test", "journal@example.invalid", true)
+}
+
+fn journal_remote(path: &std::path::Path) -> CanonicalGitRemote {
+    init_bare_remote(path).unwrap();
+    CanonicalGitRemote::new(
+        path.to_string_lossy(),
+        MachineId::parse("11".repeat(16)).unwrap(),
+        GitProcessEnvironment::default(),
+    )
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -106,6 +115,7 @@ async fn real_lease_push_preserves_signed_identity_bytes_and_observes_rejection(
 #[tokio::test(flavor = "current_thread")]
 async fn up_to_date_push_does_not_request_the_pack_catalog_or_chunks() {
     let temp = tempfile::tempdir().unwrap();
+    let canonical = journal_remote(&temp.path().join("canonical.git"));
     let repository = MachineGitRepository::init(temp.path().join("machine"), &settings())
         .await
         .unwrap();
@@ -166,6 +176,7 @@ async fn up_to_date_push_does_not_request_the_pack_catalog_or_chunks() {
     let result = push_with_journal(
         &repository,
         &transport,
+        &canonical,
         "origin",
         &[PushHead {
             bookmark: "main".to_owned(),
@@ -192,6 +203,7 @@ async fn up_to_date_push_does_not_request_the_pack_catalog_or_chunks() {
 #[tokio::test(flavor = "current_thread")]
 async fn non_noop_push_omits_every_cloud_known_git_object() {
     let temp = tempfile::tempdir().unwrap();
+    let canonical = journal_remote(&temp.path().join("canonical.git"));
     let repository = MachineGitRepository::init(temp.path().join("machine"), &settings())
         .await
         .unwrap();
@@ -269,6 +281,7 @@ async fn non_noop_push_omits_every_cloud_known_git_object() {
     let result = push_with_journal(
         &repository,
         &transport,
+        &canonical,
         "origin",
         &[PushHead {
             bookmark: "main".to_owned(),
@@ -293,6 +306,7 @@ async fn non_noop_push_omits_every_cloud_known_git_object() {
 #[tokio::test(flavor = "current_thread")]
 async fn identity_cursor_stops_clean_and_hidden_children_without_identity_states() {
     let temp = tempfile::tempdir().unwrap();
+    let canonical = journal_remote(&temp.path().join("canonical.git"));
     let repository = MachineGitRepository::init(temp.path().join("machine"), &settings())
         .await
         .unwrap();
@@ -433,6 +447,7 @@ async fn identity_cursor_stops_clean_and_hidden_children_without_identity_states
     let result = push_with_journal(
         &repository,
         &transport,
+        &canonical,
         "origin",
         &[
             PushHead {
@@ -457,6 +472,7 @@ async fn identity_cursor_stops_clean_and_hidden_children_without_identity_states
 #[tokio::test(flavor = "current_thread")]
 async fn settled_aborted_claim_refreshes_without_requesting_replay() {
     let temp = tempfile::tempdir().unwrap();
+    let canonical = journal_remote(&temp.path().join("canonical.git"));
     let repository = MachineGitRepository::init(temp.path().join("machine"), &settings())
         .await
         .unwrap();
@@ -583,6 +599,7 @@ async fn settled_aborted_claim_refreshes_without_requesting_replay() {
     let result = push_with_journal(
         &repository,
         &transport,
+        &canonical,
         "origin",
         &[PushHead {
             bookmark: "main".to_owned(),
@@ -627,9 +644,12 @@ async fn live_journal_push_recovery_and_fetch_proofs() {
             &incarnation,
         )
         .unwrap();
+        let canonical = CanonicalGitRemote::from_env(MachineId::parse("11".repeat(16)).unwrap())
+            .expect("crash child needs DEVSPACE_CANONICAL_GIT_REMOTE");
         let result = push_with_journal(
             &repository,
             &transport,
+            &canonical,
             "origin",
             &[PushHead {
                 bookmark: "crash".to_owned(),
@@ -669,6 +689,7 @@ async fn live_journal_push_recovery_and_fetch_proofs() {
     )
     .unwrap();
     let temp = tempfile::tempdir().unwrap();
+    let canonical = journal_remote(&temp.path().join("canonical.git"));
     let remote = temp.path().join("remote.git");
     let initialized = Command::new("git")
         .args(["init", "--bare", remote.to_str().unwrap()])
@@ -690,6 +711,7 @@ async fn live_journal_push_recovery_and_fetch_proofs() {
     let pushed_hidden = push_with_journal(
         &a,
         &transport_a,
+        &canonical,
         "origin",
         &[PushHead {
             bookmark: "main".to_owned(),
@@ -730,6 +752,7 @@ async fn live_journal_push_recovery_and_fetch_proofs() {
     let signed_result = push_with_journal(
         &a,
         &transport_a,
+        &canonical,
         "origin",
         &[PushHead {
             bookmark: "signed".to_owned(),
@@ -773,6 +796,10 @@ async fn live_journal_push_recovery_and_fetch_proofs() {
         .env("DEVSPACE_JOURNAL_INCARNATION", &incarnation)
         .env("DEVSPACE_JOURNAL_MACHINE_PATH", a.path())
         .env("DEVSPACE_JOURNAL_CRASH_OID", oid_hex(crash_head))
+        .env(
+            "DEVSPACE_CANONICAL_GIT_REMOTE",
+            temp.path().join("canonical.git"),
+        )
         .output()
         .unwrap();
     assert_eq!(
@@ -799,6 +826,7 @@ async fn live_journal_push_recovery_and_fetch_proofs() {
     let recovered = push_with_journal(
         &b,
         &transport_b,
+        &canonical,
         "origin",
         &[PushHead {
             bookmark: "crash".to_owned(),
@@ -859,6 +887,7 @@ async fn live_journal_push_recovery_and_fetch_proofs() {
     let fetched = fetch_with_journal(
         &b,
         &transport_b,
+        &canonical,
         "origin",
         &["main".to_owned()],
         [0x35; 16],
@@ -897,6 +926,7 @@ async fn live_journal_push_recovery_and_fetch_proofs() {
     let pushed_after_fetch = push_with_journal(
         &b,
         &transport_b,
+        &canonical,
         "origin",
         &[PushHead {
             bookmark: "main".to_owned(),
@@ -927,6 +957,7 @@ async fn live_journal_push_recovery_and_fetch_proofs() {
     let shared_push = push_with_journal(
         &a,
         &transport_a,
+        &canonical,
         "origin",
         &[
             PushHead {
@@ -952,6 +983,7 @@ async fn live_journal_push_recovery_and_fetch_proofs() {
     let fetched_shared = fetch_with_journal(
         &c,
         &transport_b,
+        &canonical,
         "origin",
         &["shared-a".to_owned(), "shared-b".to_owned()],
         [0x38; 16],

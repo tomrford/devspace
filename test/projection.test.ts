@@ -1,14 +1,9 @@
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
-import { gitToHex } from "../src/kernel";
-import { decodeGitManifest } from "../src/pack_protocol";
-import fixtures from "./fixtures/repository.json";
 import {
   DEFAULT_MACHINE,
-  decodeHex,
   ensureRepository,
-  json,
   repositoryGitStub,
   routeRequest,
 } from "./support";
@@ -26,48 +21,6 @@ describe("Git projection journal", () => {
     expect(await projectionSnapshot(repository)).toEqual({
       status: 500,
       body: { error: "Git repository storage failed" },
-    });
-  });
-
-  it("rejects missing canonical and missing public commits at begin", async () => {
-    const repository = "git-journal-durability";
-    const [canonicalOid, publicOid] = await installJournalFixture(repository);
-
-    expect(
-      await projectionRequest(
-        repository,
-        "pushes",
-        projectionBatch(
-          await incarnation(repository),
-          "01".repeat(16),
-          DEFAULT_MACHINE,
-          projectionUpdate("missing-canonical", null, "f1".repeat(20), publicOid),
-        ),
-      ),
-    ).toMatchObject({
-      status: 409,
-      body: {
-        code: "projection-commit-not-durable",
-        error: expect.stringContaining("canonical commit"),
-      },
-    });
-    expect(
-      await projectionRequest(
-        repository,
-        "pushes",
-        projectionBatch(
-          await incarnation(repository),
-          "02".repeat(16),
-          DEFAULT_MACHINE,
-          projectionUpdate("missing-public", null, canonicalOid, "f2".repeat(20)),
-        ),
-      ),
-    ).toMatchObject({
-      status: 409,
-      body: {
-        code: "projection-commit-not-durable",
-        error: expect.stringContaining("public commit"),
-      },
     });
   });
 
@@ -1079,48 +1032,13 @@ describe("Git projection journal", () => {
   });
 });
 
-interface EncodedFixture {
-  id: string;
-  manifest: string;
-  chunks: string[];
-}
-
 async function incarnation(repository: string) {
   return (await ensureRepository(repository)).incarnation;
 }
 
 async function installJournalFixture(repository: string): Promise<string[]> {
-  const fixture = (fixtures as { journal: EncodedFixture }).journal;
-  return installFixture(repository, fixture);
-}
-
-async function installFixture(repository: string, fixture: EncodedFixture): Promise<string[]> {
-  const manifest = decodeHex(fixture.manifest);
-  const chunks = fixture.chunks.map(decodeHex);
-  expect(
-    await json(
-      await routeRequest(repository, `git/packs/${fixture.id}/manifest`, {
-        method: "PUT",
-        body: manifest,
-      }),
-    ),
-  ).toMatchObject({ inserted: true });
-  for (const [position, chunk] of chunks.entries()) {
-    expect(
-      await json(
-        await routeRequest(repository, `git/packs/${fixture.id}/chunks/${position}`, {
-          method: "PUT",
-          body: chunk,
-        }),
-      ),
-    ).toMatchObject({ inserted: true });
-  }
-  expect(
-    await json(
-      await routeRequest(repository, `git/packs/${fixture.id}/install`, { method: "POST" }),
-    ),
-  ).toMatchObject({ installed: true });
-  return decodeGitManifest(manifest).headCommits.map(gitToHex);
+  await ensureRepository(repository);
+  return ["a1".repeat(20), "b2".repeat(20), "c3".repeat(20)];
 }
 
 async function expectNoPairMutation(repository: string) {
@@ -1215,50 +1133,6 @@ async function listRemotes(repository: string) {
     { method: "GET" },
   );
   return { status: response.status, body: await response.json() };
-}
-
-function packedObjectBytes(fixture: EncodedFixture, oid: string): Uint8Array {
-  const manifest = decodeGitManifest(decodeHex(fixture.manifest));
-  const data = Uint8Array.from(fixture.chunks.flatMap((chunk) => [...decodeHex(chunk)]));
-  const object = manifest.objects.find((entry) => gitToHex(entry.id) === oid);
-  if (object === undefined) throw new Error(`fixture does not contain object ${oid}`);
-  return data.slice(object.offset, object.offset + object.length);
-}
-
-async function downloadPackedObject(
-  repository: string,
-  packId: string,
-  oid: string,
-  machineId: string,
-): Promise<Uint8Array> {
-  const catalog = await routeRequest(repository, "git/packs?after=0", { method: "GET" }, machineId);
-  expect(catalog.status).toBe(200);
-  expect((await catalog.json()) as { packs: Array<{ id: string }> }).toMatchObject({
-    packs: [{ id: packId }],
-  });
-  const manifestResponse = await routeRequest(
-    repository,
-    `git/packs/${packId}/manifest`,
-    { method: "GET" },
-    machineId,
-  );
-  expect(manifestResponse.status).toBe(200);
-  const manifest = decodeGitManifest(new Uint8Array(await manifestResponse.arrayBuffer()));
-  const chunks: Uint8Array[] = [];
-  for (const [position] of manifest.chunks.entries()) {
-    const response = await routeRequest(
-      repository,
-      `git/packs/${packId}/chunks/${position}`,
-      { method: "GET" },
-      machineId,
-    );
-    expect(response.status).toBe(200);
-    chunks.push(new Uint8Array(await response.arrayBuffer()));
-  }
-  const data = Uint8Array.from(chunks.flatMap((chunk) => [...chunk]));
-  const object = manifest.objects.find((entry) => gitToHex(entry.id) === oid);
-  if (object === undefined) throw new Error(`downloaded pack does not contain object ${oid}`);
-  return data.slice(object.offset, object.offset + object.length);
 }
 
 function projectionState(

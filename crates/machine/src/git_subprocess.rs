@@ -377,6 +377,78 @@ pub fn push(
     Ok(report)
 }
 
+pub fn fetch_refspecs(
+    git_dir: &Path,
+    remote_url: &RemoteUrl,
+    refspecs: &[String],
+    environment: &GitProcessEnvironment,
+) -> Result<CommandDiagnostic, FetchError> {
+    if refspecs.is_empty() {
+        return Err(FetchError {
+            report: FetchReport {
+                heads: BTreeMap::new(),
+                diagnostic: CommandDiagnostic {
+                    command: "git fetch <remote>".to_owned(),
+                    exit_code: None,
+                    observation_command: "git fetch <remote>".to_owned(),
+                    observation_exit_code: None,
+                    stderr_excerpt: "no refs were requested".to_owned(),
+                },
+            },
+        });
+    }
+    let spec = fetch_refspec_command(git_dir, remote_url, refspecs, environment);
+    let result = run(&spec);
+    let diagnostic = diagnostic(
+        &spec,
+        &result,
+        &spec,
+        &result,
+        None,
+        remote_url,
+        environment,
+    );
+    if result
+        .as_ref()
+        .map_or(true, |output| !output.status.success())
+    {
+        return Err(FetchError {
+            report: FetchReport {
+                heads: BTreeMap::new(),
+                diagnostic,
+            },
+        });
+    }
+    Ok(diagnostic)
+}
+
+pub fn ls_remote_matching(
+    remote_url: &RemoteUrl,
+    pattern: &str,
+    environment: &GitProcessEnvironment,
+) -> Result<BTreeMap<String, Oid>, RemoteHeadsError> {
+    let spec = remote_matching_command(remote_url, pattern, environment);
+    let result = run(&spec);
+    let parsed = result
+        .as_ref()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| parse_remote_ref_lines(&output.stdout));
+    if let Some(Ok(heads)) = parsed {
+        return Ok(heads);
+    }
+    let mut stderr = Vec::new();
+    append_result_stderr(&mut stderr, &result);
+    if let Some(Err(error)) = parsed {
+        stderr.extend_from_slice(error.as_bytes());
+    }
+    Err(RemoteHeadsError {
+        command: spec.safe_shape,
+        exit_code: result.as_ref().ok().and_then(|output| output.status.code()),
+        stderr_excerpt: redact_stderr(&stderr, remote_url, environment),
+    })
+}
+
 pub fn fetch(
     git_dir: &Path,
     remote_name: &str,
@@ -543,6 +615,81 @@ fn remote_head_command(remote_url: &RemoteUrl, environment: &GitProcessEnvironme
         "HEAD".to_owned(),
     ];
     command_spec(args, safe, environment)
+}
+
+fn fetch_refspec_command(
+    git_dir: &Path,
+    remote_url: &RemoteUrl,
+    refspecs: &[String],
+    environment: &GitProcessEnvironment,
+) -> CommandSpec {
+    let mut args = vec![
+        git_dir_arg(git_dir),
+        "fetch".into(),
+        "--".into(),
+        remote_url.expose().into(),
+    ];
+    let mut safe = vec![
+        format!("--git-dir={}", git_dir.display()),
+        "fetch".to_owned(),
+        "--".to_owned(),
+        "<remote>".to_owned(),
+    ];
+    for refspec in refspecs {
+        args.push(refspec.into());
+        safe.push(refspec.clone());
+    }
+    command_spec(args, safe, environment)
+}
+
+fn remote_matching_command(
+    remote_url: &RemoteUrl,
+    pattern: &str,
+    environment: &GitProcessEnvironment,
+) -> CommandSpec {
+    let args = vec![
+        "ls-remote".into(),
+        "--refs".into(),
+        "--".into(),
+        remote_url.expose().into(),
+        pattern.into(),
+    ];
+    let safe = vec![
+        "ls-remote".to_owned(),
+        "--refs".to_owned(),
+        "--".to_owned(),
+        "<remote>".to_owned(),
+        pattern.to_owned(),
+    ];
+    command_spec(args, safe, environment)
+}
+
+fn parse_remote_ref_lines(bytes: &[u8]) -> Result<BTreeMap<String, Oid>, String> {
+    if bytes.len() > MAX_OBSERVATION_BYTES {
+        return Err("Git remote observation exceeded its byte limit".to_owned());
+    }
+    let mut heads = BTreeMap::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        if heads.len() >= MAX_REMOTE_HEADS {
+            return Err("Git remote has too many matching refs".to_owned());
+        }
+        let tab = line
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| "Git returned a malformed remote observation".to_owned())?;
+        let oid = Oid::from_hex(&line[..tab])
+            .ok_or_else(|| "Git returned an invalid observed object ID".to_owned())?;
+        let name = std::str::from_utf8(&line[tab + 1..])
+            .map_err(|_| "Git returned a non-UTF-8 observed ref".to_owned())?;
+        if heads.insert(name.to_owned(), oid).is_some() {
+            return Err("Git returned a duplicate observed ref".to_owned());
+        }
+    }
+    Ok(heads)
 }
 
 fn fetch_command(

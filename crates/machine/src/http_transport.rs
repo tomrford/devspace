@@ -1,62 +1,23 @@
-//! HTTP transport for the Worker's Git-object pack store.
+//! HTTP transport for the Worker's operation store and projection journal.
 
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::Deserialize;
 use thiserror::Error;
 
 use crate::http_client::hardened_http_client;
-use crate::pack_manifest::MAX_MANIFEST_BYTES;
 use crate::{
-    BuiltPack, CloudOpHeads, Digest, MAX_CHUNK_BYTES, ObjectKey, Oid, OpId, OpObjectKey,
-    OpObjectKind, OpSyncTransport, OpTransportError, PackManifest, PackManifestError, PackOptions,
-    PackProducer, PendingOpHeadTransaction, decode_lower_hex, encode_lower_hex,
+    CloudOpHeads, Oid, OpId, OpObjectKey, OpObjectKind, OpSyncTransport, OpTransportError,
+    PendingOpHeadTransaction, decode_lower_hex, encode_lower_hex,
 };
 
 const MAX_JSON_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
-const MAX_GIT_INVENTORY_KEYS: usize = 4_096;
 const PROJECTION_PAGE_ROWS: usize = 256;
 const MAX_PROJECTION_SNAPSHOT_ROWS: usize = 65_536;
 const MAX_PROJECTION_SNAPSHOT_PAGES: usize = MAX_PROJECTION_SNAPSHOT_ROWS / PROJECTION_PAGE_ROWS;
 const MAX_PROJECTION_SNAPSHOT_REFS: usize = 512;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitPackCatalogEntry {
-    pub sequence: u64,
-    pub id: Digest,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitPackCatalogPage {
-    pub packs: Vec<GitPackCatalogEntry>,
-    pub next_after: u64,
-    pub through: u64,
-    pub has_more: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DownloadedGitPack {
-    pub id: Digest,
-    pub manifest: Vec<u8>,
-    pub chunks: Vec<Vec<u8>>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct GitUploadReceipt {
-    pub inserted: bool,
-    pub installed: bool,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct GitInstallReceipt {
-    pub installed: bool,
-    pub inserted_objects: usize,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionGitState {
@@ -247,26 +208,8 @@ pub enum GitHttpTransportError {
     TooLarge { limit: usize },
     #[error("Worker returned malformed JSON")]
     Json(#[source] serde_json::Error),
-    #[error("Worker returned invalid pack manifest")]
-    Manifest(#[source] PackManifestError),
     #[error("Worker protocol violation: {0}")]
     Protocol(String),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct CatalogResponse {
-    packs: Vec<CatalogEntry>,
-    next_after: u64,
-    through: u64,
-    has_more: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CatalogEntry {
-    sequence: u64,
-    id: String,
 }
 
 #[derive(Deserialize)]
@@ -278,12 +221,6 @@ struct ErrorResponse {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OpInventoryResponse {
-    keys: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GitInventoryResponse {
     keys: Vec<String>,
 }
 
@@ -336,154 +273,6 @@ impl GitHttpTransport {
             machine_id: machine_id.to_owned(),
             incarnation: incarnation.to_owned(),
         })
-    }
-
-    pub async fn list_packs(
-        &self,
-        after: u64,
-        through: Option<u64>,
-    ) -> Result<GitPackCatalogPage, GitHttpTransportError> {
-        let mut url = format!("{}/packs?after={after}", self.repository_url);
-        if let Some(through) = through {
-            write!(url, "&through={through}").expect("writing to a String cannot fail");
-        }
-        let response: CatalogResponse = self
-            .read_json(self.send(self.client.get(url)).await?)
-            .await?;
-        let packs = response
-            .packs
-            .into_iter()
-            .map(|entry| {
-                Ok(GitPackCatalogEntry {
-                    sequence: entry.sequence,
-                    id: decode_digest(&entry.id)?,
-                })
-            })
-            .collect::<Result<Vec<_>, GitHttpTransportError>>()?;
-        Ok(GitPackCatalogPage {
-            packs,
-            next_after: response.next_after,
-            through: response.through,
-            has_more: response.has_more,
-        })
-    }
-
-    pub async fn download_pack(
-        &self,
-        id: Digest,
-    ) -> Result<DownloadedGitPack, GitHttpTransportError> {
-        let pack_url = format!("{}/packs/{}", self.repository_url, encode_lower_hex(&id));
-        let manifest = self
-            .fetch_bytes(format!("{pack_url}/manifest"), MAX_MANIFEST_BYTES)
-            .await?;
-        let chunk_count = PackManifest::decode(&manifest)
-            .map_err(GitHttpTransportError::Manifest)?
-            .chunks()
-            .len();
-        let mut chunks = Vec::with_capacity(chunk_count);
-        for position in 0..chunk_count {
-            chunks.push(
-                self.fetch_bytes(
-                    format!("{pack_url}/chunks/{position}"),
-                    MAX_CHUNK_BYTES as usize,
-                )
-                .await?,
-            );
-        }
-        Ok(DownloadedGitPack {
-            id,
-            manifest,
-            chunks,
-        })
-    }
-
-    pub async fn upload_pack(
-        &self,
-        pack: &BuiltPack,
-    ) -> Result<GitInstallReceipt, GitHttpTransportError> {
-        self.upload_manifest(pack.id, &pack.manifest_bytes).await?;
-        for (position, chunk) in pack.chunks.iter().enumerate() {
-            self.upload_chunk(pack.id, position, chunk).await?;
-        }
-        self.install_pack(pack.id).await
-    }
-
-    pub async fn upload_manifest(
-        &self,
-        id: Digest,
-        bytes: &[u8],
-    ) -> Result<GitUploadReceipt, GitHttpTransportError> {
-        let url = format!(
-            "{}/packs/{}/manifest",
-            self.repository_url,
-            encode_lower_hex(&id)
-        );
-        let response = self.send(self.client.put(url).body(bytes.to_vec())).await?;
-        self.read_json(response).await
-    }
-
-    pub async fn upload_chunk(
-        &self,
-        id: Digest,
-        position: usize,
-        bytes: &[u8],
-    ) -> Result<GitUploadReceipt, GitHttpTransportError> {
-        let url = format!(
-            "{}/packs/{}/chunks/{position}",
-            self.repository_url,
-            encode_lower_hex(&id)
-        );
-        let response = self.send(self.client.put(url).body(bytes.to_vec())).await?;
-        self.read_json(response).await
-    }
-
-    pub async fn install_pack(
-        &self,
-        id: Digest,
-    ) -> Result<GitInstallReceipt, GitHttpTransportError> {
-        let url = format!(
-            "{}/packs/{}/install",
-            self.repository_url,
-            encode_lower_hex(&id)
-        );
-        let response = self.send(self.client.post(url)).await?;
-        self.read_json(response).await
-    }
-
-    pub async fn inventory_git_objects(
-        &self,
-        candidates: &[ObjectKey],
-    ) -> Result<BTreeSet<ObjectKey>, GitHttpTransportError> {
-        let mut present = BTreeSet::new();
-        let candidates = candidates.iter().copied().collect::<BTreeSet<_>>();
-        let candidates = candidates.into_iter().collect::<Vec<_>>();
-        for page in candidates.chunks(MAX_GIT_INVENTORY_KEYS) {
-            let mut keys = page.iter().map(git_object_key).collect::<Vec<_>>();
-            keys.sort_unstable();
-            let response = self
-                .send(
-                    self.client
-                        .post(format!("{}/objects/inventory", self.repository_url))
-                        .json(&serde_json::json!({ "keys": keys })),
-                )
-                .await?;
-            let response: GitInventoryResponse = self.read_json(response).await?;
-            let page_present = response
-                .keys
-                .into_iter()
-                .map(|key| decode_git_object_key(&key))
-                .collect::<Result<BTreeSet<_>, _>>()?;
-            if !page_present
-                .iter()
-                .all(|key| page.binary_search(key).is_ok())
-            {
-                return Err(GitHttpTransportError::Protocol(
-                    "Git object inventory returned an unrequested object".to_owned(),
-                ));
-            }
-            present.extend(page_present);
-        }
-        Ok(present)
     }
 
     async fn op_inventory(
@@ -853,69 +642,6 @@ impl GitHttpTransport {
 }
 
 impl OpSyncTransport for GitHttpTransport {
-    async fn download_git_objects(
-        &mut self,
-        repository: &crate::MachineGitRepository,
-        mut after: u64,
-    ) -> Result<u64, OpTransportError> {
-        let mut through = None;
-        loop {
-            let page = self
-                .list_packs(after, through)
-                .await
-                .map_err(|error| Box::new(error) as OpTransportError)?;
-            through = Some(page.through);
-            for pack in page.packs {
-                let downloaded = self
-                    .download_pack(pack.id)
-                    .await
-                    .map_err(|error| Box::new(error) as OpTransportError)?;
-                repository
-                    .install_pack(downloaded.id, &downloaded.manifest, &downloaded.chunks)
-                    .map_err(|error| Box::new(error) as OpTransportError)?;
-            }
-            if !page.has_more {
-                return Ok(page.through);
-            }
-            after = page.next_after;
-        }
-    }
-
-    async fn upload_git_objects(
-        &mut self,
-        repository: &crate::MachineGitRepository,
-        heads: &BTreeSet<Oid>,
-    ) -> Result<(), OpTransportError> {
-        let heads = heads.iter().copied().filter(|oid| oid.0 != [0; 20]);
-        let closure = repository
-            .object_closure(heads)
-            .map_err(|error| Box::new(error) as OpTransportError)?;
-        if closure.objects.is_empty() {
-            return Ok(());
-        }
-        let candidates = closure
-            .objects
-            .iter()
-            .map(|object| object.key)
-            .collect::<Vec<_>>();
-        let known_objects = self
-            .inventory_git_objects(&candidates)
-            .await
-            .map_err(|error| Box::new(error) as OpTransportError)?;
-        let mut producer =
-            PackProducer::new(repository, &closure, &known_objects, PackOptions::default())
-                .map_err(|error| Box::new(error) as OpTransportError)?;
-        while let Some(pack) = producer
-            .next_pack()
-            .map_err(|error| Box::new(error) as OpTransportError)?
-        {
-            self.upload_pack(&pack)
-                .await
-                .map_err(|error| Box::new(error) as OpTransportError)?;
-        }
-        Ok(())
-    }
-
     async fn inventory_op_objects(
         &mut self,
         candidates: &[OpObjectKey],
@@ -1073,49 +799,12 @@ fn validate_projection_snapshot_rows(
     Ok(())
 }
 
-fn decode_digest(value: &str) -> Result<Digest, GitHttpTransportError> {
-    decode_lower_hex(value).map_err(|_| {
-        GitHttpTransportError::Protocol(format!(
-            "pack ID must be 128 lowercase hex characters, got {value:?}"
-        ))
-    })
-}
-
 fn op_key(key: &OpObjectKey) -> String {
     format!(
         "{}:{}",
         key.kind.inventory_prefix(),
         encode_lower_hex(&key.id)
     )
-}
-
-fn git_object_key(key: &ObjectKey) -> String {
-    let prefix = match key.kind {
-        devspace_kernel::ObjectKind::Blob => "b",
-        devspace_kernel::ObjectKind::Tree => "t",
-        devspace_kernel::ObjectKind::Commit => "c",
-    };
-    format!("{prefix}:{}", encode_lower_hex(&key.id.0))
-}
-
-fn decode_git_object_key(value: &str) -> Result<ObjectKey, GitHttpTransportError> {
-    let (prefix, id) = value.split_once(':').ok_or_else(|| {
-        GitHttpTransportError::Protocol("Git object inventory returned an invalid key".to_owned())
-    })?;
-    let kind = match prefix {
-        "b" => devspace_kernel::ObjectKind::Blob,
-        "t" => devspace_kernel::ObjectKind::Tree,
-        "c" => devspace_kernel::ObjectKind::Commit,
-        _ => {
-            return Err(GitHttpTransportError::Protocol(
-                "Git object inventory returned an invalid kind".to_owned(),
-            ));
-        }
-    };
-    let id = Oid::from_hex(id.as_bytes()).ok_or_else(|| {
-        GitHttpTransportError::Protocol("Git object inventory returned an invalid ID".to_owned())
-    })?;
-    Ok(ObjectKey { kind, id })
 }
 
 fn op_key_path(key: OpObjectKey) -> String {

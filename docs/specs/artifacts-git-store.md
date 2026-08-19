@@ -107,8 +107,12 @@ the previous anchor and the new canonical Git commits required by the jj
 operations being uploaded. Each machine writes only its own ref. The anchor
 tree is empty and the commit message contains no private content.
 
-This is a hypothesis, not yet a protocol decision. The spike must compare it
-with two alternatives:
+Selected design: machine-owned synthetic ancestry. A repository-wide
+compare-and-swap ref lost because the next writer must already hold the
+previous synthetic commit, so unrelated machines serialize. Direct commit refs
+lost because Git reachability does not follow `jj:trees`.
+
+The spike compared this design with two alternatives:
 
 - one repository-wide retention ref updated with compare-and-swap retries;
 - direct pushes of the required commits to machine-owned refs without a

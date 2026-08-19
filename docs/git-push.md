@@ -40,12 +40,11 @@ One push holds the repository sync lock and performs this sequence:
    if every requested cursor is already current;
 4. seed projection from active pair states, cursors, and pending identity
    bindings;
-5. project hidden paths parent-first, installing cloud packs only if a reached
+5. project hidden paths parent-first, fetching retention refs only if a reached
    seed selects public bytes that are missing locally;
 6. ensure the complete canonical and public closures are local, then scan every
    public tree against the canonical hidden policy;
-7. inventory those closures and upload only missing objects, one completed pack
-   at a time;
+7. push those closures to the canonical Git remote and verify a fresh fetch;
 8. begin a durable projection batch with expected old public OIDs;
 9. invoke `git push --porcelain` with an exact force-with-lease for each ref;
 10. report the observed live OIDs to the Worker;
@@ -109,7 +108,7 @@ remote accepted refs but before the Worker records them, the next overlapping
 push or fetch:
 
 1. claims a new recovery fence;
-2. checks the proposed canonical and public closures and downloads cloud packs
+2. checks the proposed canonical and public closures and fetches retention refs
    only when objects are missing;
 3. replays the exact proposed states and hidden-path scans;
 4. repeats the leased Git updates;

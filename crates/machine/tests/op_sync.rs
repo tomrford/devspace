@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use devspace_kernel::ops::{OpReferenceKind, validate_op};
 use devspace_machine::{
-    CloudOpHeads, MachineGitRepository, OpId, OpObjectKey, OpObjectKind, OpSyncEngine, OpSyncStore,
-    OpSyncTransport, OpTransportError, PendingOpHeadTransaction,
+    CanonicalGitRemote, CloudOpHeads, GitProcessEnvironment, MachineGitRepository, MachineId,
+    OpId, OpObjectKey, OpObjectKind, OpSyncEngine, OpSyncStore, OpSyncTransport, OpTransportError,
+    PendingOpHeadTransaction, init_bare_remote,
 };
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{Operation, RefTarget, RemoteRef, RemoteRefState, View};
@@ -13,6 +14,15 @@ use jj_lib::settings::UserSettings;
 
 fn settings() -> UserSettings {
     devspace_testutils::settings("Operation Sync Test", "op-sync@example.invalid", false)
+}
+
+fn git_remote(path: &std::path::Path) -> CanonicalGitRemote {
+    init_bare_remote(path).unwrap();
+    CanonicalGitRemote::new(
+        path.to_string_lossy(),
+        MachineId::parse("11".repeat(16)).unwrap(),
+        GitProcessEnvironment::default(),
+    )
 }
 
 async fn offline_machine(path: &std::path::Path, name: &str) -> MachineGitRepository {
@@ -44,22 +54,6 @@ struct FakeCloud {
 }
 
 impl OpSyncTransport for FakeCloud {
-    async fn download_git_objects(
-        &mut self,
-        _repository: &MachineGitRepository,
-        after: u64,
-    ) -> Result<u64, OpTransportError> {
-        Ok(after)
-    }
-
-    async fn upload_git_objects(
-        &mut self,
-        _repository: &MachineGitRepository,
-        _heads: &BTreeSet<devspace_machine::Oid>,
-    ) -> Result<(), OpTransportError> {
-        Ok(())
-    }
-
     async fn inventory_op_objects(
         &mut self,
         candidates: &[OpObjectKey],
@@ -144,9 +138,10 @@ async fn offline_head_failure_replays_the_durable_outbox() {
         fail_next_transaction: true,
         ..FakeCloud::default()
     };
+    let git_remote = git_remote(&temp.path().join("canonical.git"));
 
     assert!(
-        OpSyncEngine::new(&mut repository, &state, &mut cloud)
+        OpSyncEngine::new(&mut repository, &state, &mut cloud, &git_remote)
             .run()
             .await
             .is_err()
@@ -155,7 +150,7 @@ async fn offline_head_failure_replays_the_durable_outbox() {
     assert_eq!(cloud.objects.len(), 2);
     assert!(cloud.heads.is_empty());
 
-    OpSyncEngine::new(&mut repository, &state, &mut cloud)
+    OpSyncEngine::new(&mut repository, &state, &mut cloud, &git_remote)
         .run()
         .await
         .unwrap();
@@ -204,8 +199,9 @@ async fn virgin_git_backend_skips_the_implicit_root_operation() {
         .unwrap();
     let state = OpSyncStore::open(temp.path().join("sync")).unwrap();
     let mut cloud = FakeCloud::default();
+    let git_remote = git_remote(&temp.path().join("canonical.git"));
 
-    let result = OpSyncEngine::new(&mut repository, &state, &mut cloud)
+    let result = OpSyncEngine::new(&mut repository, &state, &mut cloud, &git_remote)
         .run()
         .await
         .unwrap();
@@ -223,22 +219,23 @@ async fn op_round_trip_two_machine_reconciliation_and_fresh_rebuild_are_exact() 
     let left_state = OpSyncStore::open(temp.path().join("left-sync")).unwrap();
     let right_state = OpSyncStore::open(temp.path().join("right-sync")).unwrap();
     let mut cloud = FakeCloud::default();
+    let git_remote = git_remote(&temp.path().join("canonical.git"));
 
-    OpSyncEngine::new(&mut left, &left_state, &mut cloud)
+    OpSyncEngine::new(&mut left, &left_state, &mut cloud, &git_remote)
         .run()
         .await
         .unwrap();
     assert_eq!(cloud.heads.len(), 1);
     assert_eq!(cloud.objects.len(), 2);
 
-    OpSyncEngine::new(&mut right, &right_state, &mut cloud)
+    OpSyncEngine::new(&mut right, &right_state, &mut cloud, &git_remote)
         .run()
         .await
         .unwrap();
     assert_eq!(cloud.heads.len(), 1);
     assert_eq!(cloud.cursor, 2);
 
-    OpSyncEngine::new(&mut left, &left_state, &mut cloud)
+    OpSyncEngine::new(&mut left, &left_state, &mut cloud, &git_remote)
         .run()
         .await
         .unwrap();
@@ -249,7 +246,7 @@ async fn op_round_trip_two_machine_reconciliation_and_fresh_rebuild_are_exact() 
         .await
         .unwrap();
     let rebuilt_state = OpSyncStore::open(temp.path().join("rebuilt-sync")).unwrap();
-    OpSyncEngine::new(&mut rebuilt, &rebuilt_state, &mut cloud)
+    OpSyncEngine::new(&mut rebuilt, &rebuilt_state, &mut cloud, &git_remote)
         .run()
         .await
         .unwrap();

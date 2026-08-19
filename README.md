@@ -22,7 +22,7 @@ Worker.
 
 The cloud is a durable authority, not a hosted working copy. Checkouts stay
 local and disposable. The repository can be rebuilt exactly on a fresh machine
-from cloud packs and operation objects.
+from the canonical Git remote and operation objects.
 
 ## Development
 
@@ -197,25 +197,24 @@ Synchronization transfers two content-addressed graphs:
 - Git blobs, trees, and commits, addressed by 20-byte SHA-1 object IDs;
 - Jujutsu operations and views, addressed by 64-byte Blake2b IDs.
 
-Git objects travel in deterministic `DSPK` v2 packs. Before upload, the
-machine checks the reached object keys in bounded inventory batches and
-produces one missing-object pack at a time. Operation objects use their own
-closure and pack routes. The machine installs and validates every download
-before it changes local operation heads.
+Git objects travel through standard Git fetch and push against a private
+remote. Each machine advances a retention ref so every Git object referenced
+by an advertised jj operation stays reachable. Operation objects use their
+own Worker routes. The machine verifies a fresh fetch before it publishes
+operation heads.
 
 A sync run:
 
 1. acquires the repository sync lock and replays its durable outbox;
-2. downloads missing Git packs and operation closures from the cloud;
+2. fetches retention refs and downloads missing operation closures;
 3. reconciles the cloud operation heads into a local Jujutsu operation;
-4. uploads newly reachable Git and operation objects;
+4. pushes newly reachable Git objects and uploads operation objects;
 5. records the intended operation-head transaction in the outbox;
 6. advances the cloud heads and clears the acknowledged outbox entry.
 
-Retries are idempotent. Objects are immutable, pack installation is
-no-clobber, and operation-head updates compare the expected head set before
-commit. A fresh machine can rebuild the bare repository from cloud bytes
-alone.
+Retries are idempotent. Objects are immutable and operation-head updates
+compare the expected head set before commit. A fresh machine can rebuild the
+bare repository from the Git remote and the operation store.
 
 See [Synchronization and convergence](docs/sync.md) for the complete contract.
 

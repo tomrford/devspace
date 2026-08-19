@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 
 use devspace_kernel::{ObjectKind, Oid, TreeEntryKind, parse_commit, parse_tree};
 use devspace_machine::{
-    CommitMapping, MachineGitRepository, PackOptions, ProjectionError, ProjectionMappings,
-    build_packs,
+    CanonicalGitRemote, CommitMapping, GitProcessEnvironment, MachineGitRepository, MachineId,
+    ProjectionError, ProjectionMappings, init_bare_remote,
 };
 use futures::executor::block_on;
 use jj_lib::backend::ChangeId;
@@ -182,17 +182,24 @@ fn hidden_projection_is_minimal_deterministic_and_cloud_durable() {
             .iter()
             .any(|object| object.key.id == fixture.hidden)
     );
-    let built = build_packs(&source, &closure, &BTreeSet::new(), PackOptions::default()).unwrap();
+    let remote = {
+        let path = temp.path().join("canonical.git");
+        init_bare_remote(&path).unwrap();
+        CanonicalGitRemote::new(
+            path.to_string_lossy(),
+            MachineId::parse("11".repeat(16)).unwrap(),
+            GitProcessEnvironment::default(),
+        )
+    };
+    remote.push_commits(&source, [public_head]).unwrap();
     let destination = block_on(MachineGitRepository::init(
         temp.path().join("destination"),
         &settings(),
     ))
     .unwrap();
-    for pack in &built {
-        destination
-            .install_pack(pack.id, &pack.manifest_bytes, &pack.chunks)
-            .unwrap();
-    }
+    remote
+        .verify_commits(&destination, [public_head])
+        .unwrap();
     assert_eq!(read_raw(&destination, public_head), public_bytes);
     let installed_commit = block_on(
         destination

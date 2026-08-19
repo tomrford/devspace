@@ -133,7 +133,7 @@ The projection suite proves:
 - overlay-lift preserves hidden files through public edits and deletions;
 - disclosure collisions become explicit conflicts and warnings;
 - push and fetch recover after process failure without journal drift;
-- fresh-machine recovery succeeds using cloud packs and journal state;
+- fresh-machine recovery succeeds using the canonical Git remote and journal state;
 - identity cursors stop traversal without creating identity-shaped pair rows;
 - a settled aborted claim refreshes state without an unnecessary replay.
 

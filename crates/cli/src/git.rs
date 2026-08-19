@@ -7,7 +7,8 @@ use std::path::Path;
 use clap::parser::ValueSource;
 use devspace_machine::{CatalogEntry, MachineStore, RepositorySyncGuard};
 use devspace_machine::{
-    GitHttpTransport, MachineGitRepository, Oid, RegisteredGitRemote, encode_lower_hex,
+    CanonicalGitRemote, GitHttpTransport, MachineGitRepository, Oid, RegisteredGitRemote,
+    encode_lower_hex,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -137,6 +138,7 @@ pub(super) struct LockedCheckoutEntry {
 pub(super) struct CloudSession {
     repository: MachineGitRepository,
     transport: GitHttpTransport,
+    git_remote: CanonicalGitRemote,
 }
 
 pub(crate) async fn run_git(ui: &mut Ui, command: &CommandHelper) -> Result<(), CommandError> {
@@ -388,9 +390,12 @@ pub(super) async fn open_cloud_session(
         .map_err(display_error)?;
     let config = store.load_config().map_err(display_error)?;
     let transport = git_transport(&config, entry)?;
+    let git_remote =
+        CanonicalGitRemote::from_env(config.machine_id().clone()).map_err(display_error)?;
     Ok(CloudSession {
         repository,
         transport,
+        git_remote,
     })
 }
 

@@ -12,8 +12,8 @@ use jj_lib::repo::Repo as _;
 use thiserror::Error;
 
 use crate::{
-    MachineGitRepository, Oid, OpId, OpReconcileError, OpSyncState, OpSyncStateError, OpSyncStore,
-    PendingOpHeadBatch, PendingOpHeadTransaction,
+    CanonicalGitRemote, CanonicalRemoteError, MachineGitRepository, Oid, OpId, OpReconcileError,
+    OpSyncState, OpSyncStateError, OpSyncStore, PendingOpHeadBatch, PendingOpHeadTransaction,
 };
 
 const MAX_INVENTORY_KEYS: usize = 4_096;
@@ -35,16 +35,6 @@ pub struct CloudOpHeads {
 
 #[allow(async_fn_in_trait)]
 pub trait OpSyncTransport {
-    async fn download_git_objects(
-        &mut self,
-        repository: &MachineGitRepository,
-        after: u64,
-    ) -> Result<u64, TransportError>;
-    async fn upload_git_objects(
-        &mut self,
-        repository: &MachineGitRepository,
-        heads: &BTreeSet<Oid>,
-    ) -> Result<(), TransportError>;
     async fn inventory_op_objects(
         &mut self,
         candidates: &[OpObjectKey],
@@ -66,6 +56,7 @@ pub struct OpSyncEngine<'a, T> {
     repository: &'a mut MachineGitRepository,
     state_store: &'a OpSyncStore,
     transport: &'a mut T,
+    git_remote: &'a CanonicalGitRemote,
 }
 
 impl<'a, T: OpSyncTransport> OpSyncEngine<'a, T> {
@@ -73,11 +64,13 @@ impl<'a, T: OpSyncTransport> OpSyncEngine<'a, T> {
         repository: &'a mut MachineGitRepository,
         state_store: &'a OpSyncStore,
         transport: &'a mut T,
+        git_remote: &'a CanonicalGitRemote,
     ) -> Self {
         Self {
             repository,
             state_store,
             transport,
+            git_remote,
         }
     }
 
@@ -91,19 +84,16 @@ impl<'a, T: OpSyncTransport> OpSyncEngine<'a, T> {
                 .map(|entry| entry.new_head)
                 .collect::<Vec<_>>();
             let closure = self.local_closure(heads, &BTreeSet::new())?;
-            self.transport
-                .upload_git_objects(self.repository, &closure.commit_heads)
-                .await?;
+            self.persist_git(&closure.commit_heads)?;
             self.upload_closure(&closure).await?;
+            failpoint("after_op_upload")?;
             self.drain_outbox(&mut state, pending).await?;
             return Ok(state);
         }
 
         let cloud = self.transport.get_op_heads().await?;
-        state.catalog_sequence = self
-            .transport
-            .download_git_objects(self.repository, state.catalog_sequence)
-            .await?;
+        self.git_remote.fetch_retention(self.repository)?;
+        failpoint("after_git_fetch")?;
         self.download_closures(&cloud.heads).await?;
         if !cloud.heads.is_empty() {
             self.repository
@@ -115,10 +105,9 @@ impl<'a, T: OpSyncTransport> OpSyncEngine<'a, T> {
 
         let current_heads = self.repository.current_operation_heads().await?;
         let closure = self.local_closure(current_heads, &state.accepted_heads)?;
-        self.transport
-            .upload_git_objects(self.repository, &closure.commit_heads)
-            .await?;
+        self.persist_git(&closure.commit_heads)?;
         self.upload_closure(&closure).await?;
+        failpoint("after_op_upload")?;
         let new_heads = closure
             .heads
             .iter()
@@ -143,8 +132,19 @@ impl<'a, T: OpSyncTransport> OpSyncEngine<'a, T> {
         }
         let pending = PendingOpHeadBatch::from_transactions(transactions)?;
         self.state_store.save_outbox(&pending)?;
+        failpoint("after_outbox_write")?;
         self.drain_outbox(&mut state, pending).await?;
         Ok(state)
+    }
+
+    fn persist_git(&self, heads: &BTreeSet<Oid>) -> Result<(), OpSyncEngineError> {
+        self.git_remote
+            .push_commits(self.repository, heads.iter().copied())?;
+        failpoint("after_git_push")?;
+        self.git_remote
+            .verify_commits(self.repository, heads.iter().copied())?;
+        failpoint("after_git_verify")?;
+        Ok(())
     }
 
     async fn drain_outbox(
@@ -154,11 +154,13 @@ impl<'a, T: OpSyncTransport> OpSyncEngine<'a, T> {
     ) -> Result<(), OpSyncEngineError> {
         while let Some(transaction) = pending.first_transaction() {
             let accepted = self.transport.transact_op_heads(&transaction).await?;
+            failpoint("after_head_transact")?;
             apply_heads(state, accepted);
             self.state_store.save_state(state)?;
             pending.remove_first()?;
             if pending.entries.is_empty() {
                 self.state_store.clear_outbox()?;
+                failpoint("after_outbox_clear")?;
             } else {
                 self.state_store.save_outbox(&pending)?;
             }
@@ -432,6 +434,13 @@ fn apply_heads(state: &mut OpSyncState, heads: CloudOpHeads) {
     state.accepted_heads = heads.heads;
 }
 
+fn failpoint(name: &'static str) -> Result<(), OpSyncEngineError> {
+    if std::env::var_os("DEVSPACE_FAILPOINT").as_deref() == Some(std::ffi::OsStr::new(name)) {
+        return Err(OpSyncEngineError::Failpoint(name));
+    }
+    Ok(())
+}
+
 fn request_key(new_head: OpId, observed: &BTreeSet<OpId>) -> [u8; 16] {
     let mut hasher = Blake2b512::new();
     hasher.update(new_head);
@@ -481,4 +490,8 @@ pub enum OpSyncEngineError {
     ExistingObjectMismatch { path: PathBuf },
     #[error("cloud returned an operation-store object outside the requested inventory page")]
     Inventory,
+    #[error(transparent)]
+    CanonicalRemote(#[from] CanonicalRemoteError),
+    #[error("failpoint `{0}` fired")]
+    Failpoint(&'static str),
 }

@@ -180,10 +180,6 @@ impl MachineStore {
         self.repository_directory(identity).join("sync")
     }
 
-    pub fn repository_packs_path(&self, identity: &RepositoryIdentity) -> PathBuf {
-        self.repository_directory(identity).join("packs")
-    }
-
     fn repository_directory(&self, identity: &RepositoryIdentity) -> PathBuf {
         self.repository_removal_root(identity)
             .join(identity.incarnation.as_str())

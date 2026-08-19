@@ -147,6 +147,7 @@ pub(super) async fn push_bookmarks(
         .block_on(push_requested(
             &session.repository,
             &session.transport,
+            &session.git_remote,
             &remote_name,
             &requested,
             &snapshot,
@@ -170,6 +171,7 @@ struct PushOutcome {
 async fn push_requested(
     repository: &MachineGitRepository,
     transport: &devspace_machine::GitHttpTransport,
+    git_remote: &devspace_machine::CanonicalGitRemote,
     remote: &str,
     requested: &[RequestedBookmark],
     snapshot: &ProjectionGitSnapshot,
@@ -205,6 +207,7 @@ async fn push_requested(
     let result = match push_with_journal(
         repository,
         transport,
+        git_remote,
         remote,
         &heads,
         new_batch_id()?,
