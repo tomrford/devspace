@@ -109,7 +109,7 @@ impl Git {
         let checkout_args = self.base_args([
             OsString::from("-C"),
             temp_checkout.path().as_os_str().to_os_string(),
-            OsString::from("checkout"),
+            OsString::from("switch"),
             OsString::from("--detach"),
             OsString::from("--force"),
             OsString::from("--end-of-options"),

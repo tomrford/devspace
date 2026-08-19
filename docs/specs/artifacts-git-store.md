@@ -290,12 +290,14 @@ A disposable private Artifact accepted machine retention refs of the form
 `ls-remote`. Exact Git bytes, including `jj:trees` extras on the carry tree,
 round-tripped. Two machines pushed concurrent retention refs without
 serializing. A create-lease against an existing retention ref was rejected.
-A 24-commit incremental push then fetched on a fresh machine.
+A 24-commit incremental push then fetched on a fresh machine. A fresh
+machine rebuilt the jj operation log from the Artifact Git remote plus the
+operation store. A crash after Git push recovered on retry against the same
+Artifact.
 
 Repository write tokens can be minted with an explicit TTL. The plaintext
 token includes a `?expires=` suffix, so it must be percent-encoded in Git
 URL userinfo. Artifacts rejects `--atomic` push and hangs up; a single-ref
 `--force-with-lease` push is enough for machine-owned retention. Unreachable
-object GC was not exposed as a client control. Full live jj recovery still
-needs a Worker operation store beside the Artifact; this spike did not
-deploy one.
+object GC was not exposed as a client control. This spike did not deploy a
+Devspace Worker.

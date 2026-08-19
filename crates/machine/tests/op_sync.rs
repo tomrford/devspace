@@ -317,6 +317,93 @@ async fn crash_at_each_upload_boundary_recovers_on_retry() {
     }
 }
 
+fn live_git_remote(id: u8) -> Option<CanonicalGitRemote> {
+    let url = std::env::var("DEVSPACE_CANONICAL_GIT_REMOTE")
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    let machine_id = MachineId::parse(format!("{id:02x}").repeat(16)).unwrap();
+    Some(
+        CanonicalGitRemote::from_env(machine_id.clone()).unwrap_or_else(|_| {
+            CanonicalGitRemote::new(url, machine_id, GitProcessEnvironment::default())
+        }),
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires DEVSPACE_CANONICAL_GIT_REMOTE against a disposable Artifact"]
+async fn live_artifact_fresh_machine_rebuilds_jj_from_git_and_ops() {
+    let git_remote = live_git_remote(0xa0)
+        .expect("DEVSPACE_CANONICAL_GIT_REMOTE must name the disposable Artifact");
+    let temp = tempfile::tempdir().unwrap();
+    let mut source = offline_machine(&temp.path().join("source"), "live-source").await;
+    let source_state = OpSyncStore::open(temp.path().join("source-sync")).unwrap();
+    let mut cloud = FakeCloud::default();
+
+    OpSyncEngine::new(&mut source, &source_state, &mut cloud, &git_remote)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(cloud.heads.len(), 1);
+    let expected = op_log(source.repo()).await;
+
+    let mut rebuilt = MachineGitRepository::init(temp.path().join("rebuilt"), &settings())
+        .await
+        .unwrap();
+    let rebuilt_state = OpSyncStore::open(temp.path().join("rebuilt-sync")).unwrap();
+    OpSyncEngine::new(&mut rebuilt, &rebuilt_state, &mut cloud, &git_remote)
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(rebuilt.repo().op_id(), source.repo().op_id());
+    assert_eq!(op_log(rebuilt.repo()).await, expected);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires DEVSPACE_CANONICAL_GIT_REMOTE against a disposable Artifact"]
+async fn live_artifact_recovers_after_git_push_failpoint() {
+    let _env = failpoint_lock().await;
+    let git_remote = live_git_remote(0xa1)
+        .expect("DEVSPACE_CANONICAL_GIT_REMOTE must name the disposable Artifact");
+    let temp = tempfile::tempdir().unwrap();
+    let mut repository = offline_machine(&temp.path().join("repo"), "live-crash").await;
+    let state = OpSyncStore::open(temp.path().join("sync")).unwrap();
+    let mut cloud = FakeCloud::default();
+
+    unsafe {
+        std::env::set_var("DEVSPACE_FAILPOINT", "after_git_push");
+    }
+    let error = OpSyncEngine::new(&mut repository, &state, &mut cloud, &git_remote)
+        .run()
+        .await
+        .expect_err("after_git_push");
+    unsafe {
+        std::env::remove_var("DEVSPACE_FAILPOINT");
+    }
+    assert!(matches!(
+        error,
+        OpSyncEngineError::Failpoint("after_git_push")
+    ));
+    assert!(cloud.heads.is_empty());
+
+    OpSyncEngine::new(&mut repository, &state, &mut cloud, &git_remote)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(cloud.heads.len(), 1);
+    assert!(state.load_outbox().unwrap().is_none());
+
+    let mut rebuilt = MachineGitRepository::init(temp.path().join("rebuilt"), &settings())
+        .await
+        .unwrap();
+    let rebuilt_state = OpSyncStore::open(temp.path().join("rebuilt-sync")).unwrap();
+    OpSyncEngine::new(&mut rebuilt, &rebuilt_state, &mut cloud, &git_remote)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.repo().op_id(), repository.repo().op_id());
+}
+
 async fn op_log(
     repo: &std::sync::Arc<jj_lib::repo::ReadonlyRepo>,
 ) -> BTreeMap<Vec<u8>, (Operation, View)> {
