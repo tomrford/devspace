@@ -1,11 +1,12 @@
 # Validation kernel
 
-Devspace has one validation kernel for every byte stored by the repository
-Durable Object. The native Rust library and zero-import WebAssembly build share
-the same parsers, identity functions, bounds, and reference extraction.
+Devspace has one validation kernel for Git objects and for every operation
+object stored by the repository Durable Object. The native Rust library and
+zero-import WebAssembly build share the same parsers, identity functions,
+bounds, and reference extraction.
 
 The kernel does not depend on `jj-lib`, `gix`, or a system Git library. It
-implements only the canonical formats that the cloud must validate.
+implements only the canonical Git and simple operation-store formats.
 
 ## Git objects
 
@@ -41,16 +42,19 @@ reconstructs the semantic value, and rejects non-canonical encodings.
 The accepted schema is exactly jj's operation and view format. Devspace adds no
 fields to these objects.
 
-Git objects and operation objects have separate namespaces, routes, and
-closure rules. A commit references a tree and parents; a tree references its
-entries; an operation references its parent operations and view; a view
-references Git commits through jj's commit IDs.
+Git objects and operation objects have separate namespaces and closure rules.
+A commit references a tree and parents; a tree references its entries; an
+operation references its parent operations and view; a view references Git
+commits through jj's commit IDs. Git objects travel on the private Git remote.
+Operation objects use Worker routes.
 
 ## WebAssembly boundary
 
 `crates/kernel-wasm` exports validation for Git and operation objects from one
-module. The Worker calls it before an object can enter durable storage.
-Malformed input returns a typed error and cannot trap the Worker.
+module. The Worker calls operation and view validation before those objects
+enter Durable Object storage. Git validation stays in the shared module for
+machine closure checks and golden vectors. Malformed input returns a typed
+error and cannot trap the Worker.
 
 `scripts/build-wasm.mjs` builds exactly this one module into `dist/kernel.wasm`
 and enforces three properties on every build:
@@ -68,8 +72,9 @@ repository views.
 
 Native and WebAssembly validators must return the same identity and references
 for every vector. Structured vectors are also checked under every truncation
-and single-byte mutation. Pack installation repeats identity validation and
-rejects missing references or no-clobber violations.
+and single-byte mutation. Git persist repeats identity validation on the
+machine and rejects a missing object after fetch. The Worker rejects
+no-clobber violations for operation objects.
 
 Run the complete proof:
 

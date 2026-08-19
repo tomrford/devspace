@@ -3,21 +3,9 @@
 //! Replaces the DSPK pack transport. Git objects move through standard Git
 //! fetch and push. jj operation and view objects stay on the Durable Object.
 //!
-//! Mutation boundaries recorded from the previous pack path:
-//! 1. local object write (Git ODB)
-//! 2. inventory of cloud-known objects
-//! 3. pack manifest upload
-//! 4. pack chunk upload
-//! 5. pack install transaction
-//! 6. operation-object upload
-//! 7. durable outbox write
-//! 8. operation-head transaction
-//! 9. outbox clear
-//!
-//! The Git remote collapses steps 2–5 into: advance a retention root, push it,
-//! and verify a fresh fetch can read every required object. Extra immutable
-//! objects after a crash are acceptable. A published jj head with missing Git
-//! data is not.
+//! Upload order: advance a retention root, push it, verify a fresh fetch, then
+//! upload jj objects and transact heads. Extra immutable Git objects after a
+//! crash are acceptable. A published jj head with missing Git data is not.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

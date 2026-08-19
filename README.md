@@ -74,7 +74,9 @@ single-repository creation nonce.
 
 Canonical commits, trees, and blobs are ordinary Git objects. Jujutsu
 operations and views use jj's simple operation-store protobuf encoding and
-Blake2b object IDs. The kernel validates both formats before cloud storage.
+Blake2b object IDs. The machine validates Git objects before they reach the
+private remote. The Worker validates operation objects before Durable Object
+storage.
 
 `store/extra` is a rebuildable local GitBackend cache. It is never replicated
 and is reconstructed from canonical Git object bytes when required.

@@ -36,8 +36,8 @@ existence of private history.
 
 Projection writes each rewritten commit directly to the object database and
 records its canonical/public pair. A seeded public commit must have a complete
-local object closure. If it is missing, push installs the cloud catalog and
-retries projection once from those exact seed bytes.
+local object closure. If it is missing, push fetches retention refs from the
+canonical Git remote and retries projection once from those exact seed bytes.
 
 Tree and commit rewriting is deterministic. The same canonical commit and
 effective hidden policy produce byte-identical public objects on every machine.
@@ -86,8 +86,8 @@ the one shared OID in an identity cursor. Pending identity pushes expose that
 OID as `identityOid`. Rewritten history stores the pair and the nullable
 64-byte identity of the effective hidden set.
 
-Before mutation, the Worker checks request capacity, object durability,
-request-wide canonical bindings, hidden-set lineage, and expected cursors. It
+Before mutation, the Worker checks request capacity, request-wide canonical
+bindings, hidden-set lineage, and expected cursors. It
 rejects identity-shaped pair states. The same canonical OID cannot be presented
 with conflicting public OIDs or hidden-set lineages in one request or against
 stored state.
@@ -116,8 +116,8 @@ activates every cursor atomically or records an aborted result. A partially
 accepted multi-ref push never becomes a partially committed journal update.
 
 Fetch records observed public refs, any new pair states, and either a proposed
-state index or `identityOid`. The Worker verifies that all referenced commits
-are already durable before it advances cursors.
+state index or `identityOid`. The client persists those commits on the
+canonical Git remote before the Worker advances cursors.
 
 ## Verification
 
@@ -138,7 +138,7 @@ The projection suite proves:
 - a settled aborted claim refreshes state without an unnecessary replay.
 
 The Worker checks journal mutations transactionally and rejects stale
-incarnations, stale leases, missing durable commits, identity-shaped pair
+incarnations, stale leases, identity-shaped pair
 states, conflicting bindings, ambiguous lineage, and request-key reuse. The
 native client validates snapshot page structure but relies on deterministic
 projection instead of negotiating between different machine-minted public
