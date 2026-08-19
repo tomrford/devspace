@@ -138,8 +138,8 @@ The projection suite proves:
 - a settled aborted claim refreshes state without an unnecessary replay.
 
 The Worker checks journal mutations transactionally and rejects stale
-incarnations, stale leases, identity-shaped pair
-states, conflicting bindings, ambiguous lineage, and request-key reuse. The
+incarnations, stale leases, identity-shaped pair states, conflicting bindings,
+ambiguous lineage, and request-key reuse. The
 native client validates snapshot page structure but relies on deterministic
 projection instead of negotiating between different machine-minted public
 objects.
