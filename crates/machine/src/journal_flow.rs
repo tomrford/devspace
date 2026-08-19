@@ -43,6 +43,7 @@ pub struct FetchFlowResult {
     pub disclosure_warnings: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn push_with_journal(
     repository: &MachineGitRepository,
     transport: &GitHttpTransport,
@@ -210,13 +211,8 @@ async fn push_with_journal_attempt(
             })
         }));
     let mut mappings = ProjectionMappings::from_rows(seed_rows)?;
-    let projected = project_with_canonical_seeds(
-        repository,
-        git_remote,
-        &active_heads,
-        &mut mappings,
-    )
-    .await?;
+    let projected =
+        project_with_canonical_seeds(repository, git_remote, &active_heads, &mut mappings).await?;
     let projected_by_canonical = active_heads
         .iter()
         .copied()

@@ -5,12 +5,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use devspace_machine::{
-    CatalogEntry, MachineConfig, MachineStore, MachineStoreError, RepositoryIdentity,
-    RepositoryName, RepositorySyncGuard,
-};
-use devspace_machine::{
     CanonicalGitRemote, GitHttpTransport, MachineGitRepository, OpSyncEngine, OpSyncEngineError,
     OpSyncStore,
+};
+use devspace_machine::{
+    CatalogEntry, MachineConfig, MachineStore, MachineStoreError, RepositoryIdentity,
+    RepositoryName, RepositorySyncGuard,
 };
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};

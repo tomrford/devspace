@@ -5,11 +5,11 @@ use std::io::Write as _;
 use std::path::Path;
 
 use clap::parser::ValueSource;
-use devspace_machine::{CatalogEntry, MachineStore, RepositorySyncGuard};
 use devspace_machine::{
     CanonicalGitRemote, GitHttpTransport, MachineGitRepository, Oid, RegisteredGitRemote,
     encode_lower_hex,
 };
+use devspace_machine::{CatalogEntry, MachineStore, RepositorySyncGuard};
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_cli::ui::Ui;

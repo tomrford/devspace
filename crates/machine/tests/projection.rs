@@ -197,9 +197,7 @@ fn hidden_projection_is_minimal_deterministic_and_cloud_durable() {
         &settings(),
     ))
     .unwrap();
-    remote
-        .verify_commits(&destination, [public_head])
-        .unwrap();
+    remote.verify_commits(&destination, [public_head]).unwrap();
     assert_eq!(read_raw(&destination, public_head), public_bytes);
     let installed_commit = block_on(
         destination

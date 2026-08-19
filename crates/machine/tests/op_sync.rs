@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use devspace_kernel::ops::{OpReferenceKind, validate_op};
 use devspace_machine::{
-    CanonicalGitRemote, CloudOpHeads, GitProcessEnvironment, MachineGitRepository, MachineId,
-    OpId, OpObjectKey, OpObjectKind, OpSyncEngine, OpSyncEngineError, OpSyncStore, OpSyncTransport,
+    CanonicalGitRemote, CloudOpHeads, GitProcessEnvironment, MachineGitRepository, MachineId, OpId,
+    OpObjectKey, OpObjectKind, OpSyncEngine, OpSyncEngineError, OpSyncStore, OpSyncTransport,
     OpTransportError, PendingOpHeadTransaction, init_bare_remote,
 };
 use jj_lib::object_id::ObjectId as _;

@@ -4,8 +4,8 @@ use std::thread;
 
 use devspace_kernel::{ObjectKind, Oid, validate};
 use devspace_machine::{
-    CanonicalGitRemote, GitProcessEnvironment, MachineGitRepository, MachineId,
-    delete_remote_ref, encode_lower_hex, gc_bare_remote, init_bare_remote,
+    CanonicalGitRemote, GitProcessEnvironment, MachineGitRepository, MachineId, delete_remote_ref,
+    encode_lower_hex, gc_bare_remote, init_bare_remote,
 };
 use jj_lib::settings::UserSettings;
 
@@ -85,7 +85,11 @@ fn write_fixture_graph(repository: &MachineGitRepository) -> BTreeSet<Oid> {
     BTreeSet::from([unknown, signed, conflicted])
 }
 
-fn assert_exact_objects(source: &MachineGitRepository, destination: &MachineGitRepository, ids: &BTreeSet<Oid>) {
+fn assert_exact_objects(
+    source: &MachineGitRepository,
+    destination: &MachineGitRepository,
+    ids: &BTreeSet<Oid>,
+) {
     for id in ids {
         let expected = validate(ObjectKind::Commit, &read_raw(source, *id)).unwrap();
         assert_eq!(expected.id, *id);
@@ -125,7 +129,9 @@ async fn machine_anchor_round_trips_exact_git_bytes() {
     remote.push_commits(&source, heads.iter().copied()).unwrap();
 
     let destination = machine(&temp.path().join("destination")).await;
-    remote.verify_commits(&destination, heads.iter().copied()).unwrap();
+    remote
+        .verify_commits(&destination, heads.iter().copied())
+        .unwrap();
     assert_exact_objects(&source, &destination, &heads);
     assert!(
         !user_heads(destination.git_repo_path()).contains("__devspace"),
@@ -144,7 +150,9 @@ async fn machine_anchor_survives_forced_gc() {
     remote.push_commits(&source, heads.iter().copied()).unwrap();
     gc_bare_remote(&remote_path).unwrap();
     let after_gc = machine(&temp.path().join("gc")).await;
-    remote.verify_commits(&after_gc, heads.iter().copied()).unwrap();
+    remote
+        .verify_commits(&after_gc, heads.iter().copied())
+        .unwrap();
     assert_exact_objects(&source, &after_gc, &heads);
 }
 
@@ -188,8 +196,12 @@ async fn two_machines_push_without_serializing_on_machine_refs() {
     left_push.join().unwrap().unwrap();
 
     let recovered = machine(&temp.path().join("recovered")).await;
-    left_remote.verify_commits(&recovered, left_heads.iter().copied()).unwrap();
-    right_remote.verify_commits(&recovered, [right_head]).unwrap();
+    left_remote
+        .verify_commits(&recovered, left_heads.iter().copied())
+        .unwrap();
+    right_remote
+        .verify_commits(&recovered, [right_head])
+        .unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -214,7 +226,9 @@ async fn deleted_machine_ref_can_be_recreated() {
     .unwrap();
     remote.push_commits(&source, heads.iter().copied()).unwrap();
     let destination = machine(&temp.path().join("destination")).await;
-    remote.verify_commits(&destination, heads.iter().copied()).unwrap();
+    remote
+        .verify_commits(&destination, heads.iter().copied())
+        .unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -278,7 +292,11 @@ async fn machine_anchor_retains_a_long_commit_chain() {
             &[],
         );
         if index % 11 == 0 {
-            let blob = write_raw(&source, ObjectKind::Blob, format!("chain-{index}\n").as_bytes());
+            let blob = write_raw(
+                &source,
+                ObjectKind::Blob,
+                format!("chain-{index}\n").as_bytes(),
+            );
             let mut bytes = b"100644 file\0".to_vec();
             bytes.extend_from_slice(&blob.0);
             tree = write_raw(&source, ObjectKind::Tree, &bytes);

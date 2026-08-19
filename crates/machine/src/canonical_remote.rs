@@ -189,7 +189,9 @@ impl CanonicalGitRemote {
                 .map(|(reference, status)| {
                     (
                         reference.to_string(),
-                        status.observed_oid.expect("observed after a successful push"),
+                        status
+                            .observed_oid
+                            .expect("observed after a successful push"),
                     )
                 })
                 .collect(),
@@ -204,7 +206,9 @@ impl CanonicalGitRemote {
         fetch_refspecs(
             repository.git_repo_path(),
             &self.url,
-            &[format!("+{REMOTE_RETENTION_PREFIX}*:{LOCAL_RETENTION_PREFIX}*")],
+            &[format!(
+                "+{REMOTE_RETENTION_PREFIX}*:{LOCAL_RETENTION_PREFIX}*"
+            )],
             &self.environment,
         )
         .map_err(CanonicalRemoteError::Fetch)?;
@@ -283,7 +287,8 @@ fn remote_oid(
     reference: &str,
     environment: &GitProcessEnvironment,
 ) -> Result<Option<Oid>, CanonicalRemoteError> {
-    let refs = ls_remote_matching(url, reference, environment).map_err(CanonicalRemoteError::Observe)?;
+    let refs =
+        ls_remote_matching(url, reference, environment).map_err(CanonicalRemoteError::Observe)?;
     Ok(refs.get(reference).copied())
 }
 
@@ -373,7 +378,10 @@ fn git_reachable_keys(
                         devspace_kernel::TreeEntryKind::Gitlink => continue,
                         _ => ObjectKind::Blob,
                     };
-                    pending.insert(ObjectKey { kind, id: entry.oid });
+                    pending.insert(ObjectKey {
+                        kind,
+                        id: entry.oid,
+                    });
                 }
             }
             ObjectKind::Commit => {
@@ -427,7 +435,12 @@ fn write_object(
 
 fn object_exists(repository: &MachineGitRepository, id: Oid) -> bool {
     let git_id = gix::ObjectId::from_bytes_or_panic(&id.0);
-    repository.git_repo().try_find_object(git_id).ok().flatten().is_some()
+    repository
+        .git_repo()
+        .try_find_object(git_id)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn require_object(
@@ -454,13 +467,14 @@ fn authenticated_git_url(url: &str, token: &str) -> String {
 }
 
 fn encode_userinfo(value: &str) -> String {
+    use std::fmt::Write as _;
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 encoded.push(byte as char);
             }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
+            _ => write!(encoded, "%{byte:02X}").expect("write to String"),
         }
     }
     encoded
@@ -468,7 +482,8 @@ fn encode_userinfo(value: &str) -> String {
 
 pub fn init_bare_remote(path: impl AsRef<Path>) -> Result<RemoteUrl, CanonicalRemoteError> {
     let path = path.as_ref();
-    std::fs::create_dir_all(path).map_err(|source| CanonicalRemoteError::WriteObject(source.to_string()))?;
+    std::fs::create_dir_all(path)
+        .map_err(|source| CanonicalRemoteError::WriteObject(source.to_string()))?;
     let status = std::process::Command::new("git")
         .args(["init", "--bare", "--quiet"])
         .arg(path)

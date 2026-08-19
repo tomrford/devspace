@@ -24,16 +24,16 @@ mod projection;
 mod store;
 mod wire;
 
+pub use canonical_remote::{
+    CanonicalGitRemote, CanonicalRemoteError, RetentionPush, delete_remote_ref, gc_bare_remote,
+    init_bare_remote,
+};
 pub use control_plane_client::{
     CloudRepository, ControlPlaneClient, ControlPlaneClientError, ControlPlaneRemoteErrorKind,
 };
 pub use creation_intent::{
     RepositoryCreationIntent, RepositoryCreationIntentError, RepositoryCreationKey,
     RepositoryCreationTarget,
-};
-pub use canonical_remote::{
-    CanonicalGitRemote, CanonicalRemoteError, RetentionPush, delete_remote_ref,
-    gc_bare_remote, init_bare_remote,
 };
 pub use fsync::sync_directory;
 pub use git_subprocess::{

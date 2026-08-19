@@ -288,13 +288,13 @@ async fn non_noop_push_does_not_use_worker_git_object_routes() {
     let destination = MachineGitRepository::init(temp.path().join("fresh"), &settings())
         .await
         .unwrap();
-    canonical
-        .verify_commits(&destination, [head])
-        .unwrap();
+    canonical.verify_commits(&destination, [head]).unwrap();
     let requests = server.join().unwrap();
-    assert!(requests.iter().all(|request| {
-        !request.contains("/packs") && !request.contains("/git/objects/")
-    }));
+    assert!(
+        requests
+            .iter()
+            .all(|request| { !request.contains("/packs") && !request.contains("/git/objects/") })
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1156,22 +1156,25 @@ fn assert_remote_blobs_include(remote: &std::path::Path, sentinel: &[u8]) {
         .output()
         .unwrap();
     assert!(listed.status.success());
-    let found = String::from_utf8(listed.stdout).unwrap().lines().any(|line| {
-        let (oid, kind) = line.split_once(' ').unwrap();
-        if kind != "blob" {
-            return false;
-        }
-        let blob = Command::new("git")
-            .arg(format!("--git-dir={}", remote.display()))
-            .args(["cat-file", "blob", oid])
-            .output()
-            .unwrap();
-        blob.status.success()
-            && blob
-                .stdout
-                .windows(sentinel.len())
-                .any(|window| window == sentinel)
-    });
+    let found = String::from_utf8(listed.stdout)
+        .unwrap()
+        .lines()
+        .any(|line| {
+            let (oid, kind) = line.split_once(' ').unwrap();
+            if kind != "blob" {
+                return false;
+            }
+            let blob = Command::new("git")
+                .arg(format!("--git-dir={}", remote.display()))
+                .args(["cat-file", "blob", oid])
+                .output()
+                .unwrap();
+            blob.status.success()
+                && blob
+                    .stdout
+                    .windows(sentinel.len())
+                    .any(|window| window == sentinel)
+        });
     assert!(found, "canonical remote is missing the private sentinel");
 }
 
