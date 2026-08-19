@@ -130,6 +130,7 @@ async fn up_to_date_push_does_not_request_the_pack_catalog_or_chunks() {
     let head_hex = oid_hex(head);
     let (base_url, server) = create_server(move |_, request, stream| {
         let request_line = request.lines().next().unwrap();
+        deny_retired_git_object_routes(request_line);
         if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
             respond(
                 stream,
@@ -201,7 +202,7 @@ async fn up_to_date_push_does_not_request_the_pack_catalog_or_chunks() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn non_noop_push_omits_every_cloud_known_git_object() {
+async fn non_noop_push_does_not_use_worker_git_object_routes() {
     let temp = tempfile::tempdir().unwrap();
     let canonical = journal_remote(&temp.path().join("canonical.git"));
     let repository = MachineGitRepository::init(temp.path().join("machine"), &settings())
@@ -224,6 +225,7 @@ async fn non_noop_push_omits_every_cloud_known_git_object() {
     let remote_url = remote.to_string_lossy().into_owned();
     let (base_url, server) = create_server(move |_, request, stream| {
         let request_line = request.lines().next().unwrap();
+        deny_retired_git_object_routes(request_line);
         if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
             respond(
                 stream,
@@ -237,18 +239,6 @@ async fn non_noop_push_omits_every_cloud_known_git_object() {
                 "200 OK",
                 r#"{"activationCursor":0,"cursors":[],"mappings":[],"nextAfter":0,"through":0,"hasMore":false,"pending":[]}"#,
             );
-        } else if request_line.starts_with("POST ")
-            && request_line.contains("/git/objects/inventory ")
-        {
-            let body: serde_json::Value =
-                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-            respond(
-                stream,
-                "200 OK",
-                &serde_json::json!({"keys": body["keys"]}).to_string(),
-            );
-        } else if request_line.contains("/packs/") {
-            panic!("cloud-known closure was retransmitted: {request_line}");
         } else if request_line.starts_with("POST ")
             && request_line.contains("/git/projection/pushes ")
         {
@@ -265,7 +255,7 @@ async fn non_noop_push_omits_every_cloud_known_git_object() {
             );
             return true;
         } else {
-            panic!("unexpected cloud-known push request: {request_line}");
+            panic!("unexpected projection push request: {request_line}");
         }
         false
     });
@@ -295,12 +285,102 @@ async fn non_noop_push_omits_every_cloud_known_git_object() {
     .unwrap();
 
     assert_eq!(result.outcome, "accepted");
+    let destination = MachineGitRepository::init(temp.path().join("fresh"), &settings())
+        .await
+        .unwrap();
+    canonical
+        .verify_commits(&destination, [head])
+        .unwrap();
     let requests = server.join().unwrap();
-    assert!(
-        requests
-            .iter()
-            .any(|request| request.contains("/git/objects/inventory "))
-    );
+    assert!(requests.iter().all(|request| {
+        !request.contains("/packs") && !request.contains("/git/objects/")
+    }));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hidden_paths_are_absent_from_the_publishable_remote_by_object_traversal() {
+    let temp = tempfile::tempdir().unwrap();
+    let canonical_path = temp.path().join("canonical.git");
+    let canonical = journal_remote(&canonical_path);
+    let repository = MachineGitRepository::init(temp.path().join("machine"), &settings())
+        .await
+        .unwrap();
+    let sentinel = b"private-sentinel-bytes\0hidden";
+    let (head, _) = write_hidden_commit(&repository, None, sentinel);
+    let remote = temp.path().join("publishable.git");
+    let initialized = Command::new("git")
+        .args(["init", "--bare", remote.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(initialized.status.success());
+    let remote_url = remote.to_string_lossy().into_owned();
+    let (base_url, server) = create_server(move |_, request, stream| {
+        let request_line = request.lines().next().unwrap();
+        deny_retired_git_object_routes(request_line);
+        if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
+            respond(
+                stream,
+                "200 OK",
+                &serde_json::json!({"remotes": [{"name": "origin", "url": remote_url}]})
+                    .to_string(),
+            );
+        } else if request_line.starts_with("GET ") && request_line.contains("/git/projection?") {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"activationCursor":0,"cursors":[],"mappings":[],"nextAfter":0,"through":0,"hasMore":false,"pending":[]}"#,
+            );
+        } else if request_line.starts_with("POST ")
+            && request_line.contains("/git/projection/pushes ")
+        {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"pending":true,"fence":1,"outcome":null}"#,
+            );
+        } else if request_line.starts_with("POST ") && request_line.contains("/recover ") {
+            respond(
+                stream,
+                "200 OK",
+                r#"{"pending":false,"fence":1,"outcome":"accepted"}"#,
+            );
+            return true;
+        } else {
+            panic!("unexpected hidden-path push request: {request_line}");
+        }
+        false
+    });
+    let transport = GitHttpTransport::new(
+        &base_url,
+        "hidden-secret",
+        &"11".repeat(16),
+        &"ab".repeat(32),
+        &"cd".repeat(16),
+    )
+    .unwrap();
+
+    let result = push_with_journal(
+        &repository,
+        &transport,
+        &canonical,
+        "origin",
+        &[PushHead {
+            bookmark: "main".to_owned(),
+            canonical_oid: Some(head),
+        }],
+        [0x71; 16],
+        &GitProcessEnvironment::new("git", GitProcessMode::Foreground),
+        PushFailpoint::None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.outcome, "accepted");
+    assert_remote_blobs_exclude(&remote, sentinel);
+    assert_remote_trees_exclude_name(&remote, b".dsprivate");
+    assert_remote_trees_exclude_name(&remote, b"secret.bin");
+    assert_remote_blobs_include(&canonical_path, sentinel);
+    drop(server.join().unwrap());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -340,6 +420,7 @@ async fn identity_cursor_stops_clean_and_hidden_children_without_identity_states
     let hidden_hex = oid_hex(hidden);
     let (base_url, server) = create_server(move |_, request, stream| {
         let request_line = request.lines().next().unwrap();
+        deny_retired_git_object_routes(request_line);
         if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
             respond(
                 stream,
@@ -368,27 +449,6 @@ async fn identity_cursor_stops_clean_and_hidden_children_without_identity_states
                     "pending": [],
                 })
                 .to_string(),
-            );
-        } else if request_line.starts_with("GET ") && request_line.contains("/packs?") {
-            respond(
-                stream,
-                "200 OK",
-                r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
-            );
-        } else if request_line.starts_with("POST ")
-            && request_line.contains("/git/objects/inventory ")
-        {
-            respond(stream, "200 OK", r#"{"keys":[]}"#);
-        } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
-            respond(stream, "200 OK", r#"{"inserted":true,"installed":false}"#);
-        } else if request_line.starts_with("POST ")
-            && request_line.contains("/packs/")
-            && request_line.contains("/install ")
-        {
-            respond(
-                stream,
-                "200 OK",
-                r#"{"installed":true,"insertedObjects":1}"#,
             );
         } else if request_line.starts_with("POST ")
             && request_line.contains("/git/projection/pushes ")
@@ -497,6 +557,7 @@ async fn settled_aborted_claim_refreshes_without_requesting_replay() {
     let mut snapshots = 0_usize;
     let (base_url, server) = create_server(move |_, request, stream| {
         let request_line = request.lines().next().unwrap();
+        deny_retired_git_object_routes(request_line);
         if request_line.starts_with("GET ") && request_line.contains("/remotes?") {
             respond(
                 stream,
@@ -543,27 +604,6 @@ async fn settled_aborted_claim_refreshes_without_requesting_replay() {
             );
         } else if request_line.contains("/replay?") {
             panic!("settled aborted claim must not request replay");
-        } else if request_line.starts_with("GET ") && request_line.contains("/packs?") {
-            respond(
-                stream,
-                "200 OK",
-                r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
-            );
-        } else if request_line.starts_with("POST ")
-            && request_line.contains("/git/objects/inventory ")
-        {
-            respond(stream, "200 OK", r#"{"keys":[]}"#);
-        } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
-            respond(stream, "200 OK", r#"{"inserted":true,"installed":false}"#);
-        } else if request_line.starts_with("POST ")
-            && request_line.contains("/packs/")
-            && request_line.contains("/install ")
-        {
-            respond(
-                stream,
-                "200 OK",
-                r#"{"installed":true,"insertedObjects":1}"#,
-            );
         } else if request_line.starts_with("POST ")
             && request_line.contains("/git/projection/pushes ")
         {
@@ -781,7 +821,7 @@ async fn live_journal_push_recovery_and_fetch_proofs() {
     }));
     eprintln!("LIVE_PROOF b passed in {:?}", started.elapsed());
 
-    // (c) A stops after Git push; fresh B claims and recovers from packs only.
+    // (c) A stops after Git push; fresh B claims and recovers from the Git remote.
     let started = std::time::Instant::now();
     let (crash_head, _) = write_hidden_commit(&a, Some(hidden_head), b"crash-private\0\xfe");
     let crashed = Command::new(std::env::current_exe().unwrap())
@@ -1066,6 +1106,73 @@ fn remote_commit(remote: &std::path::Path, oid: Oid) -> Vec<u8> {
         .unwrap();
     assert!(output.status.success());
     output.stdout
+}
+
+fn deny_retired_git_object_routes(request_line: &str) {
+    if request_line.contains("/packs") || request_line.contains("/git/objects/") {
+        panic!("retired Git object route: {request_line}");
+    }
+}
+
+fn assert_remote_trees_exclude_name(remote: &std::path::Path, name: &[u8]) {
+    let listed = Command::new("git")
+        .arg(format!("--git-dir={}", remote.display()))
+        .args([
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname) %(objecttype)",
+        ])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    for line in String::from_utf8(listed.stdout).unwrap().lines() {
+        let (oid, kind) = line.split_once(' ').unwrap();
+        if kind != "tree" {
+            continue;
+        }
+        let tree = Command::new("git")
+            .arg(format!("--git-dir={}", remote.display()))
+            .args(["cat-file", "tree", oid])
+            .output()
+            .unwrap();
+        assert!(tree.status.success());
+        let parsed = devspace_kernel::parse_tree(&tree.stdout).unwrap();
+        assert!(
+            parsed.entries.iter().all(|entry| entry.name != name),
+            "publishable tree {oid} still names {}",
+            String::from_utf8_lossy(name)
+        );
+    }
+}
+
+fn assert_remote_blobs_include(remote: &std::path::Path, sentinel: &[u8]) {
+    let listed = Command::new("git")
+        .arg(format!("--git-dir={}", remote.display()))
+        .args([
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname) %(objecttype)",
+        ])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let found = String::from_utf8(listed.stdout).unwrap().lines().any(|line| {
+        let (oid, kind) = line.split_once(' ').unwrap();
+        if kind != "blob" {
+            return false;
+        }
+        let blob = Command::new("git")
+            .arg(format!("--git-dir={}", remote.display()))
+            .args(["cat-file", "blob", oid])
+            .output()
+            .unwrap();
+        blob.status.success()
+            && blob
+                .stdout
+                .windows(sentinel.len())
+                .any(|window| window == sentinel)
+    });
+    assert!(found, "canonical remote is missing the private sentinel");
 }
 
 fn assert_remote_blobs_exclude(remote: &std::path::Path, sentinel: &[u8]) {

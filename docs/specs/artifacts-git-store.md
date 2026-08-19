@@ -282,3 +282,20 @@ nix develop -c sfw pnpm test
 Do not deploy Devspace from this spike. The result is a measured decision: a
 small implementation diff plus evidence that Artifacts can satisfy the
 invariants, or a short rejection which identifies the failed invariant.
+
+## Live Artifact findings
+
+A disposable private Artifact accepted machine retention refs of the form
+`refs/heads/__devspace/machines/<machine-id>` and advertised them on
+`ls-remote`. Exact Git bytes, including `jj:trees` extras on the carry tree,
+round-tripped. Two machines pushed concurrent retention refs without
+serializing. A create-lease against an existing retention ref was rejected.
+A 24-commit incremental push then fetched on a fresh machine.
+
+Repository write tokens can be minted with an explicit TTL. The plaintext
+token includes a `?expires=` suffix, so it must be percent-encoded in Git
+URL userinfo. Artifacts rejects `--atomic` push and hangs up; a single-ref
+`--force-with-lease` push is enough for machine-owned retention. Unreachable
+object GC was not exposed as a client control. Full live jj recovery still
+needs a Worker operation store beside the Artifact; this spike did not
+deploy one.

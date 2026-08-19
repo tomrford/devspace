@@ -525,8 +525,10 @@ fn push_command(
         "push".into(),
         "--porcelain".into(),
         "--no-verify".into(),
-        "--atomic".into(),
     ];
+    if updates.len() > 1 {
+        args.push("--atomic".into());
+    }
     let mut safe = os_strings(&args);
     for (reference, update) in updates {
         let expected = update
@@ -1168,7 +1170,24 @@ mod tests {
         let command = push_command(Path::new("repo.git"), &secret, &updates, &environment);
         assert!(command.safe_shape.contains("--porcelain"));
         assert!(command.safe_shape.contains("--no-verify"));
-        assert!(command.safe_shape.contains("--atomic"));
+        assert!(
+            !command.safe_shape.contains("--atomic"),
+            "a single-ref push must work against remotes that reject atomic"
+        );
+        let extra = QualifiedRef::from_bookmark("other").unwrap();
+        let multi = updates
+            .iter()
+            .chain([(
+                &extra,
+                &LeaseUpdate {
+                    expected_old_oid: None,
+                    new_oid: Some(Oid([0x22; 20])),
+                },
+            )])
+            .map(|(reference, update)| (reference.clone(), *update))
+            .collect();
+        let multi = push_command(Path::new("repo.git"), &secret, &multi, &environment);
+        assert!(multi.safe_shape.contains("--atomic"));
         assert!(
             command
                 .safe_shape

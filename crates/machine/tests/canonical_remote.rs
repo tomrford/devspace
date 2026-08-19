@@ -257,3 +257,46 @@ async fn stale_local_state_does_not_clobber_a_newer_machine_ref() {
     let recovered = machine(&temp.path().join("recovered")).await;
     remote.verify_commits(&recovered, [later]).unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn machine_anchor_retains_a_long_commit_chain() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = machine(&temp.path().join("source")).await;
+    let blob = write_raw(&source, ObjectKind::Blob, b"chain-0\n");
+    let mut tree = b"100644 file\0".to_vec();
+    tree.extend_from_slice(&blob.0);
+    let mut tree = write_raw(&source, ObjectKind::Tree, &tree);
+    let mut heads = Vec::new();
+    let mut parent = None;
+    for index in 0..80 {
+        let commit = write_commit(
+            &source,
+            "Chain <chain@example.invalid>",
+            tree,
+            &parent.into_iter().collect::<Vec<_>>(),
+            format!("chain {index}\n").as_bytes(),
+            &[],
+        );
+        if index % 11 == 0 {
+            let blob = write_raw(&source, ObjectKind::Blob, format!("chain-{index}\n").as_bytes());
+            let mut bytes = b"100644 file\0".to_vec();
+            bytes.extend_from_slice(&blob.0);
+            tree = write_raw(&source, ObjectKind::Tree, &bytes);
+        }
+        parent = Some(commit);
+        heads.push(commit);
+    }
+    let remote = attach(&temp.path().join("remote.git"), 4);
+    remote
+        .push_commits(&source, heads[..40].iter().copied())
+        .unwrap();
+    remote
+        .push_commits(&source, heads[40..].iter().copied())
+        .unwrap();
+
+    let destination = machine(&temp.path().join("destination")).await;
+    remote
+        .verify_commits(&destination, heads.iter().copied())
+        .unwrap();
+    assert_exact_objects(&source, &destination, &heads.into_iter().collect());
+}

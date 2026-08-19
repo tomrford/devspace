@@ -228,7 +228,10 @@ impl CanonicalGitRemote {
         repository: &MachineGitRepository,
         commits: impl IntoIterator<Item = Oid>,
     ) -> Result<(), CanonicalRemoteError> {
-        let required = commits.into_iter().collect::<BTreeSet<_>>();
+        let required = commits
+            .into_iter()
+            .filter(|oid| oid.0 != [0; 20])
+            .collect::<BTreeSet<_>>();
         if required.is_empty() {
             return Ok(());
         }
@@ -445,9 +448,22 @@ fn map_push_error(error: PushError) -> CanonicalRemoteError {
 fn authenticated_git_url(url: &str, token: &str) -> String {
     if let Some((scheme, rest)) = url.split_once("://") {
         let rest = rest.split_once('@').map_or(rest, |(_, host)| host);
-        return format!("{scheme}://x:{token}@{rest}");
+        return format!("{scheme}://x:{}@{rest}", encode_userinfo(token));
     }
     url.to_owned()
+}
+
+fn encode_userinfo(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 pub fn init_bare_remote(path: impl AsRef<Path>) -> Result<RemoteUrl, CanonicalRemoteError> {
@@ -516,9 +532,12 @@ mod tests {
     fn authenticated_url_inserts_token_and_strips_existing_userinfo() {
         let url = authenticated_git_url(
             "https://old:secret@example.invalid/git/ns/repo.git",
-            "art_v1_token",
+            "art_v1_token?expires=1760000000",
         );
-        assert_eq!(url, "https://x:art_v1_token@example.invalid/git/ns/repo.git");
+        assert_eq!(
+            url,
+            "https://x:art_v1_token%3Fexpires%3D1760000000@example.invalid/git/ns/repo.git"
+        );
         assert_eq!(format!("{:?}", RemoteUrl::new(url)), "<remote-url>");
     }
 }
