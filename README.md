@@ -17,8 +17,8 @@ In the end, devspace proved that we can legitimately synchronise jj storage acro
 
 Devspace is a Cloudflare-native store for Jujutsu repositories. `ds` embeds
 Jujutsu, keeps the canonical repository on each machine in a bare Git object
-database, and replicates Git objects plus Jujutsu operation history through a
-Worker.
+database, replicates Git objects through a private Git remote, and replicates
+Jujutsu operation history through a Worker.
 
 The cloud is a durable authority, not a hosted working copy. Checkouts stay
 local and disposable. The repository can be rebuilt exactly on a fresh machine
@@ -64,8 +64,8 @@ One logical repository has three parts:
 - a machine catalog entry with the cloud repository identity and local bare
   repository path;
 - one bare Git object database shared by every checkout on that machine;
-- one cloud `Repository` Durable Object containing validated Git packs,
-  operation objects, operation heads, and the public-Git projection journal.
+- one cloud `Repository` Durable Object containing operation objects,
+  operation heads, and the public-Git projection journal.
 
 The Worker `ControlPlane` Durable Object owns repository names, repository
 authorization, retirement, and creation. A repository Durable Object can

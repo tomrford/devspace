@@ -207,7 +207,7 @@ Git push and fetch add their own projection-journal recovery boundary. See
 The following are deliberate hard failures:
 
 - installed bytes conflict with an existing object ID;
-- a pack or operation closure is incomplete;
+- a Git or operation closure is incomplete;
 - cloud authorization names a stale incarnation;
 - an idempotency key is reused for a different request;
 - projection state would bind one canonical commit to two public commits;

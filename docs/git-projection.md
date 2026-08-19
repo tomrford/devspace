@@ -5,8 +5,8 @@ boundary. Projection removes paths selected by `.dsprivate` while preserving
 all other Git semantics that can remain byte-identical.
 
 Canonical and public objects live in the same bare Git object database and use
-ordinary 20-byte Git OIDs. Public objects are cloud-durable Git objects, not
-temporary export artifacts.
+ordinary 20-byte Git OIDs. Public objects are ordinary Git objects persisted
+on the canonical private remote, not temporary export artifacts.
 
 ## Machine projection
 
