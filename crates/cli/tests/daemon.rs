@@ -12,11 +12,11 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use devspace_machine::{CatalogEntry, MACHINE_STORE_OVERRIDE};
+use devspace_machine::CatalogEntry;
 use devspace_testutils::stalling_server::StallingServer;
 use support::{
-    configure_machine, daemon_socket_path, identity, machine_store, poll_until,
-    registered_repository_with_identity, stderr, write_cli_config,
+    configure_machine, daemon_socket_path, ds_command_with_home, identity, machine_store,
+    poll_until, registered_repository_with_identity, stderr, write_cli_config,
 };
 
 #[tokio::test]
@@ -196,17 +196,11 @@ async fn local_repository_with_identity(
 }
 
 fn daemon_command(root: &Path, config: &Path, poll_ms: u64, idle_ms: u64) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ds"));
+    let mut command = ds_command_with_home(root, root, config);
     command
-        .current_dir(root)
-        .env(MACHINE_STORE_OVERRIDE, root.join("machine-store"))
-        .env("JJ_CONFIG", config)
-        .env("DEVSPACE_BOUNDARY_SYNC", "0")
         .env("DEVSPACE_DAEMON_TEST_HOOKS", "1")
         .env("DEVSPACE_DAEMON_TEST_POLL_MS", poll_ms.to_string())
         .env("DEVSPACE_DAEMON_TEST_IDLE_MS", idle_ms.to_string())
-        .env("NO_COLOR", "1")
-        .env("PAGER", "cat")
         .args(["daemon", "run"]);
     command
 }
