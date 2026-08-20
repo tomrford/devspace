@@ -28,14 +28,21 @@ fn machine_id(byte: u8) -> MachineId {
     MachineId::parse(format!("{byte:02x}").repeat(16)).unwrap()
 }
 
+fn live_environment() -> GitProcessEnvironment {
+    match std::env::var_os("DEVSPACE_CANONICAL_GIT_TOKEN") {
+        Some(token) if !token.is_empty() => {
+            GitProcessEnvironment::default().with_http_bearer(token)
+        }
+        _ => GitProcessEnvironment::default(),
+    }
+}
+
 fn live_remote(id: u8) -> CanonicalGitRemote {
     let url = std::env::var("DEVSPACE_CANONICAL_GIT_REMOTE")
         .ok()
         .filter(|value| !value.is_empty())
         .expect("DEVSPACE_CANONICAL_GIT_REMOTE must name the disposable Artifact");
-    CanonicalGitRemote::from_env(machine_id(id)).unwrap_or_else(|_| {
-        CanonicalGitRemote::new(url, machine_id(id), GitProcessEnvironment::default())
-    })
+    CanonicalGitRemote::new(url, machine_id(id), live_environment())
 }
 
 fn write_fixture_graph(repository: &MachineGitRepository) -> BTreeSet<Oid> {
@@ -83,12 +90,8 @@ async fn live_artifact_round_trips_exact_git_bytes() {
     let heads = write_fixture_graph(&source);
     remote.push_commits(&source, heads.iter().copied()).unwrap();
 
-    let advertised = ls_remote_matching(
-        remote.url(),
-        "refs/heads/__devspace/*",
-        &GitProcessEnvironment::default(),
-    )
-    .unwrap();
+    let advertised =
+        ls_remote_matching(remote.url(), "refs/heads/__devspace/*", &live_environment()).unwrap();
     assert!(
         advertised
             .keys()
@@ -189,7 +192,7 @@ async fn live_artifact_rejects_a_stale_retention_lease() {
         )]
         .into_iter()
         .collect(),
-        &GitProcessEnvironment::default(),
+        &live_environment(),
     )
     .expect_err("creating an existing retention ref must not clobber");
     assert_eq!(error.kind, PushErrorKind::PushFailed);

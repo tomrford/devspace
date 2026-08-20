@@ -74,8 +74,6 @@ pub enum CanonicalRemoteError {
     WriteObject(String),
     #[error("retention object {0} is missing after fetch")]
     MissingAfterFetch(String),
-    #[error("retention object {expected} fetched as {actual}")]
-    ObjectMismatch { expected: String, actual: String },
     #[error("canonical Git remote is not configured")]
     MissingRemote,
 }
@@ -102,18 +100,16 @@ impl CanonicalGitRemote {
             .ok_or(CanonicalRemoteError::MissingRemote)?;
         let remote = Self::new(url, machine_id, GitProcessEnvironment::default());
         match std::env::var("DEVSPACE_CANONICAL_GIT_TOKEN") {
-            Ok(token) if !token.is_empty() => remote.with_token(&token),
+            Ok(token) if !token.is_empty() => Ok(remote.with_token(token)),
             _ => Ok(remote),
         }
     }
 
-    /// Embed a repository-scoped token in the Git URL without exposing it.
-    pub fn with_token(self, token: &str) -> Result<Self, CanonicalRemoteError> {
-        let url = authenticated_git_url(self.url.expose(), token);
-        Ok(Self {
-            url: RemoteUrl::new(url),
-            ..self
-        })
+    /// Send a repository-scoped token as a Bearer header without exposing it
+    /// in the remote URL or Git process arguments.
+    pub fn with_token(mut self, token: impl Into<std::ffi::OsString>) -> Self {
+        self.environment = self.environment.with_http_bearer(token);
+        self
     }
 
     pub fn url(&self) -> &RemoteUrl {
@@ -316,8 +312,8 @@ fn carry_tree(
             ObjectKind::Commit => continue,
         };
         let mut name = match key.kind {
-            ObjectKind::Blob => b"b/".to_vec(),
-            ObjectKind::Tree => b"t/".to_vec(),
+            ObjectKind::Blob => b"b-".to_vec(),
+            ObjectKind::Tree => b"t-".to_vec(),
             ObjectKind::Commit => continue,
         };
         name.extend_from_slice(encode_lower_hex(&key.id.0).as_bytes());
@@ -446,28 +442,6 @@ fn map_push_error(error: PushError) -> CanonicalRemoteError {
     CanonicalRemoteError::PushRejected(error)
 }
 
-fn authenticated_git_url(url: &str, token: &str) -> String {
-    if let Some((scheme, rest)) = url.split_once("://") {
-        let rest = rest.split_once('@').map_or(rest, |(_, host)| host);
-        return format!("{scheme}://x:{}@{rest}", encode_userinfo(token));
-    }
-    url.to_owned()
-}
-
-fn encode_userinfo(value: &str) -> String {
-    use std::fmt::Write as _;
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => write!(encoded, "%{byte:02X}").expect("write to String"),
-        }
-    }
-    encoded
-}
-
 pub fn init_bare_remote(path: impl AsRef<Path>) -> Result<RemoteUrl, CanonicalRemoteError> {
     let path = path.as_ref();
     std::fs::create_dir_all(path)
@@ -525,22 +499,4 @@ pub fn delete_remote_ref(
     )
     .map_err(map_push_error)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn authenticated_url_inserts_token_and_strips_existing_userinfo() {
-        let url = authenticated_git_url(
-            "https://old:secret@example.invalid/git/ns/repo.git",
-            "art_v1_token?expires=1760000000",
-        );
-        assert_eq!(
-            url,
-            "https://x:art_v1_token%3Fexpires%3D1760000000@example.invalid/git/ns/repo.git"
-        );
-        assert_eq!(format!("{:?}", RemoteUrl::new(url)), "<remote-url>");
-    }
 }

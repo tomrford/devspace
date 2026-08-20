@@ -100,6 +100,7 @@ pub enum GitProcessMode {
 pub struct GitProcessEnvironment {
     git_executable: PathBuf,
     extra: BTreeMap<OsString, OsString>,
+    http_bearer_token: Option<OsString>,
     mode: GitProcessMode,
 }
 
@@ -108,12 +109,18 @@ impl GitProcessEnvironment {
         Self {
             git_executable: git_executable.into(),
             extra: BTreeMap::new(),
+            http_bearer_token: None,
             mode,
         }
     }
 
     pub fn with_extra_environment(mut self, extra: BTreeMap<OsString, OsString>) -> Self {
         self.extra = extra;
+        self
+    }
+
+    pub fn with_http_bearer(mut self, token: impl Into<OsString>) -> Self {
+        self.http_bearer_token = Some(token.into());
         self
     }
 }
@@ -130,6 +137,7 @@ impl fmt::Debug for GitProcessEnvironment {
             .debug_struct("GitProcessEnvironment")
             .field("git_executable", &self.git_executable)
             .field("extra", &"<redacted>")
+            .field("http_bearer_token", &"<redacted>")
             .field("mode", &self.mode)
             .finish()
     }
@@ -760,6 +768,13 @@ fn os_strings(values: &[OsString]) -> Vec<String> {
 }
 fn command_environment(environment: &GitProcessEnvironment) -> BTreeMap<OsString, OsString> {
     let mut values = environment.extra.clone();
+    if let Some(token) = &environment.http_bearer_token {
+        values.insert("GIT_CONFIG_COUNT".into(), "1".into());
+        values.insert("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into());
+        let mut header = OsString::from("Authorization: Bearer ");
+        header.push(token);
+        values.insert("GIT_CONFIG_VALUE_0".into(), header);
+    }
     values.insert("LC_ALL".into(), "C".into());
     if environment.mode == GitProcessMode::Background {
         values.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
@@ -1064,6 +1079,11 @@ fn redact_stderr(
                 (!value.is_empty()).then(|| value.into_owned())
             }),
     );
+    if let Some(token) = &environment.http_bearer_token {
+        let token = token.to_string_lossy();
+        sensitive.push(token.to_string());
+        sensitive.push(format!("Authorization: Bearer {token}"));
+    }
     let mut redacted = String::new();
     for line in text.lines() {
         if sensitive.iter().any(|value| line.contains(value)) {
@@ -1166,7 +1186,8 @@ mod tests {
                 new_oid: Some(Oid([0x11; 20])),
             },
         )]);
-        let environment = GitProcessEnvironment::new("git", GitProcessMode::Foreground);
+        let environment = GitProcessEnvironment::new("git", GitProcessMode::Foreground)
+            .with_http_bearer("top-secret");
         let command = push_command(Path::new("repo.git"), &secret, &updates, &environment);
         assert!(command.safe_shape.contains("--porcelain"));
         assert!(command.safe_shape.contains("--no-verify"));
@@ -1195,9 +1216,25 @@ mod tests {
         );
         assert!(command.safe_shape.contains("<remote>"));
         assert!(!command.safe_shape.contains("secret"));
+        assert!(
+            command
+                .args
+                .iter()
+                .all(|argument| !argument.to_string_lossy().contains("top-secret"))
+        );
         assert_eq!(
             command.environment.get(&OsString::from("LC_ALL")),
             Some(&OsString::from("C"))
+        );
+        assert_eq!(
+            command.environment.get(&OsString::from("GIT_CONFIG_KEY_0")),
+            Some(&OsString::from("http.extraHeader"))
+        );
+        assert_eq!(
+            command
+                .environment
+                .get(&OsString::from("GIT_CONFIG_VALUE_0")),
+            Some(&OsString::from("Authorization: Bearer top-secret"))
         );
     }
 
