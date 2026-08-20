@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use devspace_kernel::ops::{OpReferenceKind, validate_op};
 use devspace_machine::{
-    CloudOpHeads, MachineGitRepository, OpId, OpObjectKey, OpObjectKind, OpSyncEngine, OpSyncStore,
-    OpSyncTransport, OpTransportError, PendingOpHeadTransaction,
+    CanonicalGitRemote, CloudOpHeads, GitProcessEnvironment, MachineGitRepository, MachineId, OpId,
+    OpObjectKey, OpObjectKind, OpSyncEngine, OpSyncEngineError, OpSyncStore, OpSyncTransport,
+    OpTransportError, PendingOpHeadTransaction, init_bare_remote,
 };
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::{Operation, RefTarget, RemoteRef, RemoteRefState, View};
@@ -13,6 +14,15 @@ use jj_lib::settings::UserSettings;
 
 fn settings() -> UserSettings {
     devspace_testutils::settings("Operation Sync Test", "op-sync@example.invalid", false)
+}
+
+fn git_remote(path: &std::path::Path) -> CanonicalGitRemote {
+    init_bare_remote(path).unwrap();
+    CanonicalGitRemote::new(
+        path.to_string_lossy(),
+        MachineId::parse("11".repeat(16)).unwrap(),
+        GitProcessEnvironment::default(),
+    )
 }
 
 async fn offline_machine(path: &std::path::Path, name: &str) -> MachineGitRepository {
@@ -44,22 +54,6 @@ struct FakeCloud {
 }
 
 impl OpSyncTransport for FakeCloud {
-    async fn download_git_objects(
-        &mut self,
-        _repository: &MachineGitRepository,
-        after: u64,
-    ) -> Result<u64, OpTransportError> {
-        Ok(after)
-    }
-
-    async fn upload_git_objects(
-        &mut self,
-        _repository: &MachineGitRepository,
-        _heads: &BTreeSet<devspace_machine::Oid>,
-    ) -> Result<(), OpTransportError> {
-        Ok(())
-    }
-
     async fn inventory_op_objects(
         &mut self,
         candidates: &[OpObjectKey],
@@ -137,6 +131,7 @@ impl OpSyncTransport for FakeCloud {
 
 #[tokio::test(flavor = "current_thread")]
 async fn offline_head_failure_replays_the_durable_outbox() {
+    let _env = failpoint_lock().await;
     let temp = tempfile::tempdir().unwrap();
     let mut repository = offline_machine(&temp.path().join("repo"), "offline").await;
     let state = OpSyncStore::open(temp.path().join("sync")).unwrap();
@@ -144,9 +139,10 @@ async fn offline_head_failure_replays_the_durable_outbox() {
         fail_next_transaction: true,
         ..FakeCloud::default()
     };
+    let git_remote = git_remote(&temp.path().join("canonical.git"));
 
     assert!(
-        OpSyncEngine::new(&mut repository, &state, &mut cloud)
+        OpSyncEngine::new(&mut repository, &state, &mut cloud, &git_remote)
             .run()
             .await
             .is_err()
@@ -155,7 +151,7 @@ async fn offline_head_failure_replays_the_durable_outbox() {
     assert_eq!(cloud.objects.len(), 2);
     assert!(cloud.heads.is_empty());
 
-    OpSyncEngine::new(&mut repository, &state, &mut cloud)
+    OpSyncEngine::new(&mut repository, &state, &mut cloud, &git_remote)
         .run()
         .await
         .unwrap();
@@ -198,14 +194,16 @@ impl FakeCloud {
 
 #[tokio::test(flavor = "current_thread")]
 async fn virgin_git_backend_skips_the_implicit_root_operation() {
+    let _env = failpoint_lock().await;
     let temp = tempfile::tempdir().unwrap();
     let mut repository = MachineGitRepository::init(temp.path().join("repo"), &settings())
         .await
         .unwrap();
     let state = OpSyncStore::open(temp.path().join("sync")).unwrap();
     let mut cloud = FakeCloud::default();
+    let git_remote = git_remote(&temp.path().join("canonical.git"));
 
-    let result = OpSyncEngine::new(&mut repository, &state, &mut cloud)
+    let result = OpSyncEngine::new(&mut repository, &state, &mut cloud, &git_remote)
         .run()
         .await
         .unwrap();
@@ -217,28 +215,30 @@ async fn virgin_git_backend_skips_the_implicit_root_operation() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn op_round_trip_two_machine_reconciliation_and_fresh_rebuild_are_exact() {
+    let _env = failpoint_lock().await;
     let temp = tempfile::tempdir().unwrap();
     let mut left = offline_machine(&temp.path().join("left"), "left").await;
     let mut right = offline_machine(&temp.path().join("right"), "right").await;
     let left_state = OpSyncStore::open(temp.path().join("left-sync")).unwrap();
     let right_state = OpSyncStore::open(temp.path().join("right-sync")).unwrap();
     let mut cloud = FakeCloud::default();
+    let git_remote = git_remote(&temp.path().join("canonical.git"));
 
-    OpSyncEngine::new(&mut left, &left_state, &mut cloud)
+    OpSyncEngine::new(&mut left, &left_state, &mut cloud, &git_remote)
         .run()
         .await
         .unwrap();
     assert_eq!(cloud.heads.len(), 1);
     assert_eq!(cloud.objects.len(), 2);
 
-    OpSyncEngine::new(&mut right, &right_state, &mut cloud)
+    OpSyncEngine::new(&mut right, &right_state, &mut cloud, &git_remote)
         .run()
         .await
         .unwrap();
     assert_eq!(cloud.heads.len(), 1);
     assert_eq!(cloud.cursor, 2);
 
-    OpSyncEngine::new(&mut left, &left_state, &mut cloud)
+    OpSyncEngine::new(&mut left, &left_state, &mut cloud, &git_remote)
         .run()
         .await
         .unwrap();
@@ -249,7 +249,7 @@ async fn op_round_trip_two_machine_reconciliation_and_fresh_rebuild_are_exact() 
         .await
         .unwrap();
     let rebuilt_state = OpSyncStore::open(temp.path().join("rebuilt-sync")).unwrap();
-    OpSyncEngine::new(&mut rebuilt, &rebuilt_state, &mut cloud)
+    OpSyncEngine::new(&mut rebuilt, &rebuilt_state, &mut cloud, &git_remote)
         .run()
         .await
         .unwrap();
@@ -257,6 +257,151 @@ async fn op_round_trip_two_machine_reconciliation_and_fresh_rebuild_are_exact() 
     assert_eq!(rebuilt.repo().op_id(), right.repo().op_id());
     assert_eq!(op_log(rebuilt.repo()).await, expected);
     assert!(rebuilt_state.load_outbox().unwrap().is_none());
+}
+
+async fn failpoint_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    ENV.lock().await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn crash_at_each_upload_boundary_recovers_on_retry() {
+    let _env = failpoint_lock().await;
+    for name in [
+        "after_git_fetch",
+        "after_git_push",
+        "after_git_verify",
+        "after_op_upload",
+        "after_outbox_write",
+        "after_head_transact",
+        "after_outbox_clear",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut repository = offline_machine(&temp.path().join("repo"), name).await;
+        let state = OpSyncStore::open(temp.path().join("sync")).unwrap();
+        let mut cloud = FakeCloud::default();
+        let git_remote = git_remote(&temp.path().join("canonical.git"));
+
+        // SAFETY: tests serialize this process-wide variable behind ENV.
+        unsafe {
+            std::env::set_var("DEVSPACE_FAILPOINT", name);
+        }
+        let error = OpSyncEngine::new(&mut repository, &state, &mut cloud, &git_remote)
+            .run()
+            .await
+            .expect_err(name);
+        unsafe {
+            std::env::remove_var("DEVSPACE_FAILPOINT");
+        }
+        assert!(
+            matches!(error, OpSyncEngineError::Failpoint(fired) if fired == name),
+            "{name}: {error}"
+        );
+
+        OpSyncEngine::new(&mut repository, &state, &mut cloud, &git_remote)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(cloud.heads.len(), 1, "{name}");
+        assert!(state.load_outbox().unwrap().is_none(), "{name}");
+
+        let mut rebuilt = MachineGitRepository::init(temp.path().join("rebuilt"), &settings())
+            .await
+            .unwrap();
+        let rebuilt_state = OpSyncStore::open(temp.path().join("rebuilt-sync")).unwrap();
+        OpSyncEngine::new(&mut rebuilt, &rebuilt_state, &mut cloud, &git_remote)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(rebuilt.repo().op_id(), repository.repo().op_id(), "{name}");
+    }
+}
+
+fn live_git_remote(id: u8) -> Option<CanonicalGitRemote> {
+    let url = std::env::var("DEVSPACE_CANONICAL_GIT_REMOTE")
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    let machine_id = MachineId::parse(format!("{id:02x}").repeat(16)).unwrap();
+    Some(
+        CanonicalGitRemote::from_env(machine_id.clone()).unwrap_or_else(|_| {
+            CanonicalGitRemote::new(url, machine_id, GitProcessEnvironment::default())
+        }),
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires DEVSPACE_CANONICAL_GIT_REMOTE against a disposable Artifact"]
+async fn live_artifact_fresh_machine_rebuilds_jj_from_git_and_ops() {
+    let git_remote = live_git_remote(0xa0)
+        .expect("DEVSPACE_CANONICAL_GIT_REMOTE must name the disposable Artifact");
+    let temp = tempfile::tempdir().unwrap();
+    let mut source = offline_machine(&temp.path().join("source"), "live-source").await;
+    let source_state = OpSyncStore::open(temp.path().join("source-sync")).unwrap();
+    let mut cloud = FakeCloud::default();
+
+    OpSyncEngine::new(&mut source, &source_state, &mut cloud, &git_remote)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(cloud.heads.len(), 1);
+    let expected = op_log(source.repo()).await;
+
+    let mut rebuilt = MachineGitRepository::init(temp.path().join("rebuilt"), &settings())
+        .await
+        .unwrap();
+    let rebuilt_state = OpSyncStore::open(temp.path().join("rebuilt-sync")).unwrap();
+    OpSyncEngine::new(&mut rebuilt, &rebuilt_state, &mut cloud, &git_remote)
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(rebuilt.repo().op_id(), source.repo().op_id());
+    assert_eq!(op_log(rebuilt.repo()).await, expected);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires DEVSPACE_CANONICAL_GIT_REMOTE against a disposable Artifact"]
+async fn live_artifact_recovers_after_git_push_failpoint() {
+    let _env = failpoint_lock().await;
+    let git_remote = live_git_remote(0xa1)
+        .expect("DEVSPACE_CANONICAL_GIT_REMOTE must name the disposable Artifact");
+    let temp = tempfile::tempdir().unwrap();
+    let mut repository = offline_machine(&temp.path().join("repo"), "live-crash").await;
+    let state = OpSyncStore::open(temp.path().join("sync")).unwrap();
+    let mut cloud = FakeCloud::default();
+
+    unsafe {
+        std::env::set_var("DEVSPACE_FAILPOINT", "after_git_push");
+    }
+    let error = OpSyncEngine::new(&mut repository, &state, &mut cloud, &git_remote)
+        .run()
+        .await
+        .expect_err("after_git_push");
+    unsafe {
+        std::env::remove_var("DEVSPACE_FAILPOINT");
+    }
+    assert!(matches!(
+        error,
+        OpSyncEngineError::Failpoint("after_git_push")
+    ));
+    assert!(cloud.heads.is_empty());
+
+    OpSyncEngine::new(&mut repository, &state, &mut cloud, &git_remote)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(cloud.heads.len(), 1);
+    assert!(state.load_outbox().unwrap().is_none());
+
+    let mut rebuilt = MachineGitRepository::init(temp.path().join("rebuilt"), &settings())
+        .await
+        .unwrap();
+    let rebuilt_state = OpSyncStore::open(temp.path().join("rebuilt-sync")).unwrap();
+    OpSyncEngine::new(&mut rebuilt, &rebuilt_state, &mut cloud, &git_remote)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.repo().op_id(), repository.repo().op_id());
 }
 
 async fn op_log(

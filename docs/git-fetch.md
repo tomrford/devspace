@@ -2,8 +2,9 @@
 
 `ds git fetch` imports public Git history through the projection journal. It
 fetches exact public objects into the canonical bare Git object database, lifts
-the inherited hidden overlay onto new history, makes both public and canonical
-closures cloud-durable, and updates remote-tracking bookmarks.
+the inherited hidden overlay onto new history, persists both public and
+canonical closures on the private Git remote, and updates remote-tracking
+bookmarks.
 
 ## Command
 
@@ -30,13 +31,14 @@ One fetch holds the repository sync lock and performs this sequence:
 1. read the complete projection snapshot;
 2. recover any pending push batch that overlaps the requested bookmarks;
 3. refresh the snapshot if recovery settled a batch;
-4. install the current cloud pack catalog;
+4. fetch Devspace retention refs from the canonical Git remote;
 5. run `git fetch` into temporary refs in the shared bare object database;
 6. read the fetched public head OIDs;
 7. seed overlay-lift with journaled canonical/public pairs;
 8. replay canonical hidden state over each newly reached public commit;
 9. print every data-disclosure warning;
-10. upload the Git closure of all public and canonical heads;
+10. persist the Git closure of all public and canonical heads on the private
+    remote and verify a fresh fetch;
 11. record one idempotent fetch transaction in the Worker;
 12. update Jujutsu remote-tracking bookmarks to the canonical heads in one
     native operation.
@@ -83,7 +85,7 @@ If hidden state or rewritten parents require a mirror, Devspace creates a
 canonical Git commit while retaining the original public commit as the pair's
 `publicOid`. The canonical mirror inherits private paths and `.dsprivate`
 policy from its canonical parents. Both objects remain in the same Git object
-database and become cloud-durable.
+database and are persisted on the canonical Git remote.
 
 Merges replay all parent lineages through Jujutsu's merged-tree semantics.
 Hidden conflicts remain canonical conflicts; they are never flattened into a
@@ -116,8 +118,9 @@ Each fetched bookmark records:
 - either the proposed pair index or an `identityOid`.
 
 `identityOid` must equal the observed public OID and cannot accompany pair
-states. The Worker verifies every public and canonical commit is durable and
-checks request-wide binding and hidden-lineage consistency before mutation.
+states. The client persists those commits on the canonical Git remote before the
+transaction. The Worker checks request-wide binding and hidden-lineage
+consistency before mutation.
 
 The fetch ID and canonical request hash make retries idempotent. Reusing the ID
 for different bytes is rejected. Cursor advancement is transactional across
@@ -134,9 +137,8 @@ OIDs determine the correct seed lineage. Recovery uses the original leases and
 fencing rules described in [Git push](git-push.md).
 
 Downloaded public and mirrored canonical objects are ordinary Git objects.
-Fresh-machine recovery obtains them from the cloud pack catalog. One command
-tracks the installed catalog high-water and downloads only later entries when
-another recovery step needs them.
+Fresh-machine recovery obtains private lineages from the canonical Git remote
+retention refs.
 
 Snapshot activation high-waters do not make concurrent remote repointing
 consistent. That remains the remote-generation work in issue #15.

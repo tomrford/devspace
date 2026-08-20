@@ -43,7 +43,24 @@ pub fn write_cli_config(root: &Path) -> PathBuf {
         "#,
     )
     .unwrap();
+    ensure_canonical_remote(root);
     path
+}
+
+pub fn ensure_canonical_remote(home: &Path) -> PathBuf {
+    let remote = home.join("canonical.git");
+    if !remote.exists() {
+        let status = Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "failed to create local canonical Git remote"
+        );
+    }
+    remote
 }
 
 /// Append more TOML to a config already written by [`write_cli_config`].
@@ -81,10 +98,12 @@ pub fn ds_command(cwd: &Path, config: &Path) -> Command {
 }
 
 pub fn ds_command_with_home(cwd: &Path, home: &Path, config: &Path) -> Command {
+    let remote = ensure_canonical_remote(home);
     let mut command = Command::new(env!("CARGO_BIN_EXE_ds"));
     command
         .current_dir(cwd)
         .env(MACHINE_STORE_OVERRIDE, home.join("machine-store"))
+        .env("DEVSPACE_CANONICAL_GIT_REMOTE", &remote)
         .env("JJ_CONFIG", config)
         .env("DEVSPACE_BOUNDARY_SYNC", "0")
         .env("NO_COLOR", "1")

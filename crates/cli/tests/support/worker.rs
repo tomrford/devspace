@@ -33,27 +33,6 @@ pub fn create_push_server(git_url: String) -> (String, JoinHandle<Vec<String>>) 
                 "200 OK",
                 &serde_json::json!({"remote": {"name": name, "url": git_url}}).to_string(),
             );
-        } else if request_line.starts_with("GET ") && request_line.contains("/packs?") {
-            respond(
-                stream,
-                "200 OK",
-                r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
-            );
-        } else if request_line.starts_with("POST ")
-            && request_line.contains("/git/objects/inventory ")
-        {
-            respond(stream, "200 OK", r#"{"keys":[]}"#);
-        } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
-            respond(stream, "200 OK", r#"{"inserted":true,"installed":false}"#);
-        } else if request_line.starts_with("POST ")
-            && request_line.contains("/packs/")
-            && request_line.contains("/install ")
-        {
-            respond(
-                stream,
-                "200 OK",
-                r#"{"installed":true,"insertedObjects":1}"#,
-            );
         } else if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads ") {
             respond(
                 stream,
@@ -400,32 +379,7 @@ pub fn cloud_paused_at_remote_list() -> (String, Receiver<()>, SyncSender<()>, J
                 respond(&mut stream, "200 OK", r#"{"remotes":[]}"#);
                 return;
             }
-            if request_line.starts_with("GET ") && request_line.contains("/packs?") {
-                respond(
-                    &mut stream,
-                    "200 OK",
-                    r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
-                );
-            } else if request_line.starts_with("POST ")
-                && request_line.contains("/git/objects/inventory ")
-            {
-                respond(&mut stream, "200 OK", r#"{"keys":[]}"#);
-            } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
-                respond(
-                    &mut stream,
-                    "200 OK",
-                    r#"{"inserted":true,"installed":false}"#,
-                );
-            } else if request_line.starts_with("POST ")
-                && request_line.contains("/packs/")
-                && request_line.contains("/install ")
-            {
-                respond(
-                    &mut stream,
-                    "200 OK",
-                    r#"{"installed":true,"insertedObjects":1}"#,
-                );
-            } else if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads ") {
+            if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads ") {
                 respond(&mut stream, "200 OK", r#"{"cursor":0,"heads":[]}"#);
             } else if request_line.starts_with("POST ")
                 && request_line.contains("/git/ops/inventory ")

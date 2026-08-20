@@ -108,12 +108,12 @@ impl MachineGitRepository {
         &self.git_repo_path
     }
 
-    /// Stock jj simple operation-store location. Git packs do not include it.
+    /// Stock jj simple operation-store location. Git remotes do not include it.
     pub fn operation_store_path(&self) -> PathBuf {
         self.path.join("op_store")
     }
 
-    /// Stock jj simple operation-head-store location. Git packs do not include it.
+    /// Stock jj simple operation-head-store location. Git remotes do not include it.
     pub fn operation_heads_path(&self) -> PathBuf {
         self.path.join("op_heads")
     }

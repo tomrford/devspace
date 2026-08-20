@@ -6,9 +6,9 @@ use devspace_kernel::{ObjectKind, Oid};
 use thiserror::Error;
 
 use crate::{
-    CommitMapping, GitHttpTransport, GitHttpTransportError, GitProcessEnvironment, LeaseUpdate,
-    LiftError, LiftedCommit, MachineGitRepository, ObjectClosureError, PackBuildError,
-    PackInstallError, PackOptions, PackProducer, ProjectionError, ProjectionGitBatchResult,
+    CanonicalGitRemote, CanonicalRemoteError, CommitMapping, GitHttpTransport,
+    GitHttpTransportError, GitProcessEnvironment, LeaseUpdate, LiftError, LiftedCommit,
+    MachineGitRepository, ObjectClosureError, ProjectionError, ProjectionGitBatchResult,
     ProjectionGitFetchRef, ProjectionGitObservation, ProjectionGitSnapshot, ProjectionGitState,
     ProjectionGitUpdate, ProjectionMappings, PushError, PushErrorKind, QualifiedRef, RemoteUrl,
     fetch, overlay_lift, push,
@@ -43,19 +43,21 @@ pub struct FetchFlowResult {
     pub disclosure_warnings: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn push_with_journal(
     repository: &MachineGitRepository,
     transport: &GitHttpTransport,
+    git_remote: &CanonicalGitRemote,
     remote: &str,
     heads: &[PushHead],
     batch_id: [u8; 16],
     environment: &GitProcessEnvironment,
     failpoint: PushFailpoint,
 ) -> Result<PushFlowResult, JournalFlowError> {
-    let mut cloud_catalog = CloudCatalogInstaller::default();
     push_with_journal_attempt(
         repository,
         transport,
+        git_remote,
         remote,
         heads,
         batch_id,
@@ -63,7 +65,6 @@ pub async fn push_with_journal(
         failpoint,
         None,
         true,
-        &mut cloud_catalog,
     )
     .await
 }
@@ -72,6 +73,7 @@ pub async fn push_with_journal(
 async fn push_with_journal_attempt(
     repository: &MachineGitRepository,
     transport: &GitHttpTransport,
+    git_remote: &CanonicalGitRemote,
     remote: &str,
     heads: &[PushHead],
     batch_id: [u8; 16],
@@ -79,7 +81,6 @@ async fn push_with_journal_attempt(
     failpoint: PushFailpoint,
     initial_snapshot: Option<ProjectionGitSnapshot>,
     retry_allowed: bool,
-    cloud_catalog: &mut CloudCatalogInstaller,
 ) -> Result<PushFlowResult, JournalFlowError> {
     if heads.is_empty() {
         return Err(JournalFlowError::InvalidInput(
@@ -105,12 +106,12 @@ async fn push_with_journal_attempt(
     let recovery = recover_overlapping(
         repository,
         transport,
+        git_remote,
         &remote_url,
         remote,
         &requested,
         &snapshot,
         environment,
-        cloud_catalog,
     )
     .await?;
     let mut recovered_batches = recovery.accepted;
@@ -210,14 +211,8 @@ async fn push_with_journal_attempt(
             })
         }));
     let mut mappings = ProjectionMappings::from_rows(seed_rows)?;
-    let projected = project_with_cloud_seeds(
-        repository,
-        transport,
-        &active_heads,
-        &mut mappings,
-        cloud_catalog,
-    )
-    .await?;
+    let projected =
+        project_with_canonical_seeds(repository, git_remote, &active_heads, &mut mappings).await?;
     let projected_by_canonical = active_heads
         .iter()
         .copied()
@@ -252,7 +247,7 @@ async fn push_with_journal_attempt(
         })
         .collect::<Vec<_>>();
     let required_closure = closure_heads.iter().copied().collect::<BTreeSet<_>>();
-    ensure_cloud_closure(repository, transport, &required_closure, cloud_catalog).await?;
+    ensure_canonical_closure(repository, git_remote, &required_closure)?;
     for head in &journal_heads {
         if let (Some(canonical), Some(public)) = (head.canonical_oid, public_heads[&head.bookmark])
         {
@@ -260,7 +255,7 @@ async fn push_with_journal_attempt(
             repository.scan_hidden_paths(public, &hidden_set)?;
         }
     }
-    upload_closure(repository, transport, &closure_heads).await?;
+    persist_canonical(repository, git_remote, &closure_heads)?;
 
     let mut state_rows = Vec::new();
     let mut seen_state_rows = BTreeSet::new();
@@ -364,6 +359,7 @@ async fn push_with_journal_attempt(
             let mut retried = Box::pin(push_with_journal_attempt(
                 repository,
                 transport,
+                git_remote,
                 remote,
                 heads,
                 batch_id,
@@ -371,7 +367,6 @@ async fn push_with_journal_attempt(
                 failpoint,
                 Some(raced),
                 false,
-                cloud_catalog,
             ))
             .await?;
             recovered_batches.append(&mut retried.recovered_batches);
@@ -427,24 +422,24 @@ async fn push_with_journal_attempt(
 pub async fn fetch_with_journal(
     repository: &MachineGitRepository,
     transport: &GitHttpTransport,
+    git_remote: &CanonicalGitRemote,
     remote: &str,
     bookmarks: &[String],
     fetch_id: [u8; 16],
     environment: &GitProcessEnvironment,
 ) -> Result<FetchFlowResult, JournalFlowError> {
     let remote_url = registered_remote(transport, remote).await?;
-    let mut cloud_catalog = CloudCatalogInstaller::default();
     let mut snapshot = transport.projection_snapshot_all().await?;
     let requested = bookmarks.iter().cloned().collect::<BTreeSet<_>>();
     let recovery = recover_overlapping(
         repository,
         transport,
+        git_remote,
         &remote_url,
         remote,
         &requested,
         &snapshot,
         environment,
-        &mut cloud_catalog,
     )
     .await?;
     if recovery.settled {
@@ -459,9 +454,9 @@ pub async fn fetch_with_journal(
         environment,
     )?;
     // Cursor and mapping rows can select canonical commits that are not
-    // reachable from the public Git remote. Install the cloud object catalog
-    // before lift so a fresh machine can resolve those private lineages.
-    cloud_catalog.install(repository, transport).await?;
+    // reachable from the public Git remote. Fetch retention refs so a fresh
+    // machine can resolve those private lineages.
+    git_remote.fetch_retention(repository)?;
     let cursor_by_bookmark = snapshot
         .cursors
         .iter()
@@ -533,7 +528,7 @@ pub async fn fetch_with_journal(
         .copied()
         .chain(canonical_heads.values().copied())
         .collect::<Vec<_>>();
-    upload_closure(repository, transport, &closure_heads).await?;
+    persist_canonical(repository, git_remote, &closure_heads)?;
 
     let refs = fetched
         .heads
@@ -579,12 +574,12 @@ struct RecoverySummary {
 async fn recover_overlapping(
     repository: &MachineGitRepository,
     transport: &GitHttpTransport,
+    git_remote: &CanonicalGitRemote,
     remote_url: &RemoteUrl,
     remote: &str,
     bookmarks: &BTreeSet<String>,
     snapshot: &ProjectionGitSnapshot,
     environment: &GitProcessEnvironment,
-    cloud_catalog: &mut CloudCatalogInstaller,
 ) -> Result<RecoverySummary, JournalFlowError> {
     let batches = snapshot
         .pending
@@ -639,7 +634,7 @@ async fn recover_overlapping(
                     .chain(update.identity_oid)
             })
             .collect::<BTreeSet<_>>();
-        ensure_cloud_closure(repository, transport, &replay_heads, cloud_catalog).await?;
+        ensure_canonical_closure(repository, git_remote, &replay_heads)?;
         for update in &replay.updates {
             if let Some(index) = update.proposed_state {
                 let state = update.states.get(index).ok_or_else(|| {
@@ -737,79 +732,24 @@ async fn registered_remote(
         .ok_or_else(|| JournalFlowError::RemoteNotFound(remote.to_owned()))
 }
 
-async fn upload_closure(
+fn persist_canonical(
     repository: &MachineGitRepository,
-    transport: &GitHttpTransport,
+    git_remote: &CanonicalGitRemote,
     heads: &[Oid],
 ) -> Result<(), JournalFlowError> {
     if heads.is_empty() {
         return Ok(());
     }
-    let closure = repository.object_closure(heads.iter().copied())?;
-    let candidates = closure
-        .objects
-        .iter()
-        .map(|object| object.key)
-        .collect::<Vec<_>>();
-    let known_objects = transport.inventory_git_objects(&candidates).await?;
-    let mut producer =
-        PackProducer::new(repository, &closure, &known_objects, PackOptions::default())?;
-    while let Some(pack) = producer.next_pack()? {
-        transport.upload_pack(&pack).await?;
-    }
+    git_remote.push_commits(repository, heads.iter().copied())?;
+    git_remote.verify_commits(repository, heads.iter().copied())?;
     Ok(())
 }
 
-#[derive(Default)]
-struct CloudCatalogInstaller {
-    installed_through: u64,
-}
-
-impl CloudCatalogInstaller {
-    async fn install(
-        &mut self,
-        repository: &MachineGitRepository,
-        transport: &GitHttpTransport,
-    ) -> Result<(), JournalFlowError> {
-        let mut after = self.installed_through;
-        let mut through = None;
-        loop {
-            let page = transport.list_packs(after, through).await?;
-            if through.is_some_and(|fixed| fixed != page.through) {
-                return Err(JournalFlowError::Protocol(
-                    "Git pack catalog page changed its high-water".to_owned(),
-                ));
-            }
-            through = Some(page.through);
-            if page.next_after < after || page.next_after > page.through {
-                return Err(JournalFlowError::Protocol(
-                    "Git pack catalog returned invalid cursor bounds".to_owned(),
-                ));
-            }
-            if page.has_more && page.next_after <= after {
-                return Err(JournalFlowError::Protocol(
-                    "Git pack catalog did not make monotonic progress".to_owned(),
-                ));
-            }
-            for pack in page.packs {
-                let downloaded = transport.download_pack(pack.id).await?;
-                repository.install_pack(downloaded.id, &downloaded.manifest, &downloaded.chunks)?;
-            }
-            if !page.has_more {
-                self.installed_through = page.through;
-                return Ok(());
-            }
-            after = page.next_after;
-        }
-    }
-}
-
-async fn project_with_cloud_seeds(
+async fn project_with_canonical_seeds(
     repository: &MachineGitRepository,
-    transport: &GitHttpTransport,
+    git_remote: &CanonicalGitRemote,
     active_heads: &[Oid],
     mappings: &mut ProjectionMappings,
-    cloud_catalog: &mut CloudCatalogInstaller,
 ) -> Result<crate::ProjectionResult, JournalFlowError> {
     match repository
         .project_hidden_paths(active_heads, mappings)
@@ -817,7 +757,7 @@ async fn project_with_cloud_seeds(
     {
         Ok(projected) => Ok(projected),
         Err(ProjectionError::SeededPublicCommitUnavailable { .. }) => {
-            cloud_catalog.install(repository, transport).await?;
+            git_remote.fetch_retention(repository)?;
             Ok(repository
                 .project_hidden_paths(active_heads, mappings)
                 .await?)
@@ -826,16 +766,15 @@ async fn project_with_cloud_seeds(
     }
 }
 
-async fn ensure_cloud_closure(
+fn ensure_canonical_closure(
     repository: &MachineGitRepository,
-    transport: &GitHttpTransport,
+    git_remote: &CanonicalGitRemote,
     heads: &BTreeSet<Oid>,
-    cloud_catalog: &mut CloudCatalogInstaller,
 ) -> Result<(), JournalFlowError> {
     if heads.is_empty() || repository.object_closure(heads.iter().copied()).is_ok() {
         return Ok(());
     }
-    cloud_catalog.install(repository, transport).await?;
+    git_remote.fetch_retention(repository)?;
     repository.object_closure(heads.iter().copied())?;
     Ok(())
 }
@@ -890,9 +829,7 @@ pub enum JournalFlowError {
     #[error(transparent)]
     Closure(#[from] ObjectClosureError),
     #[error(transparent)]
-    Pack(#[from] PackBuildError),
-    #[error(transparent)]
-    Install(#[from] PackInstallError),
+    CanonicalRemote(#[from] CanonicalRemoteError),
     #[error(transparent)]
     Push(#[from] PushError),
     #[error(transparent)]

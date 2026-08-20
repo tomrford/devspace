@@ -20,7 +20,6 @@ const MAX_SYNC_HEADS: usize = 4_096;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OpSyncState {
     pub cloud_cursor: u64,
-    pub catalog_sequence: u64,
     pub accepted_heads: BTreeSet<OpId>,
 }
 
@@ -173,7 +172,7 @@ impl OpSyncStore {
         bytes.extend_from_slice(&STATE_FORMAT_VERSION.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         bytes.extend_from_slice(&state.cloud_cursor.to_le_bytes());
-        bytes.extend_from_slice(&state.catalog_sequence.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
         bytes.extend_from_slice(&(state.accepted_heads.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&0_u32.to_le_bytes());
         for head in &state.accepted_heads {
@@ -246,11 +245,11 @@ fn decode_state(bytes: &[u8]) -> Result<OpSyncState, OpSyncStateError> {
         "state",
     )?;
     let count = read_u32(bytes, 24) as usize;
+    require_zero(&bytes[16..24], "state reserved bytes")?;
     require_zero(&bytes[28..32], "state reserved bytes")?;
     let heads = decode_heads(bytes, STATE_HEADER_BYTES, count, "state")?;
     Ok(OpSyncState {
         cloud_cursor: read_u64(bytes, 8),
-        catalog_sequence: read_u64(bytes, 16),
         accepted_heads: heads,
     })
 }
@@ -622,7 +621,6 @@ mod tests {
 
         let state = OpSyncState {
             cloud_cursor: 9,
-            catalog_sequence: 12,
             accepted_heads: BTreeSet::from([[1; 64], [2; 64]]),
         };
         let pending = PendingOpHeadBatch::from_transactions(vec![

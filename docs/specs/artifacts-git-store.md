@@ -107,8 +107,12 @@ the previous anchor and the new canonical Git commits required by the jj
 operations being uploaded. Each machine writes only its own ref. The anchor
 tree is empty and the commit message contains no private content.
 
-This is a hypothesis, not yet a protocol decision. The spike must compare it
-with two alternatives:
+Selected design: machine-owned synthetic ancestry. A repository-wide
+compare-and-swap ref lost because the next writer must already hold the
+previous synthetic commit, so unrelated machines serialize. Direct commit refs
+lost because Git reachability does not follow `jj:trees`.
+
+The spike compared this design with two alternatives:
 
 - one repository-wide retention ref updated with compare-and-swap retries;
 - direct pushes of the required commits to machine-owned refs without a
@@ -278,3 +282,22 @@ nix develop -c sfw pnpm test
 Do not deploy Devspace from this spike. The result is a measured decision: a
 small implementation diff plus evidence that Artifacts can satisfy the
 invariants, or a short rejection which identifies the failed invariant.
+
+## Live Artifact findings
+
+A disposable private Artifact accepted machine retention refs of the form
+`refs/heads/__devspace/machines/<machine-id>` and advertised them on
+`ls-remote`. Exact Git bytes, including `jj:trees` extras on the carry tree,
+round-tripped. Two machines pushed concurrent retention refs without
+serializing. A create-lease against an existing retention ref was rejected.
+A 24-commit incremental push then fetched on a fresh machine. A fresh
+machine rebuilt the jj operation log from the Artifact Git remote plus the
+operation store. A crash after Git push recovered on retry against the same
+Artifact.
+
+Repository write tokens can be minted with an explicit TTL. The plaintext
+token includes a `?expires=` suffix, so it must be percent-encoded in Git
+URL userinfo. Artifacts rejects `--atomic` push and hangs up; a single-ref
+`--force-with-lease` push is enough for machine-owned retention. Unreachable
+object GC was not exposed as a client control. This spike did not deploy a
+Devspace Worker.

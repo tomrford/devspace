@@ -1,9 +1,9 @@
 # Git push
 
 `ds git push` is the only supported path from canonical Devspace history to a
-public Git remote. It projects hidden paths, uploads every required canonical
-and public object to the cloud, and binds the Git subprocess result to the cloud
-journal.
+public Git remote. It projects hidden paths, persists every required canonical
+and public object on the private Git remote, and binds the Git subprocess
+result to the cloud journal.
 
 ## Commands
 
@@ -40,12 +40,11 @@ One push holds the repository sync lock and performs this sequence:
    if every requested cursor is already current;
 4. seed projection from active pair states, cursors, and pending identity
    bindings;
-5. project hidden paths parent-first, installing cloud packs only if a reached
+5. project hidden paths parent-first, fetching retention refs only if a reached
    seed selects public bytes that are missing locally;
 6. ensure the complete canonical and public closures are local, then scan every
    public tree against the canonical hidden policy;
-7. inventory those closures and upload only missing objects, one completed pack
-   at a time;
+7. push those closures to the canonical Git remote and verify a fresh fetch;
 8. begin a durable projection batch with expected old public OIDs;
 9. invoke `git push --porcelain` with an exact force-with-lease for each ref;
 10. report the observed live OIDs to the Worker;
@@ -53,20 +52,19 @@ One push holds the repository sync lock and performs this sequence:
 12. write one native Jujutsu operation that tracks the accepted remote
     bookmarks.
 
-An up-to-date push makes no pack-catalog, inventory, manifest, or chunk request.
-A non-no-op attempt also skips the catalog when all required closures are
-already local. Its bounded inventory requests prevent retransmission of
-cloud-known objects. One command retains its installed catalog high-water so
-later recovery or retry work downloads only new catalog entries.
+An up-to-date push does not contact the canonical Git remote or start a journal
+batch. A non-no-op push persists the required Git closures on the private
+remote and verifies a fresh fetch before the journal batch begins.
 
 An identity projection sends the canonical commit itself. Its cursor is a
 projection stop point, but it does not create a pair state or public mirror.
 Existing Git signature bytes remain intact. A hidden path or rewritten parent
 creates a minimal deterministic public commit in the same Git object database.
 
-The cloud receives both canonical and public closures before the batch begins.
-This makes the batch recoverable by any client with the development credential
-and repository identity.
+Git object bytes stay on the canonical private remote. The Worker journal
+stores only projection mappings, cursors, and batch state. Any machine with
+the development credential, repository identity, and Git remote can recover
+the batch.
 
 ## Leases and atomic journal state
 
@@ -109,7 +107,7 @@ remote accepted refs but before the Worker records them, the next overlapping
 push or fetch:
 
 1. claims a new recovery fence;
-2. checks the proposed canonical and public closures and downloads cloud packs
+2. checks the proposed canonical and public closures and fetches retention refs
    only when objects are missing;
 3. replays the exact proposed states and hidden-path scans;
 4. repeats the leased Git updates;
@@ -135,7 +133,7 @@ partial multi-ref results, and stale recovery fences still fail closed.
 Git credentials come from the user's Git configuration and credential helpers.
 Devspace does not store remote passwords or tokens in the cloud journal.
 
-Diagnostics name the failed phase: projection, hidden-path scan, cloud upload,
+Diagnostics name the failed phase: projection, hidden-path scan, Git persist,
 batch creation, Git subprocess, live-ref observation, or journal recovery.
 Sensitive credential material is not printed.
 

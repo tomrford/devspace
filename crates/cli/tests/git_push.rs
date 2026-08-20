@@ -480,8 +480,8 @@ async fn push_fails_loudly_when_a_mapped_object_is_missing() {
     let pushed = fixture.push(&["-b", "main"]);
     assert_eq!(pushed.status.code(), Some(1));
     let diagnostic = stderr(&pushed);
-    assert!(diagnostic.contains("seeded public commit"), "{diagnostic}");
-    assert!(diagnostic.contains("is unavailable"), "{diagnostic}");
+    assert!(diagnostic.contains("retention update"), "{diagnostic}");
+    assert!(diagnostic.contains("could not parse commit"), "{diagnostic}");
 }
 
 #[tokio::test]

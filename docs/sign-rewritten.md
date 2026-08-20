@@ -22,7 +22,7 @@ handle concurrent pushes of that same pair.
 Machine-specific signing keys make the mint nondeterministic. Two machines can
 produce different public OIDs for the same canonical commit. Making that safe
 requires a permanent winner record, a paginated way to discover winners,
-cloud-pack adoption by losing machines, descendant reparenting, new signatures,
+Git-remote adoption by losing machines, descendant reparenting, new signatures,
 and a retry protocol for pending, aborted, and accepted races. That protocol
 cost is not justified for a feature that is not on the planned push path.
 

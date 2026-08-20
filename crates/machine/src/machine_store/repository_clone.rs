@@ -20,7 +20,6 @@ pub struct StagedRepositoryClone {
     staging_directory: PathBuf,
     native_path: PathBuf,
     sync_path: PathBuf,
-    packs_path: PathBuf,
     repository_directory: PathBuf,
     _sync_guard: RepositorySyncGuard,
     _materialization_lock: File,
@@ -44,11 +43,6 @@ impl StagedRepositoryClone {
         drop(self.repository.take());
         self.store.require_binding(&self.name, &self.identity)?;
         for (from, to, component) in [
-            (
-                &self.packs_path,
-                self.repository_directory.join("packs"),
-                "packs",
-            ),
             (
                 &self.sync_path,
                 self.repository_directory.join("sync"),
@@ -150,12 +144,7 @@ impl MachineStore {
 
         let staging_directory = repository_directory.join(CLONE_STAGING_DIRECTORY);
         let published_sync_path = self.repository_sync_path(expected);
-        let published_packs_path = self.repository_packs_path(expected);
-        for path in [
-            staging_directory.as_path(),
-            published_sync_path.as_path(),
-            published_packs_path.as_path(),
-        ] {
+        for path in [staging_directory.as_path(), published_sync_path.as_path()] {
             remove_disposable_path(path).map_err(|source| {
                 MachineStoreError::RemoveIncompleteCloneState {
                     path: path.to_owned(),
@@ -177,13 +166,6 @@ impl MachineStore {
         })?;
         let native_path = staging_directory.join("native");
         let sync_path = staging_directory.join("sync");
-        let packs_path = staging_directory.join("packs");
-        fs::create_dir(&packs_path).map_err(|source| {
-            MachineStoreError::CreateRepositoryStaging {
-                path: packs_path.clone(),
-                source,
-            }
-        })?;
         let repository = MachineGitRepository::init(&native_path, settings)
             .await
             .map_err(MachineStoreError::Repository)?;
@@ -201,7 +183,6 @@ impl MachineStore {
             staging_directory,
             native_path,
             sync_path,
-            packs_path,
             repository_directory,
             _sync_guard: sync_guard,
             _materialization_lock: materialization_lock,

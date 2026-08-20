@@ -435,10 +435,6 @@ export class OpGitStore {
          )
          SELECT reachable.kind, reachable.id
          FROM reachable
-         LEFT JOIN objects AS commits
-           ON reachable.kind = ${OP_REFERENCE_KIND.commit}
-          AND commits.kind = 2
-          AND commits.id = reachable.id
          LEFT JOIN op_objects AS views
            ON reachable.kind = ${OP_REFERENCE_KIND.view}
           AND views.kind = ${OP_OBJECT_KIND.view}
@@ -447,13 +443,11 @@ export class OpGitStore {
            ON reachable.kind = ${OP_REFERENCE_KIND.operation}
           AND operations.kind = ${OP_OBJECT_KIND.operation}
           AND operations.id = reachable.id
-         WHERE commits.id IS NULL AND views.id IS NULL AND operations.id IS NULL
+         WHERE reachable.kind != ${OP_REFERENCE_KIND.commit}
+           AND views.id IS NULL AND operations.id IS NULL
            AND NOT (
-             (reachable.kind = ${OP_REFERENCE_KIND.operation}
-              AND reachable.id = zeroblob(${OP_OBJECT_ID_BYTES}))
-             OR
-             (reachable.kind = ${OP_REFERENCE_KIND.commit}
-              AND reachable.id = zeroblob(20))
+             reachable.kind = ${OP_REFERENCE_KIND.operation}
+             AND reachable.id = zeroblob(${OP_OBJECT_ID_BYTES})
            )
          ORDER BY reachable.kind, reachable.id
          LIMIT 1`,

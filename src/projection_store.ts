@@ -1,4 +1,4 @@
-import { GIT_OBJECT_KIND, Kernel, equalGitBytes, exactGitBuffer, gitToHex } from "./kernel";
+import { Kernel, equalGitBytes, exactGitBuffer, gitToHex } from "./kernel";
 import {
   BeginProjectionGitBatchRequest,
   MAX_GIT_PROJECTION_STATES,
@@ -372,12 +372,6 @@ export class ProjectionGitStore {
           return { ok: true as const, pending: true, fence: previous.fence };
         }
         this.requireBeginCapacity(request);
-        for (const update of request.updates) {
-          for (const state of update.states) this.requireDurableState(state);
-          if (update.identityOid !== null) {
-            this.requireDurableCommit("identity", update.identityOid);
-          }
-        }
         this.requireCanonicalBindings(
           request.updates.flatMap((update) => canonicalBindings(update.states, update.identityOid)),
           "canonical-lineage-diverged",
@@ -508,12 +502,6 @@ export class ProjectionGitStore {
               409,
               "fetch-overlaps-pending-push",
             );
-          }
-        }
-        for (const ref of request.refs) {
-          for (const state of ref.states) this.requireDurableState(state, "fetch-commit-not-durable");
-          if (ref.identityOid !== null) {
-            this.requireDurableCommit("identity", ref.identityOid, "fetch-commit-not-durable");
           }
         }
         this.requireFetchBindings(request);
@@ -999,28 +987,6 @@ export class ProjectionGitStore {
         "observations must cover the exact pending ref set",
         409,
         "projection-observation-set-mismatch",
-      );
-    }
-  }
-
-  private requireDurableState(state: ProjectionGitState, code?: string) {
-    this.requireDurableCommit("canonical", state.canonicalOid, code);
-    this.requireDurableCommit("public", state.publicOid, code);
-  }
-
-  private requireDurableCommit(label: string, oid: Uint8Array, code?: string) {
-    const present = this.sql
-      .exec<{ count: number }>(
-        "SELECT count(*) AS count FROM objects WHERE kind = ? AND id = ?",
-        GIT_OBJECT_KIND.commit,
-        exactGitBuffer(oid),
-      )
-      .one().count;
-    if (present === 0) {
-      throw new ProjectionGitStoreError(
-        `${label} commit ${gitToHex(oid)} is not cloud durable`,
-        409,
-        code ?? "projection-commit-not-durable",
       );
     }
   }

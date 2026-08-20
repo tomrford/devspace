@@ -100,6 +100,7 @@ pub enum GitProcessMode {
 pub struct GitProcessEnvironment {
     git_executable: PathBuf,
     extra: BTreeMap<OsString, OsString>,
+    http_bearer_token: Option<OsString>,
     mode: GitProcessMode,
 }
 
@@ -108,12 +109,18 @@ impl GitProcessEnvironment {
         Self {
             git_executable: git_executable.into(),
             extra: BTreeMap::new(),
+            http_bearer_token: None,
             mode,
         }
     }
 
     pub fn with_extra_environment(mut self, extra: BTreeMap<OsString, OsString>) -> Self {
         self.extra = extra;
+        self
+    }
+
+    pub fn with_http_bearer(mut self, token: impl Into<OsString>) -> Self {
+        self.http_bearer_token = Some(token.into());
         self
     }
 }
@@ -130,6 +137,7 @@ impl fmt::Debug for GitProcessEnvironment {
             .debug_struct("GitProcessEnvironment")
             .field("git_executable", &self.git_executable)
             .field("extra", &"<redacted>")
+            .field("http_bearer_token", &"<redacted>")
             .field("mode", &self.mode)
             .finish()
     }
@@ -377,6 +385,78 @@ pub fn push(
     Ok(report)
 }
 
+pub fn fetch_refspecs(
+    git_dir: &Path,
+    remote_url: &RemoteUrl,
+    refspecs: &[String],
+    environment: &GitProcessEnvironment,
+) -> Result<CommandDiagnostic, FetchError> {
+    if refspecs.is_empty() {
+        return Err(FetchError {
+            report: FetchReport {
+                heads: BTreeMap::new(),
+                diagnostic: CommandDiagnostic {
+                    command: "git fetch <remote>".to_owned(),
+                    exit_code: None,
+                    observation_command: "git fetch <remote>".to_owned(),
+                    observation_exit_code: None,
+                    stderr_excerpt: "no refs were requested".to_owned(),
+                },
+            },
+        });
+    }
+    let spec = fetch_refspec_command(git_dir, remote_url, refspecs, environment);
+    let result = run(&spec);
+    let diagnostic = diagnostic(
+        &spec,
+        &result,
+        &spec,
+        &result,
+        None,
+        remote_url,
+        environment,
+    );
+    if result
+        .as_ref()
+        .map_or(true, |output| !output.status.success())
+    {
+        return Err(FetchError {
+            report: FetchReport {
+                heads: BTreeMap::new(),
+                diagnostic,
+            },
+        });
+    }
+    Ok(diagnostic)
+}
+
+pub fn ls_remote_matching(
+    remote_url: &RemoteUrl,
+    pattern: &str,
+    environment: &GitProcessEnvironment,
+) -> Result<BTreeMap<String, Oid>, RemoteHeadsError> {
+    let spec = remote_matching_command(remote_url, pattern, environment);
+    let result = run(&spec);
+    let parsed = result
+        .as_ref()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| parse_remote_ref_lines(&output.stdout));
+    if let Some(Ok(heads)) = parsed {
+        return Ok(heads);
+    }
+    let mut stderr = Vec::new();
+    append_result_stderr(&mut stderr, &result);
+    if let Some(Err(error)) = parsed {
+        stderr.extend_from_slice(error.as_bytes());
+    }
+    Err(RemoteHeadsError {
+        command: spec.safe_shape,
+        exit_code: result.as_ref().ok().and_then(|output| output.status.code()),
+        stderr_excerpt: redact_stderr(&stderr, remote_url, environment),
+    })
+}
+
 pub fn fetch(
     git_dir: &Path,
     remote_name: &str,
@@ -453,8 +533,10 @@ fn push_command(
         "push".into(),
         "--porcelain".into(),
         "--no-verify".into(),
-        "--atomic".into(),
     ];
+    if updates.len() > 1 {
+        args.push("--atomic".into());
+    }
     let mut safe = os_strings(&args);
     for (reference, update) in updates {
         let expected = update
@@ -545,6 +627,81 @@ fn remote_head_command(remote_url: &RemoteUrl, environment: &GitProcessEnvironme
     command_spec(args, safe, environment)
 }
 
+fn fetch_refspec_command(
+    git_dir: &Path,
+    remote_url: &RemoteUrl,
+    refspecs: &[String],
+    environment: &GitProcessEnvironment,
+) -> CommandSpec {
+    let mut args = vec![
+        git_dir_arg(git_dir),
+        "fetch".into(),
+        "--".into(),
+        remote_url.expose().into(),
+    ];
+    let mut safe = vec![
+        format!("--git-dir={}", git_dir.display()),
+        "fetch".to_owned(),
+        "--".to_owned(),
+        "<remote>".to_owned(),
+    ];
+    for refspec in refspecs {
+        args.push(refspec.into());
+        safe.push(refspec.clone());
+    }
+    command_spec(args, safe, environment)
+}
+
+fn remote_matching_command(
+    remote_url: &RemoteUrl,
+    pattern: &str,
+    environment: &GitProcessEnvironment,
+) -> CommandSpec {
+    let args = vec![
+        "ls-remote".into(),
+        "--refs".into(),
+        "--".into(),
+        remote_url.expose().into(),
+        pattern.into(),
+    ];
+    let safe = vec![
+        "ls-remote".to_owned(),
+        "--refs".to_owned(),
+        "--".to_owned(),
+        "<remote>".to_owned(),
+        pattern.to_owned(),
+    ];
+    command_spec(args, safe, environment)
+}
+
+fn parse_remote_ref_lines(bytes: &[u8]) -> Result<BTreeMap<String, Oid>, String> {
+    if bytes.len() > MAX_OBSERVATION_BYTES {
+        return Err("Git remote observation exceeded its byte limit".to_owned());
+    }
+    let mut heads = BTreeMap::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        if heads.len() >= MAX_REMOTE_HEADS {
+            return Err("Git remote has too many matching refs".to_owned());
+        }
+        let tab = line
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| "Git returned a malformed remote observation".to_owned())?;
+        let oid = Oid::from_hex(&line[..tab])
+            .ok_or_else(|| "Git returned an invalid observed object ID".to_owned())?;
+        let name = std::str::from_utf8(&line[tab + 1..])
+            .map_err(|_| "Git returned a non-UTF-8 observed ref".to_owned())?;
+        if heads.insert(name.to_owned(), oid).is_some() {
+            return Err("Git returned a duplicate observed ref".to_owned());
+        }
+    }
+    Ok(heads)
+}
+
 fn fetch_command(
     git_dir: &Path,
     remote_name: &str,
@@ -611,6 +768,13 @@ fn os_strings(values: &[OsString]) -> Vec<String> {
 }
 fn command_environment(environment: &GitProcessEnvironment) -> BTreeMap<OsString, OsString> {
     let mut values = environment.extra.clone();
+    if let Some(token) = &environment.http_bearer_token {
+        values.insert("GIT_CONFIG_COUNT".into(), "1".into());
+        values.insert("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into());
+        let mut header = OsString::from("Authorization: Bearer ");
+        header.push(token);
+        values.insert("GIT_CONFIG_VALUE_0".into(), header);
+    }
     values.insert("LC_ALL".into(), "C".into());
     if environment.mode == GitProcessMode::Background {
         values.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
@@ -915,6 +1079,11 @@ fn redact_stderr(
                 (!value.is_empty()).then(|| value.into_owned())
             }),
     );
+    if let Some(token) = &environment.http_bearer_token {
+        let token = token.to_string_lossy();
+        sensitive.push(token.to_string());
+        sensitive.push(format!("Authorization: Bearer {token}"));
+    }
     let mut redacted = String::new();
     for line in text.lines() {
         if sensitive.iter().any(|value| line.contains(value)) {
@@ -1017,11 +1186,29 @@ mod tests {
                 new_oid: Some(Oid([0x11; 20])),
             },
         )]);
-        let environment = GitProcessEnvironment::new("git", GitProcessMode::Foreground);
+        let environment = GitProcessEnvironment::new("git", GitProcessMode::Foreground)
+            .with_http_bearer("top-secret");
         let command = push_command(Path::new("repo.git"), &secret, &updates, &environment);
         assert!(command.safe_shape.contains("--porcelain"));
         assert!(command.safe_shape.contains("--no-verify"));
-        assert!(command.safe_shape.contains("--atomic"));
+        assert!(
+            !command.safe_shape.contains("--atomic"),
+            "a single-ref push must work against remotes that reject atomic"
+        );
+        let extra = QualifiedRef::from_bookmark("other").unwrap();
+        let multi = updates
+            .iter()
+            .chain([(
+                &extra,
+                &LeaseUpdate {
+                    expected_old_oid: None,
+                    new_oid: Some(Oid([0x22; 20])),
+                },
+            )])
+            .map(|(reference, update)| (reference.clone(), *update))
+            .collect();
+        let multi = push_command(Path::new("repo.git"), &secret, &multi, &environment);
+        assert!(multi.safe_shape.contains("--atomic"));
         assert!(
             command
                 .safe_shape
@@ -1029,9 +1216,25 @@ mod tests {
         );
         assert!(command.safe_shape.contains("<remote>"));
         assert!(!command.safe_shape.contains("secret"));
+        assert!(
+            command
+                .args
+                .iter()
+                .all(|argument| !argument.to_string_lossy().contains("top-secret"))
+        );
         assert_eq!(
             command.environment.get(&OsString::from("LC_ALL")),
             Some(&OsString::from("C"))
+        );
+        assert_eq!(
+            command.environment.get(&OsString::from("GIT_CONFIG_KEY_0")),
+            Some(&OsString::from("http.extraHeader"))
+        );
+        assert_eq!(
+            command
+                .environment
+                .get(&OsString::from("GIT_CONFIG_VALUE_0")),
+            Some(&OsString::from("Authorization: Bearer top-secret"))
         );
     }
 

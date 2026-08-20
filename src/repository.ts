@@ -2,7 +2,6 @@ import { DurableObject } from "cloudflare:workers";
 import type { RepositoryAuthority } from "./control_plane";
 import { Kernel, equalGitBytes, exactGitBuffer } from "./kernel";
 import { OpGitStore } from "./op_store";
-import { GitPackStore } from "./pack_store";
 import { ProjectionGitStore } from "./projection_store";
 import { initializeGitSchema } from "./schema";
 import { hexBytes } from "./validation";
@@ -29,7 +28,6 @@ interface RepositoryRetirement {
 }
 
 export class Repository extends DurableObject<Env> {
-  private readonly packs: GitPackStore;
   private readonly ops: OpGitStore;
   private readonly projection: ProjectionGitStore;
   private retirement: RepositoryRetirement | undefined;
@@ -41,7 +39,6 @@ export class Repository extends DurableObject<Env> {
       this.ctx.storage.transactionSync(() => initializeGitSchema(sql)),
     );
     const kernel = new Kernel();
-    this.packs = new GitPackStore(this.ctx, sql, kernel);
     this.ops = new OpGitStore(this.ctx, sql, kernel);
     this.projection = new ProjectionGitStore(this.ctx, sql, kernel);
   }
@@ -122,40 +119,6 @@ export class Repository extends DurableObject<Env> {
     } catch (error) {
       return authorityFailure(error);
     }
-  }
-
-  putPackManifest(authority: RepositoryAuthority, packId: string, bytes: Uint8Array) {
-    return this.withAuthority(authority, () => this.packs.putPackManifest(packId, bytes));
-  }
-
-  putPackChunk(authority: RepositoryAuthority, packId: string, position: number, bytes: Uint8Array) {
-    return this.withAuthority(authority, () =>
-      this.packs.putPackChunk(packId, position, bytes),
-    );
-  }
-
-  installPack(authority: RepositoryAuthority, packId: string) {
-    return this.withAuthority(authority, () => this.packs.installPack(packId));
-  }
-
-  inventoryGitObjects(authority: RepositoryAuthority, value: unknown) {
-    return this.withAuthority(authority, () => this.packs.inventoryObjects(value));
-  }
-
-  listInstalledPacks(authority: RepositoryAuthority, afterValue: unknown, throughValue: unknown) {
-    return this.withAuthority(authority, () =>
-      this.packs.listInstalledPacks(afterValue, throughValue),
-    );
-  }
-
-  getInstalledPackManifest(authority: RepositoryAuthority, packId: string) {
-    return this.withAuthority(authority, () => this.packs.getInstalledPackManifest(packId));
-  }
-
-  getInstalledPackChunk(authority: RepositoryAuthority, packId: string, position: number) {
-    return this.withAuthority(authority, () =>
-      this.packs.getInstalledPackChunk(packId, position),
-    );
   }
 
   putOpObject(

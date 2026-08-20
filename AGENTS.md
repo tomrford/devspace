@@ -67,7 +67,7 @@ canonical bytes or reference semantics.
 
 When that happens:
 
-1. define a new advertised transport capability after `git-pack/2`;
+1. define a new advertised transport capability after `git-remote/1`;
 2. deploy the Worker first with an explicit accept set for every live canonical
    form and an upgrade error for stale clients;
 3. upgrade machines after the Worker accepts the new capability;

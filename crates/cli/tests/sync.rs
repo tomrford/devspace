@@ -87,36 +87,7 @@ async fn sync_run_silences_colliding_alias_warning() {
     let (base_url, server) =
         devspace_testutils::fake_worker::create_server(|_, request, stream| {
             let request_line = request.lines().next().unwrap();
-            if request_line.starts_with("GET ") && request_line.contains("/packs?") {
-                devspace_testutils::fake_worker::respond(
-                    stream,
-                    "200 OK",
-                    r#"{"packs":[],"nextAfter":0,"through":0,"hasMore":false}"#,
-                );
-                false
-            } else if request_line.starts_with("POST ")
-                && request_line.contains("/git/objects/inventory ")
-            {
-                devspace_testutils::fake_worker::respond(stream, "200 OK", r#"{"keys":[]}"#);
-                false
-            } else if request_line.starts_with("PUT ") && request_line.contains("/packs/") {
-                devspace_testutils::fake_worker::respond(
-                    stream,
-                    "200 OK",
-                    r#"{"inserted":true,"installed":false}"#,
-                );
-                false
-            } else if request_line.starts_with("POST ")
-                && request_line.contains("/packs/")
-                && request_line.contains("/install ")
-            {
-                devspace_testutils::fake_worker::respond(
-                    stream,
-                    "200 OK",
-                    r#"{"installed":true,"insertedObjects":1}"#,
-                );
-                false
-            } else if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads ") {
+            if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads ") {
                 devspace_testutils::fake_worker::respond(
                     stream,
                     "200 OK",

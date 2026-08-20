@@ -3,8 +3,6 @@ import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { countRows, workerRequest } from "./support";
 
-const packId = "00".repeat(64);
-
 describe("cloud identity and repository directory", () => {
   it("authenticates 2 machines with the shared development secret", async () => {
     const firstMachine = "11".repeat(16);
@@ -61,16 +59,12 @@ describe("cloud identity and repository directory", () => {
     });
     const repository = env.REPOSITORIES.getByName(created.repositoryId);
     expect(
-      await repository.putPackManifest(
-        {
-          ...stranger,
-          repositoryId: created.repositoryId,
-          incarnation: created.incarnation,
-          creationNonce: "00".repeat(16),
-        },
-        packId,
-        new Uint8Array(),
-      ),
+      await repository.getOpHeads({
+        ...stranger,
+        repositoryId: created.repositoryId,
+        incarnation: created.incarnation,
+        creationNonce: "00".repeat(16),
+      }),
     ).toMatchObject({
       ok: false,
       status: 409,
@@ -344,11 +338,7 @@ describe("cloud identity and repository directory", () => {
       code: "repository-authority-stale",
     });
     expect(
-      await repositoryStub.putPackManifest(
-        staleAuthorization.authority,
-        packId,
-        new Uint8Array(),
-      ),
+      await repositoryStub.getOpHeads(staleAuthorization.authority),
     ).toMatchObject({ ok: false, status: 409, code: "repository-authority-stale" });
   });
 
@@ -483,9 +473,9 @@ describe("cloud identity and repository directory", () => {
     expect(await firstStub.initializeRepository(firstAuthority)).toMatchObject({ ok: true });
     await runInDurableObject(firstStub, (_instance, state) => {
       state.storage.sql.exec(
-        "INSERT INTO objects (kind, id, bytes) VALUES (?, ?, ?)",
+        "INSERT INTO op_objects (kind, id, bytes) VALUES (?, ?, ?)",
         1,
-        new Uint8Array(20).fill(1),
+        new Uint8Array(64).fill(1),
         new Uint8Array([2]),
       );
     });
@@ -502,7 +492,7 @@ describe("cloud identity and repository directory", () => {
     expect(deleted.status).toBe(200);
     expect(await deleted.json()).toEqual({ deleted: true });
     await evictDurableObject(firstStub);
-    expect(await countRows(firstStub, "objects")).toBe(0);
+    expect(await countRows(firstStub, "op_objects")).toBe(0);
     await runInDurableObject(firstStub, (_instance, state) => {
       expect(
         state.storage.sql
@@ -510,13 +500,7 @@ describe("cloud identity and repository directory", () => {
           .one().count,
       ).toBe(0);
     });
-    expect(
-      await firstStub.putPackManifest(
-        firstAuthority,
-        packId,
-        new Uint8Array(),
-      ),
-    ).toMatchObject({
+    expect(await firstStub.getOpHeads(firstAuthority)).toMatchObject({
       ok: false,
       status: 409,
       code: "repository-authority-stale",

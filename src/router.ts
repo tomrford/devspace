@@ -1,13 +1,6 @@
 import { authenticateDevelopmentRequest, type DevelopmentSecretEnv } from "./auth";
 import type { AuthenticatedPrincipal, ControlPlane } from "./control_plane";
-import {
-  MAX_GIT_CHUNK_BYTES,
-  MAX_GIT_MANIFEST_BYTES,
-  readBoundedGitBody,
-} from "./pack_protocol";
-import {
-  MAX_GIT_INVENTORY_REQUEST_BYTES,
-} from "./pack_store";
+import { readBoundedGitBody } from "./http_body";
 import { MAX_GIT_PROJECTION_REQUEST_BYTES } from "./projection_protocol";
 import { MAX_REMOTE_REQUEST_BYTES } from "./remote_protocol";
 import {
@@ -16,9 +9,8 @@ import {
 } from "./op_store";
 import { MAX_HEAD_REQUEST_BYTES } from "./op_protocol";
 import type { Repository } from "./repository";
-import { cursorStringSchema, identifierSchema, lowerHexStringSchema } from "./validation";
+import { cursorStringSchema, identifierSchema } from "./validation";
 
-const gitPackIdSchema = lowerHexStringSchema(64, "pack ID");
 const DIRECTORY_REQUEST_BYTES = 4 * 1024;
 const CONTROL_PLANE_NAME = "directory";
 type WorkerEnv = Env & DevelopmentSecretEnv;
@@ -104,16 +96,6 @@ async function routeRepository(
   control: DurableObjectStub<ControlPlane>,
   url: URL,
 ): Promise<Response | undefined> {
-  const chunkMatch = /^\/repositories\/([^/]+)\/git\/packs\/([^/]+)\/chunks\/([^/]+)$/.exec(
-    url.pathname,
-  );
-  const packMatch = /^\/repositories\/([^/]+)\/git\/packs\/([^/]+)\/(manifest|install)$/.exec(
-    url.pathname,
-  );
-  const packCatalogMatch = /^\/repositories\/([^/]+)\/git\/packs$/.exec(url.pathname);
-  const gitInventoryMatch = /^\/repositories\/([^/]+)\/git\/objects\/inventory$/.exec(
-    url.pathname,
-  );
   const projectionMatch = /^\/repositories\/([^/]+)\/git\/projection$/.exec(url.pathname);
   const remotesMatch = /^\/repositories\/([^/]+)\/git\/remotes$/.exec(url.pathname);
   const remoteMatch = /^\/repositories\/([^/]+)\/git\/remotes\/([^/]+)$/.exec(url.pathname);
@@ -136,10 +118,6 @@ async function routeRepository(
   const opHeadTransactionsMatch =
     /^\/repositories\/([^/]+)\/git\/ops\/heads\/transactions$/.exec(url.pathname);
   const repositoryId =
-    chunkMatch?.[1] ??
-    packMatch?.[1] ??
-    packCatalogMatch?.[1] ??
-    gitInventoryMatch?.[1] ??
     projectionMatch?.[1] ??
     remotesMatch?.[1] ??
     remoteMatch?.[1] ??
@@ -150,7 +128,6 @@ async function routeRepository(
     opInventoryMatch?.[1] ??
     opHeadsMatch?.[1] ??
     opHeadTransactionsMatch?.[1];
-  const packIdCandidate = chunkMatch?.[2] ?? packMatch?.[2];
   if (repositoryId === undefined) return undefined;
 
   const authorization = await control.authorizeRepository(
@@ -159,9 +136,6 @@ async function routeRepository(
     request.headers.get("x-devspace-incarnation"),
   );
   if (!authorization.ok) return rpcResponse(authorization);
-  if (packIdCandidate !== undefined && !gitPackIdSchema.safeParse(packIdCandidate).success) {
-    return errorResponse(400, "invalid pack ID");
-  }
 
   const authority = authorization.authority;
   const stub: DurableObjectStub<Repository> = env.REPOSITORIES.getByName(repositoryId);
@@ -208,72 +182,6 @@ async function routeRepository(
       );
       if (body instanceof Response) return body;
       return rpcResponse(await stub.transactOpHeads(authority, body));
-    }
-    if (packCatalogMatch !== null && request.method === "GET") {
-      const after = cursorStringSchema.safeParse(url.searchParams.get("after") ?? "0");
-      if (!after.success) return errorResponse(400, "invalid pack cursor");
-      const throughValue = url.searchParams.get("through");
-      const through = throughValue === null ? undefined : cursorStringSchema.safeParse(throughValue);
-      if (through !== undefined && !through.success) {
-        return errorResponse(400, "invalid pack high-water");
-      }
-      return rpcResponse(await stub.listInstalledPacks(authority, after.data, through?.data));
-    }
-    if (gitInventoryMatch !== null && request.method === "POST") {
-      const body = await readJsonBody(
-        request,
-        MAX_GIT_INVENTORY_REQUEST_BYTES,
-        "Git object inventory request",
-        "invalid-git-inventory",
-      );
-      if (body instanceof Response) return body;
-      return rpcResponse(await stub.inventoryGitObjects(authority, body));
-    }
-    if (packMatch?.[3] === "manifest" && request.method === "PUT") {
-      const packId = packMatch[2];
-      let bytes: Uint8Array;
-      try {
-        bytes = await readBoundedGitBody(request, MAX_GIT_MANIFEST_BYTES, "Git manifest");
-      } catch (error) {
-        return errorResponse(
-          400,
-          error instanceof Error ? error.message : "invalid Git manifest body",
-        );
-      }
-      return rpcResponse(await stub.putPackManifest(authority, packId, bytes));
-    }
-    if (packMatch?.[3] === "manifest" && request.method === "GET") {
-      const packId = packMatch[2];
-      return binaryRpcResponse(await stub.getInstalledPackManifest(authority, packId));
-    }
-    if (chunkMatch !== null && request.method === "PUT") {
-      const packId = chunkMatch[2];
-      const decodedPosition = cursorStringSchema.safeParse(chunkMatch[3]);
-      if (!decodedPosition.success) return errorResponse(400, "invalid chunk position");
-      let bytes: Uint8Array;
-      try {
-        bytes = await readBoundedGitBody(request, MAX_GIT_CHUNK_BYTES, "Git chunk");
-      } catch (error) {
-        return errorResponse(
-          400,
-          error instanceof Error ? error.message : "invalid Git chunk body",
-        );
-      }
-      return rpcResponse(
-        await stub.putPackChunk(authority, packId, decodedPosition.data, bytes),
-      );
-    }
-    if (chunkMatch !== null && request.method === "GET") {
-      const packId = chunkMatch[2];
-      const decodedPosition = cursorStringSchema.safeParse(chunkMatch[3]);
-      if (!decodedPosition.success) return errorResponse(400, "invalid chunk position");
-      return binaryRpcResponse(
-        await stub.getInstalledPackChunk(authority, packId, decodedPosition.data),
-      );
-    }
-    if (packMatch?.[3] === "install" && request.method === "POST") {
-      const packId = packMatch[2];
-      return rpcResponse(await stub.installPack(authority, packId));
     }
     if (projectionMatch !== null && request.method === "GET") {
       const after = cursorStringSchema.safeParse(url.searchParams.get("after") ?? "0");

@@ -2,8 +2,8 @@
 
 Devspace replicates a Jujutsu repository without replicating a working copy.
 Each machine owns a bare Git repository and Jujutsu operation store. The cloud
-owns immutable object bytes, installed pack metadata, and the authoritative set
-of operation heads.
+owns immutable operation-store bytes and the authoritative set of operation
+heads. Canonical Git objects live on a private Git remote.
 
 The protocol is content-addressed and retry-safe. No synchronization request
 rewrites an existing object.
@@ -22,7 +22,7 @@ Commands that need the cloud send the global development-only
 `DEVSPACE_SHARED_SECRET` as a bearer credential, the repository incarnation in
 `x-devspace-incarnation`, and a syntactically validated but non-authoritative
 `x-devspace-machine-id`. The client capability header is
-`x-devspace-client: ds/<version> git-pack/2`.
+`x-devspace-client: ds/<version> git-remote/1`.
 
 The shared credential selects one fixed development user. The control plane
 checks that user's active repository incarnation before forwarding a request
@@ -85,42 +85,23 @@ Closure discovery rejects:
 The machine reads canonical and projected objects from the same Git object
 database.
 
-## Git pack format
+## Canonical Git remote
 
-Git objects travel in deterministic `DSPK` version 2 packs. This is a
-Devspace transport container, not Git's packfile format.
+Git objects travel through standard Git fetch and push against a private
+remote. Tests use a local bare repository. A live Artifact repository uses a
+repository-scoped token. The Worker does not store Git object bytes.
 
-The manifest contains:
+Each machine writes only its own retention ref
+`refs/heads/__devspace/machines/<machine-id>`. The ref points at a synthetic
+commit whose parents include the previous anchor and the required canonical
+heads. Extra objects that standard Git reachability would not send, including
+`jj:trees` trees, are named from a carry tree on that commit. Fetch maps those
+refs into `refs/devspace/retention/*` so they stay out of the user's
+`refs/heads` view.
 
-- the `DSPK` magic and version;
-- chunk size, total pack length, and 64-byte Blake2b pack digest;
-- ordered 20-byte head OIDs;
-- ordered object entries with kind, OID, offset, and length;
-- ordered chunk entries with offset, length, and 64-byte Blake2b digest.
-
-The payload concatenates exact Git object payloads in manifest order. The same
-missing-object set, ordered head set, and pack options produce the same sequence
-of manifests, payloads, and pack IDs; each individual pack is deterministic for
-its exact object contents and options.
-Production is incremental: the machine asks for installed object keys in
-bounded batches, omits cloud-known objects, and retains only the completed pack
-currently being uploaded. Dependency-safe pack order ensures that an earlier
-pack installs every cross-pack dependency needed by the next pack. Object
-entries remain sorted inside each manifest, so the wire format stays
-deterministic.
-
-The Worker receives a manifest and bounded chunk parts in quarantine. Install
-is one Durable Object transaction:
-
-1. verify manifest, part layout, chunk digests, and full pack digest;
-2. validate every Git object with the WebAssembly kernel;
-3. verify every reference is present in the pack or already installed;
-4. insert objects and reference rows with no-clobber checks;
-5. publish the installed pack at the next catalog sequence;
-6. remove its quarantine rows.
-
-A repeated install of the same pack is idempotent. A different byte sequence
-for an existing object key is a hard error.
+A machine-owned ref is the selected retention design. A repository-wide
+compare-and-swap ref serializes unrelated machines. Direct commit refs do not
+retain `jj:trees` extras.
 
 ## Operation object closure
 
@@ -134,9 +115,8 @@ objects before upload. The Worker validates them again before insertion.
 
 Inventory requests are bounded batches of `(kind, id)` keys. The Worker returns
 the keys already present, and the machine computes which objects are missing
-and uploads only those objects. Git
-commit references in views must become durable through the Git-pack path
-before an operation head can advance.
+and uploads only those objects. Git commit references in views must be
+durable on the canonical Git remote before an operation head can advance.
 
 ## Cloud operation heads
 
@@ -161,24 +141,26 @@ the native merge operation.
 One run holds the repository synchronization lock and follows this order:
 
 1. load local sync state;
-2. if an outbox batch exists, re-upload its reachable Git and operation
-   closures, replay its head transactions, and stop;
+2. if an outbox batch exists, push and verify its reachable Git objects, upload
+   its operation closure, replay its head transactions, and stop;
 3. read cloud operation heads;
-4. download Git packs after the local catalog sequence;
+4. fetch Devspace retention refs from the canonical Git remote;
 5. download the missing operation closures;
 6. reconcile multiple cloud heads in the native Jujutsu repository;
-7. persist the accepted heads and catalog sequence;
+7. persist the accepted heads;
 8. discover the current local operation heads;
-9. inventory their reachable Git closure and upload only missing objects, one
-   completed pack at a time;
+9. push this machine's retention root and verify a fresh fetch can read every
+   required Git object;
 10. upload their operation closure;
 11. write a durable outbox batch for new head transactions;
 12. apply each transaction and remove each acknowledged outbox entry.
 
-The outbox is written only after every referenced byte is durable in the
-cloud. On retry, the machine uploads the closure again before replaying the
+The outbox is written only after every referenced Git object is durable on the
+canonical remote and every referenced operation object is durable in the
+Worker. On retry, the machine pushes and uploads again before replaying the
 transaction. This ordering makes a local crash, network timeout, or lost
-response recoverable without guessing whether the cloud committed.
+response recoverable without guessing whether the cloud committed. Extra
+immutable Git objects after a crash are acceptable.
 
 ## Convergence
 
@@ -202,10 +184,10 @@ remove only heads it proves it observed.
 A new machine can recover a repository using only:
 
 - its control-plane repository identity;
-- the installed Git pack catalog and bytes;
+- the canonical Git remote and its retention refs;
 - operation objects and cloud operation heads.
 
-It installs every missing Git pack, downloads each operation closure, rebuilds
+It fetches the retention refs, downloads each operation closure, rebuilds
 the GitBackend cache from commit bytes, and opens a checkout at the recovered
 operation. The recovered canonical Git OIDs and Jujutsu operation IDs match the
 source machine exactly.
@@ -225,7 +207,7 @@ Git push and fetch add their own projection-journal recovery boundary. See
 The following are deliberate hard failures:
 
 - installed bytes conflict with an existing object ID;
-- a pack or operation closure is incomplete;
+- a Git or operation closure is incomplete;
 - cloud authorization names a stale incarnation;
 - an idempotency key is reused for a different request;
 - projection state would bind one canonical commit to two public commits;

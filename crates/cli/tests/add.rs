@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
@@ -6,8 +6,8 @@ use std::thread;
 
 use devspace_machine::RepositoryName;
 use devspace_machine::{
-    BuiltPack, MachineGitRepository as MachineRepository, Oid, PackOptions, build_packs,
-    encode_lower_hex,
+    CanonicalGitRemote, GitProcessEnvironment, MachineGitRepository as MachineRepository,
+    MachineId, Oid, encode_lower_hex, init_bare_remote,
 };
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
@@ -33,7 +33,6 @@ async fn local_repository(root: &Path, repository_name: &str) -> PathBuf {
 struct CloudFixture {
     operation_head: String,
     op_objects: BTreeMap<String, Vec<u8>>,
-    pack: BuiltPack,
 }
 
 async fn cloud_fixture(root: &Path) -> CloudFixture {
@@ -65,69 +64,25 @@ async fn cloud_fixture(root: &Path) -> CloudFixture {
         .values()
         .map(|id| Oid(id.as_bytes().try_into().unwrap()))
         .collect::<Vec<_>>();
-    let closure = repository.object_closure(commit_heads).unwrap();
-    let pack = build_packs(
-        &repository,
-        &closure,
-        &BTreeSet::new(),
-        PackOptions::default(),
+    let remote_path = root.join("canonical.git");
+    init_bare_remote(&remote_path).unwrap();
+    CanonicalGitRemote::new(
+        remote_path.to_string_lossy(),
+        MachineId::parse(TEST_MACHINE_ID).unwrap(),
+        GitProcessEnvironment::default(),
     )
-    .unwrap()
-    .into_iter()
-    .next()
+    .push_commits(&repository, commit_heads)
     .unwrap();
     CloudFixture {
         operation_head,
         op_objects,
-        pack,
     }
 }
 
 fn create_cloud_sync_server(fixture: CloudFixture) -> (String, thread::JoinHandle<Vec<String>>) {
     create_server(move |_, request, stream| {
         let request_line = request.lines().next().unwrap();
-        if request_line.starts_with("GET ") && request_line.contains("/git/packs?") {
-            respond(
-                stream,
-                "200 OK",
-                &serde_json::json!({
-                    "packs": [{"sequence": 1, "id": encode_lower_hex(&fixture.pack.id)}],
-                    "nextAfter": 1,
-                    "through": 1,
-                    "hasMore": false,
-                })
-                .to_string(),
-            );
-        } else if request_line.starts_with("GET ")
-            && request_line.contains("/git/packs/")
-            && request_line.contains("/manifest ")
-        {
-            respond_bytes(
-                stream,
-                "200 OK",
-                "application/octet-stream",
-                &fixture.pack.manifest_bytes,
-            );
-        } else if request_line.starts_with("GET ")
-            && request_line.contains("/git/packs/")
-            && request_line.contains("/chunks/")
-        {
-            let position = request_line
-                .split("/chunks/")
-                .nth(1)
-                .unwrap()
-                .split_whitespace()
-                .next()
-                .unwrap()
-                .parse::<usize>()
-                .unwrap();
-            respond_bytes(
-                stream,
-                "200 OK",
-                "application/octet-stream",
-                &fixture.pack.chunks[position],
-            );
-        } else if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads") {
+        if request_line.starts_with("GET ") && request_line.contains("/git/ops/heads") {
             respond(
                 stream,
                 "200 OK",
@@ -319,7 +274,6 @@ async fn add_resumes_after_kill_between_catalog_registration_and_native_publicat
     for path in [
         repository_directory.join(".clone-staging"),
         store.repository_sync_path(&entry.identity),
-        store.repository_packs_path(&entry.identity),
     ] {
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("stale"), "must disappear").unwrap();
@@ -342,12 +296,6 @@ async fn add_resumes_after_kill_between_catalog_registration_and_native_publicat
     assert!(
         !store
             .repository_sync_path(&entry.identity)
-            .join("stale")
-            .exists()
-    );
-    assert!(
-        !store
-            .repository_packs_path(&entry.identity)
             .join("stale")
             .exists()
     );
